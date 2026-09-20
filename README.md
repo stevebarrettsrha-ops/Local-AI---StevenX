@@ -129,6 +129,18 @@ silently lost. Reads are capped at 300 KB per file and writes can only
 land inside the opened folder. For this whole-project mode the Qwen3
 Coder 30B A3B entry in the catalogue is the model to reach for.
 
+### Run &amp; fix
+
+Set a run command under the file list — `python app.py`, `npm test`,
+whatever proves the project works — and **Run** executes it inside the
+open folder with the output in a console. **Run &amp; fix** is the
+autonomous loop: run; on a non-zero exit, send the error output and the
+current files to the model, apply the corrected files it returns (each
+with a `.bak` of the previous version), and run again — up to three
+rounds, stopping the moment the command passes, the model returns no
+file changes, or the rounds run out. The command is always the one you
+typed; model output never chooses what gets executed.
+
 ## Documents and files
 
 Everything the model writes can leave the chat as a real file, entirely in

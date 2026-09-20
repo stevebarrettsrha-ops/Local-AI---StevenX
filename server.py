@@ -10,6 +10,7 @@ import html as html_mod
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -39,6 +40,7 @@ DEFAULTS = {
     "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 1024,
     "system": "", "kv_bits": 16, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
+    "run_command": "",
 }
 
 
@@ -127,7 +129,8 @@ def api_status():
         "workspace": str(workspace_root() or ""),
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
-                    "kv_bits", "auto_start", "last_model", "plan_for")},
+                    "kv_bits", "auto_start", "last_model", "plan_for",
+                    "run_command")},
         "catalogue": fit.CATALOGUE,
         "presets": fit.presets(),
         "setup_complete": bool(cfg.get("setup_complete")),
@@ -615,6 +618,36 @@ def api_workspace_write():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return jsonify({"ok": True, "path": b.get("path"), "backup": backup})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/workspace/run")
+def api_workspace_run():
+    """Run the user's own command inside the open folder and hand back
+    exit code plus output. The command is always the one the person typed
+    — model output never chooses what runs."""
+    root = workspace_root()
+    if not root:
+        return jsonify({"error": "No folder is open."}), 400
+    b = request.get_json(silent=True) or {}
+    cmd = (b.get("command") or cfg.get("run_command") or "").strip()
+    if not cmd:
+        return jsonify({"error": "No run command set."}), 400
+    cfg["run_command"] = cmd
+    save_config(cfg)
+    started = time.time()
+    try:
+        p = subprocess.run(cmd, shell=True, cwd=str(root),
+                           capture_output=True, text=True, timeout=60)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        return jsonify({"ok": True, "exit": p.returncode,
+                        "output": out[-8000:],
+                        "seconds": round(time.time() - started, 1)})
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": True, "exit": -1,
+                        "output": "Timed out after 60 seconds.",
+                        "seconds": 60.0})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
