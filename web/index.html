@@ -1793,6 +1793,28 @@ function renderHardware() {
     (st.ready ? "ok" : "") + '">' + (st.ready ? "ready" :
       st.running ? "starting" : "idle") + "</span></div>";
   box.appendChild(run);
+  // The engine speaks the OpenAI API, so external agent tools can drive
+  // it too — DeepSeek Harness, Aider, Continue, anything compatible.
+  var apiRow = document.createElement("div");
+  apiRow.className = "fitem";
+  apiRow.innerHTML = '<div class="n"><b>Local API</b><span>' +
+    (st.ready
+      ? esc(st.api_url || "http://127.0.0.1:8080/v1") + " · model name: " +
+        esc(st.model) + " — point external agent tools (DeepSeek Harness, " +
+        "Aider, Continue…) at this OpenAI-compatible endpoint."
+      : "Load a model and any OpenAI-compatible tool can use this engine " +
+        "at " + esc(st.api_url || "http://127.0.0.1:8080/v1") + ".") +
+    '</span></div><div class="right"></div>';
+  if (st.ready) {
+    apiRow.querySelector(".right").appendChild(
+      mkBtn("Copy URL", function () {
+        if (navigator.clipboard && navigator.clipboard.writeText)
+          navigator.clipboard.writeText(st.api_url ||
+            "http://127.0.0.1:8080/v1");
+        toast("Endpoint copied.");
+      }));
+  }
+  box.appendChild(apiRow);
   $("engineTag").hidden = !!st.llama_installed;
 }
 var logTimer = null;

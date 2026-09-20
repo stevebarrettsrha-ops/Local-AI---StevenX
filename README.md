@@ -200,6 +200,17 @@ the browser — nothing is uploaded anywhere:
 So "write me a status report page" ends as an .html file you can open,
 print, host or send.
 
+## Using other agent tools with the engine
+
+The loaded engine is an ordinary OpenAI-compatible server on
+`http://127.0.0.1:8080/v1` (shown, with a copy button, on the Engine
+page). Any tool that takes a custom OpenAI-compatible provider — DeepSeek
+Harness (`dsh`), Aider, Continue and the like — can be pointed at it and
+will drive whichever model the switcher has loaded; use the loaded file's
+name as the model name. The big DeepSeek V4-Flash model those tools
+default to does not fit consumer hardware, but the harness driving this
+app's Coder engine does.
+
 ## Notes
 
 - Conversations are stored in `data/chats.json`. The user's message is saved
