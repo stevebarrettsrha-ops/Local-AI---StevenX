@@ -217,7 +217,13 @@ block become real Word tables with a bold header row. Decks take an
 optional `# Theme: dark` (or `# Theme: #RRGGBB` accent) and a
 `- image: <file>` line places a picture from `data/images` on the
 slide — `image: latest` uses the newest generated one, wiring the
-Images page straight into your slides. Missing packages
+Images page straight into your slides. For branded decks, drop your
+company's `.potx` (or a `.pptx` to copy) into `data/templates/` and
+start the block with `# Template: <file>`: the deck is built on that
+template — its fonts, colours, layouts, slide size and master
+furniture (logos, footers) all apply, any example slides in it are
+cleared, and the model is told which templates exist so "use our
+company template" just works. Missing packages
 degrade to a clear "pip install -r requirements.txt" message rather than
 a broken button.
 
