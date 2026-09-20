@@ -123,6 +123,7 @@ def api_status():
         "llama_installed": bool(binary),
         "llama_path": str(binary) if binary else "",
         "running": server.alive(), "ready": server.ready(),
+        "api_url": server.url + "/v1",
         "model": Path(server.model).name if server.model else "",
         "models": engine.local_models(),
         "models_dir": str(engine.MODELS_DIR),
