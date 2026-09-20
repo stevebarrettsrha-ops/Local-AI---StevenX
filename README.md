@@ -106,6 +106,17 @@ Pasting a safetensors repo by hand does the same thing — the app checks whethe
 a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
 never a dead link.
 
+## Working on a folder of code
+
+The Code page can open any folder on this computer: type its path, press
+Open, and its files appear in the explorer (common noise like `.git`,
+`node_modules` and `__pycache__` is skipped). Click a file to attach it to
+your next question — the model sees the real contents — and the reply's
+code blocks gain an **Apply to file** button that writes the model's
+version back to disk. Every apply keeps the previous version beside the
+file as `.bak`, so nothing is ever silently lost. Reads are capped at
+300 KB per file and writes can only land inside the opened folder.
+
 ## Documents and files
 
 Everything the model writes can leave the chat as a real file, entirely in

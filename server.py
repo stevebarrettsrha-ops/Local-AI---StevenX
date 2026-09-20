@@ -34,7 +34,7 @@ DEFAULTS = {
     "hf_token": "", "hf_endpoint": "https://huggingface.co",
     "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 1024,
     "system": "", "kv_bits": 16, "auto_start": True, "plan_for": "",
-    "last_model": "", "setup_complete": False,
+    "last_model": "", "setup_complete": False, "workspace": "",
 }
 
 
@@ -120,6 +120,7 @@ def api_status():
         "models": engine.local_models(),
         "models_dir": str(engine.MODELS_DIR),
         "engines": engines_list(),
+        "workspace": str(workspace_root() or ""),
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
                     "kv_bits", "auto_start", "last_model", "plan_for")},
@@ -451,6 +452,121 @@ def api_task_cancel(task_id: str):
     if task:
         task.cancel = True
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# workspace (a folder on this computer the Code page can read and edit)
+# --------------------------------------------------------------------------- #
+WS_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+           "dist", "build", "target", ".idea", ".vscode", ".next",
+           "site-packages"}
+WS_MAX_FILES = 400
+WS_MAX_READ = 300_000
+
+
+def workspace_root() -> Path | None:
+    raw = (cfg.get("workspace") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser()
+    return p if p.is_dir() else None
+
+
+def ws_resolve(rel: str) -> Path:
+    """A path inside the open folder — never outside it."""
+    root = workspace_root()
+    if not root:
+        raise RuntimeError("No folder is open.")
+    target = (root / rel).resolve()
+    root = root.resolve()
+    if target != root and not str(target).startswith(str(root) + os.sep):
+        raise RuntimeError("That path is outside the open folder.")
+    return target
+
+
+@app.post("/api/workspace")
+def api_workspace_open():
+    b = request.get_json(silent=True) or {}
+    raw = (b.get("path") or "").strip()
+    if not raw:
+        cfg["workspace"] = ""
+        save_config(cfg)
+        return jsonify({"ok": True, "path": ""})
+    p = Path(raw).expanduser()
+    if not p.is_dir():
+        return jsonify({"error": f"No such folder: {raw}"}), 400
+    cfg["workspace"] = str(p)
+    save_config(cfg)
+    return jsonify({"ok": True, "path": str(p)})
+
+
+@app.get("/api/workspace/tree")
+def api_workspace_tree():
+    root = workspace_root()
+    if not root:
+        return jsonify({"path": "", "files": []})
+    files, truncated = [], False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in sorted(dirnames)
+                       if d not in WS_SKIP and not d.startswith(".")]
+        rel_dir = Path(dirpath).relative_to(root)
+        for name in sorted(filenames):
+            if name.startswith(".") or name.endswith(".bak"):
+                continue
+            if len(files) >= WS_MAX_FILES:
+                truncated = True
+                break
+            f = Path(dirpath) / name
+            rel = str(rel_dir / name).replace("\\", "/").lstrip("./")
+            try:
+                files.append({"path": rel, "size": f.stat().st_size})
+            except OSError:
+                continue
+        if truncated:
+            break
+    return jsonify({"path": str(root), "files": files,
+                    "truncated": truncated})
+
+
+@app.get("/api/workspace/file")
+def api_workspace_read():
+    try:
+        target = ws_resolve(request.args.get("path", ""))
+        if not target.is_file():
+            raise RuntimeError("That file does not exist.")
+        if target.stat().st_size > WS_MAX_READ:
+            raise RuntimeError("That file is too large to attach "
+                               f"({WS_MAX_READ // 1000} KB cap).")
+        data = target.read_bytes()
+        if b"\0" in data[:8192]:
+            raise RuntimeError("That looks like a binary file.")
+        return jsonify({"path": request.args.get("path", ""),
+                        "content": data.decode("utf-8", errors="replace"),
+                        "size": len(data)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.post("/api/workspace/file")
+def api_workspace_write():
+    """Write model output back into the folder. The previous version is
+    kept beside it as .bak — an edit is undoable, never silent loss."""
+    b = request.get_json(silent=True) or {}
+    try:
+        target = ws_resolve(b.get("path") or "")
+        content = b.get("content")
+        if content is None:
+            raise RuntimeError("Nothing to write.")
+        backup = ""
+        if target.exists():
+            bak = target.with_name(target.name + ".bak")
+            bak.write_bytes(target.read_bytes())
+            backup = bak.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return jsonify({"ok": True, "path": b.get("path"), "backup": backup})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
 
 
 # --------------------------------------------------------------------------- #

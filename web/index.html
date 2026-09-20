@@ -88,6 +88,26 @@
   .seg:hover{color:var(--text)}
   .seg.on{background:rgba(217,119,87,.16);color:#eeb296}
 
+  /* ---------- workspace (Code page file explorer) ---------- */
+  .codewrap{display:flex;flex:1;min-height:0}
+  .codecol{flex:1;display:flex;flex-direction:column;min-width:0}
+  .ws{width:256px;flex:none;border-right:1px solid var(--hair);
+      background:var(--chrome);display:flex;flex-direction:column;min-height:0}
+  .wshead{padding:10px;display:flex;gap:6px;border-bottom:1px solid var(--hair)}
+  .wshead input{font-size:11.5px;font-family:var(--mono);padding:7px 9px}
+  .wsroot{padding:8px 12px 2px;font-size:10.5px;color:var(--dim);
+      font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap}
+  .wslist{overflow-y:auto;flex:1;padding:6px 8px}
+  .wsfile{display:block;width:100%;text-align:left;padding:4px 9px;
+      border-radius:7px;color:var(--muted);font-family:var(--mono);
+      font-size:11.5px;white-space:nowrap;overflow:hidden;
+      text-overflow:ellipsis}
+  .wsfile:hover{background:#2a2926;color:var(--text)}
+  .wsfile.on{background:var(--raised);color:var(--text)}
+  .attachrow{display:flex;gap:6px;padding:0 4px 6px;flex-wrap:wrap}
+  @media (max-width:820px){.ws{display:none}}
+
   /* ---------- first-run setup ---------- */
   .setupbar{display:flex;align-items:center;gap:14px;padding:10px 20px;
         border-bottom:1px solid var(--hair);background:var(--panel);
@@ -310,17 +330,34 @@
 
     <!-- code -->
     <section class="chatpane" data-page="code" hidden>
-      <div class="thread" id="codeThread"><div class="inner" id="codeInner"></div></div>
-      <div class="composer">
-        <div class="cwrap">
-          <textarea id="codeInput" rows="1" spellcheck="false"
-            placeholder="Describe the code you need, or paste code to fix…"></textarea>
-          <div class="crow">
-            <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
-            <span class="mlab" id="codeModelLab"></span>
-            <button class="send" id="btnCodeSend">Send</button>
-            <button class="send" id="btnCodeStop" hidden
-              style="background:#3a3935">Stop</button>
+      <div class="codewrap">
+        <aside class="ws">
+          <div class="wshead">
+            <input type="text" id="wsPath"
+              placeholder="C:\Projects\my-app  or  /home/me/app">
+            <button class="btn thin go" id="btnWsOpen">Open</button>
+          </div>
+          <div class="wsroot" id="wsRoot"></div>
+          <div class="wslist" id="wsList">
+            <div class="note" style="padding:4px 8px">Open a folder on this
+              computer to read and edit its files with the model.</div>
+          </div>
+        </aside>
+        <div class="codecol">
+          <div class="thread" id="codeThread"><div class="inner" id="codeInner"></div></div>
+          <div class="composer">
+            <div class="cwrap">
+              <div class="attachrow" id="wsAttach" hidden></div>
+              <textarea id="codeInput" rows="1" spellcheck="false"
+                placeholder="Describe the code you need, or paste code to fix…"></textarea>
+              <div class="crow">
+                <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
+                <span class="mlab" id="codeModelLab"></span>
+                <button class="send" id="btnCodeSend">Send</button>
+                <button class="send" id="btnCodeStop" hidden
+                  style="background:#3a3935">Stop</button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -451,7 +488,8 @@
 
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
-          setupKicked: false, cur: { chat: null, code: null } };
+          setupKicked: false, cur: { chat: null, code: null },
+          ws: { path: "", attached: null, lastFile: "" } };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -513,7 +551,7 @@ function closePops() { $("paramsPop").hidden = true; $("systemPop").hidden = tru
 
 // Markdown-lite: fenced code blocks and inline code only, everything
 // escaped. An unclosed fence (mid-stream) renders as a code block too.
-function renderBody(text) {
+function renderBody(text, withApply) {
   var parts = String(text == null ? "" : text).split("```");
   var html = "";
   for (var i = 0; i < parts.length; i++) {
@@ -530,6 +568,9 @@ function renderBody(text) {
         esc(lang || "code") + '</span><span class="cbb">' +
         (canPreview ?
           '<button class="prev" type="button">Preview</button>' : "") +
+        (withApply && S.ws.lastFile ?
+          '<button class="apply" type="button" title="' +
+          esc(S.ws.lastFile) + '">Apply to file</button>' : "") +
         '<button class="dl" type="button">Save</button>' +
         '<button class="copy" type="button">Copy</button></span></div>' +
         "<pre>" + esc(codeTxt.replace(/\n$/, "")) + "</pre></div>";
@@ -573,6 +614,88 @@ function docHtml(content) {
     "pre{margin:0;padding:12px 14px;overflow-x:auto;background:#faf9f7;" +
     "font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.55}" +
     "</style></head><body>" + renderBody(content) + "</body></html>";
+}
+
+/* ========================= workspace ========================= */
+function loadWorkspace() {
+  var w = (S.status && S.status.workspace) || "";
+  if (!$("wsPath").value) $("wsPath").value = w;
+  if (w && w !== S.ws.path) { S.ws.path = w; loadTree(); }
+}
+async function loadTree() {
+  var box = $("wsList");
+  try {
+    var d = await api("/api/workspace/tree");
+    $("wsRoot").textContent = d.path || "";
+    if (!d.path) return;
+    box.innerHTML = "";
+    if (!d.files.length) {
+      box.innerHTML = '<div class="note" style="padding:4px 8px">' +
+        "No readable files in that folder.</div>";
+      return;
+    }
+    d.files.forEach(function (f) {
+      var b = document.createElement("button");
+      b.className = "wsfile" +
+        (S.ws.attached && S.ws.attached.path === f.path ? " on" : "");
+      b.textContent = f.path;
+      b.title = f.path + " · " + (f.size / 1024).toFixed(1) + " KB";
+      b.addEventListener("click", function () { attachFile(f.path); });
+      box.appendChild(b);
+    });
+    if (d.truncated) {
+      box.innerHTML += '<div class="note" style="padding:4px 8px">' +
+        "Large folder — only the first 400 files are listed.</div>";
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="note bad-text" style="padding:4px 8px">' +
+      esc(e.message) + "</div>";
+  }
+}
+async function attachFile(path) {
+  try {
+    var d = await api("/api/workspace/file?path=" + encodeURIComponent(path));
+    S.ws.attached = { path: d.path, content: d.content };
+    S.ws.lastFile = d.path;
+    renderAttach(); loadTree();
+    $("codeInput").focus();
+    toast(d.path + " attached — ask the model about it.");
+  } catch (e) { toast(e.message, true); }
+}
+function renderAttach() {
+  var row = $("wsAttach");
+  row.hidden = !S.ws.attached;
+  row.innerHTML = "";
+  if (!S.ws.attached) return;
+  var chip = document.createElement("span");
+  chip.className = "pill on";
+  chip.innerHTML = esc(S.ws.attached.path) +
+    ' <span style="cursor:pointer" title="Detach">×</span>';
+  chip.querySelector("span").addEventListener("click", function () {
+    S.ws.attached = null; renderAttach(); loadTree();
+  });
+  row.appendChild(chip);
+}
+function fenceLang(path) {
+  var e = (path.split(".").pop() || "").toLowerCase();
+  var m = { py: "python", js: "javascript", ts: "typescript", htm: "html",
+            html: "html", css: "css", md: "markdown", sh: "bash",
+            yml: "yaml" };
+  return m[e] || e;
+}
+async function applyToFile(codeText) {
+  var file = S.ws.lastFile;
+  if (!file) return;
+  if (!confirm("Write this code to " + file + "?\nThe previous version " +
+               "is kept beside it as " + file.split("/").pop() + ".bak"))
+    return;
+  try {
+    var d = await api("/api/workspace/file", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: file, content: codeText }) });
+    toast("Saved to " + d.path +
+      (d.backup ? " — previous version kept as " + d.backup : "."));
+  } catch (e) { toast(e.message, true); }
 }
 
 /* ========================= engines + first run ========================= */
@@ -656,6 +779,7 @@ function show(view) {
   updateTitle();
   if (view === "models") { loadLocal(); renderCatalogue(); pollTasks(); }
   if (view === "engine") { renderHardware(); pollLog(); }
+  if (view === "code") loadWorkspace();
 }
 
 /* ========================= chat + code ========================= */
@@ -695,7 +819,8 @@ function renderThread(mode) {
   chat.messages.forEach(function (m) {
     var el = document.createElement("div");
     el.className = "msg" + (m.role === "user" ? " me" : "");
-    el.innerHTML = '<div class="body">' + renderBody(m.content) + "</div>" +
+    el.innerHTML = '<div class="body">' +
+      renderBody(m.content, m.role !== "user") + "</div>" +
       (m.tps || m.stopped ? '<div class="meta">' +
         (m.tps ? m.tps + " tok/s · " + m.seconds + " s" : "") +
         (m.stopped ? (m.tps ? " · " : "") + "stopped" : "") + "</div>" : "");
@@ -793,7 +918,18 @@ async function send(mode) {
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
   var acc = "", doneMeta = null;
-  var payload = { chat: chat.id || "", message: text, mode: mode };
+  var outgoing = text;
+  if (mode === "code" && S.ws.attached) {
+    // The question leads (it becomes the chat title); the file rides along
+    // underneath it, then detaches so later turns stay light.
+    outgoing = text + "\n\nHere is `" + S.ws.attached.path + "`:\n```" +
+      fenceLang(S.ws.attached.path) + "\n" + S.ws.attached.content +
+      "\n```";
+    chat.messages[chat.messages.length - 1].content = outgoing;
+    S.ws.attached = null;
+    renderAttach(); loadTree();
+  }
+  var payload = { chat: chat.id || "", message: outgoing, mode: mode };
   if (mode === "code") {
     // Deterministic-ish output for code; the built-in prompt steps aside
     // the moment the user sets their own.
@@ -826,12 +962,13 @@ async function send(mode) {
         if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
         if (d.delta) {
           acc += d.delta;
-          body.innerHTML = renderBody(acc) + '<span class="caret"></span>';
+          body.innerHTML = renderBody(acc, true) +
+            '<span class="caret"></span>';
           $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
         if (d.error) { toast(d.error, true); }
         if (d.done) {
-          body.innerHTML = renderBody(acc);
+          body.innerHTML = renderBody(acc, true);
           doneMeta = { tps: d.tps, seconds: d.seconds };
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
@@ -1225,6 +1362,8 @@ function wire() {
         ext === "html" ? "text/html" : "text/plain");
       t.textContent = "Saved";
       setTimeout(function () { t.textContent = "Save"; }, 1400);
+    } else if (t.classList.contains("apply")) {
+      applyToFile(pre.textContent);
     } else if (t.classList.contains("prev")) {
       // The page the model wrote, rendered for real in a new tab.
       var url = URL.createObjectURL(new Blob([pre.textContent],
@@ -1279,6 +1418,18 @@ function wire() {
     $("systemText").value = ""; await saveParams(); toast("Cleared.");
   });
 
+  $("btnWsOpen").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/workspace", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: $("wsPath").value.trim() }) });
+      S.ws.path = d.path; S.ws.attached = null; S.ws.lastFile = "";
+      renderAttach(); loadTree();
+      toast(d.path ? "Opened " + d.path : "Folder closed.");
+    } catch (e) { toast(e.message, true); }
+  });
+  $("wsPath").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("btnWsOpen").click(); });
   $("btnSetupRetry").addEventListener("click", startSetup);
   $("btnSetupSkip").addEventListener("click", async function () {
     await api("/api/config", { method: "POST",
