@@ -125,6 +125,19 @@ Two kinds, both plain files you can read and edit:
   `data/chats.json` is used instead. Either way it is local,
   inspectable, and switched off by one toggle.
 
+## Voice
+
+- **Speech in**: the mic button beside Send records, then transcribes
+  locally with **whisper.cpp** — the official release binary running as a
+  small server, with the `ggml-base` model in `models/voice/` (one-click
+  download under Parameters, ~160 MB total). The browser converts your
+  recording to 16 kHz WAV itself, so no converter is needed, and no audio
+  ever leaves the machine. The browser's built-in cloud speech
+  recognition is deliberately not used.
+- **Speech out**: the Voice pill in the top bar reads replies aloud with
+  the voices built into your operating system (code blocks are skipped,
+  links read as "a link"); every reply also has a Speak button.
+
 ## Web search (opt-in)
 
 The **Web** pill in the chat composer, when switched on, searches

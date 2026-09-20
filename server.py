@@ -131,6 +131,9 @@ def api_status():
         "embed": {"installed": bool(embed_model_file()),
                   "ready": embedder.ready(),
                   "indexed": len(emb_index())},
+        "voice": {"installed": bool(engine.whisper_binary()
+                                    and voice_model_file()),
+                  "ready": whisper.ready()},
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
                     "kv_bits", "auto_start", "last_model", "plan_for",
@@ -348,6 +351,76 @@ def api_embed_install():
     return jsonify({"ok": True,
                     "task": engine.spawn("download", "recall model",
                                          run).view()})
+
+
+# ---- voice: local speech-to-text via whisper.cpp ---- #
+WHISPER_MODEL_REPO = "ggerganov/whisper.cpp"
+WHISPER_MODEL_FILE = "ggml-base.bin"
+VOICE_DIR = "voice"
+whisper = engine.WhisperServer(8083)
+
+
+def voice_model_file() -> Path | None:
+    d = engine.MODELS_DIR / VOICE_DIR
+    if d.is_dir():
+        for f in sorted(d.glob("*.bin")):
+            return f
+    return None
+
+
+def ensure_whisper(wait: int = 15) -> bool:
+    model = voice_model_file()
+    if not model or not engine.whisper_binary():
+        return False
+    if whisper.ready():
+        return True
+    if not whisper.alive():
+        try:
+            whisper.start_whisper(str(model))
+        except Exception:
+            return False
+    return whisper.wait_ready(wait)
+
+
+@app.post("/api/voice/install")
+def api_voice_install():
+    if engine.whisper_binary() and voice_model_file():
+        ensure_whisper(20)
+        return jsonify({"ok": True, "already": True})
+
+    def run(task):
+        if not engine.whisper_binary():
+            engine.whisper_install_sync(task)
+        if not voice_model_file():
+            engine.download_sync(cfg, WHISPER_MODEL_REPO,
+                                 WHISPER_MODEL_FILE, VOICE_DIR, task,
+                                 45, 95, label="voice model")
+            if task.cancel:
+                return
+        task.set(pct=96, detail="Starting the speech server…")
+        if not ensure_whisper(30):
+            raise RuntimeError("The whisper server did not come up.")
+        task.set(pct=100, detail="Ready — speak with the mic button.")
+
+    return jsonify({"ok": True,
+                    "task": engine.spawn("download", "voice (whisper)",
+                                         run).view()})
+
+
+@app.post("/api/voice/transcribe")
+def api_voice_transcribe():
+    audio = request.get_data(cache=False)
+    if not audio:
+        return jsonify({"error": "No audio received."}), 400
+    if len(audio) > 25_000_000:
+        return jsonify({"error": "Recording too long."}), 400
+    if not ensure_whisper(10):
+        return jsonify({"error": "Voice input is not set up — download "
+                                 "the Whisper model under Parameters."}), 503
+    try:
+        return jsonify({"text": whisper.transcribe(audio)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 502
 
 
 _STOP = {"the", "and", "that", "this", "with", "from", "have", "what",
@@ -1081,6 +1154,7 @@ def main() -> None:
     finally:
         server.stop()
         embedder.stop()
+        whisper.stop()
 
 
 if __name__ == "__main__":

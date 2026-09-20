@@ -155,6 +155,11 @@
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
          vertical-align:-2px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:0}}
+  .mic{padding:7px 12px;border-radius:9px;background:#3a3935;color:var(--muted)}
+  .mic:hover{color:var(--text)}
+  .mic svg{width:16px;height:16px;display:block}
+  .mic.rec{background:var(--err);color:#fff;animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{opacity:.55}}
   .composer{padding:10px 22px 18px}
   .cwrap{max-width:780px;margin:0 auto;background:#302f2c;
          border:1px solid var(--line);border-radius:14px;padding:10px 10px 8px;
@@ -306,6 +311,10 @@
       <button class="pill" id="btnMemory">
         <svg viewBox="0 0 24 24"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-2 7 4 4 0 0 0 3 6h6a4 4 0 0 0 3-6 4 4 0 0 0-2-7V7a4 4 0 0 0-4-4z"/></svg>
         <span id="memoryLabel">Memory</span></button>
+      <button class="pill" id="voicePill" title="Read replies aloud with the
+system's own voice">
+        <svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+        Voice</button>
       <span class="pill" id="speedPill" hidden></span>
     </div>
 
@@ -332,6 +341,8 @@
               title="Search the web first and give the model the results">
               Web</button>
             <span class="mlab" id="chatModelLab"></span>
+            <button class="mic" id="btnMic" title="Speak instead of typing">
+              <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
             <button class="send" id="btnSend">Send</button>
             <button class="send" id="btnStop" hidden
               style="background:#3a3935">Stop</button>
@@ -380,6 +391,9 @@ files to the model, apply its fixes, and run again — up to 3 rounds.">
               <div class="crow">
                 <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
                 <span class="mlab" id="codeModelLab"></span>
+                <button class="mic" id="btnCodeMic"
+                  title="Speak instead of typing">
+                  <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
                 <button class="send" id="btnCodeSend">Send</button>
                 <button class="send" id="btnCodeStop" hidden
                   style="background:#3a3935">Stop</button>
@@ -485,6 +499,13 @@ files to the model, apply its fixes, and run again — up to 3 rounds.">
   <div class="orow"><span class="lab">KV cache</span><div class="ctl">
     <select id="kvSel"><option value="16">f16 — exact</option>
       <option value="8">q8 — half the memory</option></select></div></div>
+  <div class="orow"><span class="lab">Voice input (Whisper)</span><div class="ctl">
+    <span class="state" id="voiceState">checking…</span>
+    <button class="btn thin" id="btnVoiceInstall" hidden>Download
+      (~160 MB)</button></div></div>
+  <p class="note">Local speech recognition via whisper.cpp — official
+    binaries, your audio never leaves this machine. Spoken replies use the
+    voices built into your operating system.</p>
   <p class="note" id="paramNote"></p>
   <p class="note">The Code page always answers at temperature 0.2 for
     reproducible code; the slider applies to the Chat page.</p>
@@ -929,6 +950,102 @@ async function applyToFile(codeText, file) {
   } catch (e) { toast(e.message, true); }
 }
 
+/* ========================= voice ========================= */
+var REC = { active: false, mode: "", mr: null, chunks: [] };
+function micBtn(mode) { return $(mode === "code" ? "btnCodeMic" : "btnMic"); }
+function renderVoice() {
+  var v = (S.status && S.status.voice) || {};
+  var st = $("voiceState"), btn = $("btnVoiceInstall");
+  if (v.installed && v.ready) {
+    st.textContent = "ready"; st.className = "state ok"; btn.hidden = true;
+  } else if (v.installed) {
+    st.textContent = "starting…"; st.className = "state"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed"; st.className = "state";
+    btn.hidden = false;
+  }
+}
+// 16 kHz mono 16-bit WAV — the format whisper-server takes with no
+// external converter.
+async function toWav16k(blob) {
+  var buf = await blob.arrayBuffer();
+  var ac = new (window.AudioContext || window.webkitAudioContext)();
+  var audio = await ac.decodeAudioData(buf);
+  if (ac.close) ac.close();
+  var rate = 16000;
+  var oc = new OfflineAudioContext(1, Math.ceil(audio.duration * rate) || 1,
+                                   rate);
+  var src = oc.createBufferSource();
+  src.buffer = audio; src.connect(oc.destination); src.start();
+  var out = (await oc.startRendering()).getChannelData(0);
+  var wav = new DataView(new ArrayBuffer(44 + out.length * 2));
+  function ws(o, s) {
+    for (var i = 0; i < s.length; i++) wav.setUint8(o + i, s.charCodeAt(i));
+  }
+  ws(0, "RIFF"); wav.setUint32(4, 36 + out.length * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); wav.setUint32(16, 16, true); wav.setUint16(20, 1, true);
+  wav.setUint16(22, 1, true); wav.setUint32(24, rate, true);
+  wav.setUint32(28, rate * 2, true); wav.setUint16(32, 2, true);
+  wav.setUint16(34, 16, true); ws(36, "data");
+  wav.setUint32(40, out.length * 2, true);
+  for (var i = 0; i < out.length; i++) {
+    var s = Math.max(-1, Math.min(1, out[i]));
+    wav.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return wav.buffer;
+}
+async function toggleMic(mode) {
+  if (REC.active) { REC.mr.stop(); return; }
+  if (!S.status || !S.status.voice || !S.status.voice.installed) {
+    toast("Voice input needs the Whisper model — download it under "
+      + "Parameters.", true);
+    closePops(); placePop($("paramsPop"), $("btnParams"));
+    return;
+  }
+  var stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { toast("Microphone permission was refused.", true); return; }
+  REC = { active: true, mode: mode, chunks: [], mr: new MediaRecorder(stream) };
+  REC.mr.ondataavailable = function (e) { REC.chunks.push(e.data); };
+  REC.mr.onstop = async function () {
+    stream.getTracks().forEach(function (t) { t.stop(); });
+    micBtn(mode).classList.remove("rec");
+    REC.active = false;
+    toast("Transcribing…");
+    try {
+      var wav = await toWav16k(new Blob(REC.chunks));
+      var r = await fetch("/api/voice/transcribe", { method: "POST",
+        headers: { "Content-Type": "audio/wav" }, body: wav });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error(d.error || "Transcription failed.");
+      if (!(d.text || "").trim()) { toast("Heard nothing.", true); return; }
+      var input = $(PANES[mode].input);
+      input.value = (input.value ? input.value + " " : "") + d.text.trim();
+      grow(input); input.focus();
+      toast("Heard: " + d.text.trim().slice(0, 80));
+    } catch (e) { toast(e.message, true); }
+  };
+  REC.mr.start();
+  micBtn(mode).classList.add("rec");
+  toast("Recording — press the mic again to stop.");
+}
+// Spoken replies use the operating system's own voices: local, instant.
+function speak(text) {
+  if (!("speechSynthesis" in window)) {
+    toast("This browser offers no speech output.", true);
+    return;
+  }
+  var clean = String(text == null ? "" : text).split("```")
+    .filter(function (_, i) { return i % 2 === 0; })
+    .join(" — code block skipped — ")
+    .replace(/`([^`]+)`/g, "$1").replace(/https?:\/\/\S+/g, "a link")
+    .replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(clean.slice(0, 1500)));
+}
+
 function renderEmbed() {
   var e = (S.status && S.status.embed) || {};
   var st = $("embedState"), btn = $("btnEmbedInstall");
@@ -1089,6 +1206,8 @@ function renderThread(mode) {
           applyAll(m.content);
         }, "miniBtn"));
       }
+      acts.appendChild(mkBtn("Speak", function () { speak(m.content); },
+        "miniBtn"));
       el.appendChild(acts);
     }
     box.appendChild(el);
@@ -1256,6 +1375,7 @@ async function sendMessage(mode, text) {
     chat.messages.push({ role: "assistant", content: acc,
       tps: doneMeta && doneMeta.tps, seconds: doneMeta && doneMeta.seconds });
     renderThread(mode);
+    if (S.speakOn) speak(acc);
   } catch (e) {
     if (e.name === "AbortError") {
       chat.messages.push({ role: "assistant", content: acc, stopped: true });
@@ -1589,6 +1709,7 @@ async function refresh() {
   if (!$("wsRunCmd").value && c.run_command)
     $("wsRunCmd").value = c.run_command;
   renderEngines();
+  renderVoice();
   if (!$("memoryPop").hidden) renderEmbed();
   if (st.setup_complete === false && !S.setupKicked) {
     // First run: fetch Qwen (primary) and Gemma into their own folders.
@@ -1769,6 +1890,27 @@ function wire() {
   $("btnWsAutoFix").addEventListener("click", autoFix);
   $("wsRunCmd").addEventListener("keydown", function (e) {
     if (e.key === "Enter") runCmd(); });
+  $("btnMic").addEventListener("click", function () { toggleMic("chat"); });
+  $("btnCodeMic").addEventListener("click", function () {
+    toggleMic("code"); });
+  $("voicePill").addEventListener("click", function () {
+    S.speakOn = !S.speakOn;
+    $("voicePill").classList.toggle("on", S.speakOn);
+    if (!S.speakOn && "speechSynthesis" in window) speechSynthesis.cancel();
+    toast(S.speakOn ? "Replies will be read aloud."
+                    : "Voice replies off.");
+  });
+  $("btnVoiceInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/voice/install", { method: "POST" });
+      toast(d.already ? "Voice is already set up."
+        : "Downloading whisper.cpp and the voice model — progress is "
+          + "under Models → Downloads.");
+      $("voiceState").textContent = "downloading…";
+      $("btnVoiceInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
+  });
   $("webPill").addEventListener("click", function () {
     S.webOn = !S.webOn;
     $("webPill").classList.toggle("on", S.webOn);

@@ -35,6 +35,8 @@ MODELS_DIR = APP_DIR / "models"
 GH_API = os.environ.get("LLAMA_STUDIO_GITHUB_API",
                         "https://api.github.com").rstrip("/")
 RELEASES = f"{GH_API}/repos/ggml-org/llama.cpp/releases"
+WHISPER_RELEASES = f"{GH_API}/repos/ggml-org/whisper.cpp/releases"
+WHISPER_DIR = APP_DIR / "whisper.cpp"
 HF_BASE = "https://huggingface.co"
 
 
@@ -145,7 +147,7 @@ def _pick_asset(assets: list[dict],
 
 
 def _resolve_release(choices: list[tuple[list[str], str]],
-                     task: Task) -> tuple[dict, dict, str]:
+                     task: Task, base: str = "") -> tuple[dict, dict, str]:
     """(release, asset, why) for the newest release that really carries a
     build for this machine.
 
@@ -153,9 +155,10 @@ def _resolve_release(choices: list[tuple[list[str], str]],
     *tag*.txt asset naming the tag of the release the binaries actually
     live in. Follow that pointer, and failing that walk the recent
     releases, rather than declaring there is nothing to install."""
+    base = base or RELEASES
     headers = {"Accept": "application/vnd.github+json"}
     tried: list[str] = []
-    r = requests.get(RELEASES + "/latest", timeout=30, headers=headers)
+    r = requests.get(base + "/latest", timeout=30, headers=headers)
     r.raise_for_status()
     release = r.json()
     found = _pick_asset(release.get("assets", []), choices)
@@ -175,7 +178,7 @@ def _resolve_release(choices: list[tuple[list[str], str]],
         if tag:
             task.log(f"{release.get('tag_name')} only points at the real "
                      f"build — following it to {tag}.")
-            rr = requests.get(f"{RELEASES}/tags/{tag}", timeout=30,
+            rr = requests.get(f"{base}/tags/{tag}", timeout=30,
                               headers=headers)
             if rr.status_code == 200:
                 rel = rr.json()
@@ -183,7 +186,7 @@ def _resolve_release(choices: list[tuple[list[str], str]],
                 if found:
                     return rel, found[0], found[1]
                 tried.append(tag)
-    rr = requests.get(RELEASES + "?per_page=15", timeout=30, headers=headers)
+    rr = requests.get(base + "?per_page=15", timeout=30, headers=headers)
     if rr.status_code == 200:
         for rel in rr.json():
             found = _pick_asset(rel.get("assets", []), choices)
@@ -213,16 +216,60 @@ def server_binary() -> Path | None:
     return Path(found) if found else None
 
 
+def whisper_binary() -> Path | None:
+    name = "whisper-server.exe" if platform.system() == "Windows" \
+        else "whisper-server"
+    if WHISPER_DIR.is_dir():
+        direct = WHISPER_DIR / name
+        if direct.exists():
+            return direct
+        for found in WHISPER_DIR.rglob(name):
+            return found
+    found = shutil.which(name)
+    return Path(found) if found else None
+
+
+def whisper_install_sync(task: Task) -> None:
+    """whisper.cpp's server binary, from the official releases. Prebuilt
+    zips exist for Windows; elsewhere the person supplies the binary."""
+    if platform.system() != "Windows":
+        raise RuntimeError(
+            "whisper.cpp publishes prebuilt binaries for Windows only. On "
+            "this OS, put a whisper-server binary into ./whisper.cpp "
+            "yourself (package manager or your own build) and retry.")
+    choices = [(["whisper-bin-x64"], "CPU build"),
+               (["bin", "x64"], "CPU build")]
+    task.set(detail="Asking GitHub for the latest whisper.cpp release…")
+    release, match, why = _resolve_release(choices, task,
+                                           base=WHISPER_RELEASES)
+    task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
+    WHISPER_DIR.mkdir(parents=True, exist_ok=True)
+    if not _fetch_zip(task, match, 0, 40, dest_dir=WHISPER_DIR):
+        task.set(state="cancelled", detail="Cancelled")
+        return
+    binary = whisper_binary()
+    if not binary:
+        raise RuntimeError("Unpacked, but no whisper-server binary was "
+                           "found inside the archive.")
+    if platform.system() != "Windows":
+        for f in WHISPER_DIR.rglob("whisper-*"):
+            try:
+                f.chmod(0o755)
+            except OSError:
+                pass
+
+
 def install(hw: dict) -> Task:
     """Download an official release build and unpack it into ./llama.cpp."""
     return spawn("install", "llama.cpp", lambda t: install_sync(t, hw))
 
 
 def _fetch_zip(task: Task, asset: dict, pct_from: float,
-               pct_to: float) -> bool:
+               pct_to: float, dest_dir: Path | None = None) -> bool:
     """Download one release zip into BIN_DIR and unpack it there. False
     means the task was cancelled mid-way."""
-    archive = BIN_DIR / asset["name"]
+    dest_dir = dest_dir or BIN_DIR
+    archive = dest_dir / asset["name"]
     span = pct_to - pct_from
     _stream(asset["browser_download_url"], archive, {},
             lambda got, total, speed, eta: task.set(
@@ -235,7 +282,7 @@ def _fetch_zip(task: Task, asset: dict, pct_from: float,
         return False
     task.set(detail=f"Unpacking {asset['name']}…")
     with zipfile.ZipFile(archive) as z:
-        z.extractall(BIN_DIR)
+        z.extractall(dest_dir)
     archive.unlink(missing_ok=True)
     return True
 
@@ -507,11 +554,14 @@ class Server:
                "-ngl", str(max(0, gpu_layers)), "--no-webui"]
         if extra:
             cmd += extra
+        self._spawn(cmd, model_path)
+
+    def _spawn(self, cmd: list[str], model_path: str) -> None:
         with self._lock:
             self.lines = [" ".join(cmd)]
         env = dict(os.environ)
         if platform.system() != "Windows":
-            lib = str(server_binary().parent)
+            lib = str(Path(cmd[0]).parent)
             env["LD_LIBRARY_PATH"] = lib + ":" + env.get("LD_LIBRARY_PATH", "")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" else 0
@@ -596,6 +646,40 @@ class Server:
             return requests.get(f"{self.url}/props", timeout=5).json()
         except Exception:
             return {}
+
+
+class WhisperServer(Server):
+    """whisper.cpp's server: local speech to text, no audio leaves the
+    machine. Started from the whisper.cpp binary, not llama.cpp's."""
+
+    def start_whisper(self, model_path: str) -> None:
+        binary = whisper_binary()
+        if not binary:
+            raise RuntimeError("whisper.cpp is not installed yet.")
+        if not Path(model_path).exists():
+            raise RuntimeError(f"No such model file: {model_path}")
+        self.stop()
+        self._spawn([str(binary), "-m", model_path,
+                     "--host", "127.0.0.1", "--port", str(self.port)],
+                    model_path)
+
+    def ready(self) -> bool:
+        # whisper-server has no /health; its root page answering is
+        # the ready signal.
+        try:
+            return requests.get(self.url + "/",
+                                timeout=2).status_code < 500
+        except Exception:
+            return False
+
+    def transcribe(self, wav: bytes) -> str:
+        r = requests.post(self.url + "/inference",
+                          files={"file": ("audio.wav", wav, "audio/wav")},
+                          data={"temperature": "0.0",
+                                "response_format": "json"},
+                          timeout=120)
+        r.raise_for_status()
+        return (r.json().get("text") or "").strip()
 
 
 class EmbedServer(Server):
