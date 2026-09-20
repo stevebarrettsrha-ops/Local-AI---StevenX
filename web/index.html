@@ -303,6 +303,9 @@
       <button class="pill" id="btnSystem">
         <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/></svg>
         <span id="systemLabel">System prompt</span></button>
+      <button class="pill" id="btnMemory">
+        <svg viewBox="0 0 24 24"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-2 7 4 4 0 0 0 3 6h6a4 4 0 0 0 3-6 4 4 0 0 0-2-7V7a4 4 0 0 0-4-4z"/></svg>
+        <span id="memoryLabel">Memory</span></button>
       <span class="pill" id="speedPill" hidden></span>
     </div>
 
@@ -505,6 +508,28 @@ files to the model, apply its fixes, and run again — up to 3 rounds.">
   </div>
 </div>
 
+<!-- memory -->
+<div class="pop" id="memoryPop" hidden>
+  <h3>Memory</h3>
+  <textarea id="memoryText" rows="8" spellcheck="false"
+    placeholder="- Facts worth keeping across conversations, one per line.
+The model adds lines here itself when a reply contains remember: …"></textarea>
+  <p class="note">Sent with every conversation, in every chat. The model can
+    add to it by writing a line starting with <b>remember:</b> — edit or
+    delete anything here, it is just a text file
+    (<span style="font-family:var(--mono)">data/memory.md</span>).</p>
+  <div class="orow"><span class="lab">Use past conversations as context</span>
+    <div class="ctl"><input type="checkbox" id="recallChk"
+      style="width:auto"></div></div>
+  <p class="note">When on, excerpts of earlier chats that share enough words
+    with your question ride along so the model can refer back to them.</p>
+  <div class="rowbtn">
+    <button class="btn thin go" id="btnSaveMemory">Save</button>
+    <button class="btn thin" id="btnClearMemory">Clear</button>
+    <button class="btn thin" id="btnCloseMemory">Done</button>
+  </div>
+</div>
+
 <div class="toast" id="toast" hidden></div>
 
 <script>
@@ -575,7 +600,11 @@ function placePop(pop, anchor) {
   pop.style.left = Math.max(12,
     Math.min(r.left, window.innerWidth - pop.offsetWidth - 12)) + "px";
 }
-function closePops() { $("paramsPop").hidden = true; $("systemPop").hidden = true; }
+function closePops() {
+  $("paramsPop").hidden = true;
+  $("systemPop").hidden = true;
+  $("memoryPop").hidden = true;
+}
 
 // Markdown-lite: fenced code blocks and inline code only, everything
 // escaped. An unclosed fence (mid-stream) renders as a code block too.
@@ -1614,13 +1643,53 @@ function wire() {
   $("btnCloseParams").addEventListener("click", closePops);
   $("btnCloseSystem").addEventListener("click", closePops);
   document.addEventListener("pointerdown", function (e) {
-    ["paramsPop", "systemPop"].forEach(function (id) {
+    ["paramsPop", "systemPop", "memoryPop"].forEach(function (id) {
       var pop = $(id);
       if (pop.hidden || pop.contains(e.target)) return;
-      if ($("btnParams").contains(e.target) || $("btnSystem").contains(e.target))
+      if ($("btnParams").contains(e.target) ||
+          $("btnSystem").contains(e.target) ||
+          $("btnMemory").contains(e.target))
         return;
       pop.hidden = true;
     });
+  });
+  $("btnMemory").addEventListener("click", async function () {
+    var pop = $("memoryPop"), open = !pop.hidden;
+    closePops();
+    if (open) return;
+    try {
+      var d = await api("/api/memory");
+      $("memoryText").value = d.text || "";
+      $("recallChk").checked = !!d.recall;
+      $("memoryLabel").textContent = (d.text || "").trim()
+        ? "Memory · set" : "Memory";
+    } catch (e) { /* still show the editor */ }
+    placePop(pop, $("btnMemory"));
+  });
+  $("btnSaveMemory").addEventListener("click", async function () {
+    await api("/api/memory", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: $("memoryText").value }) });
+    $("memoryLabel").textContent = $("memoryText").value.trim()
+      ? "Memory · set" : "Memory";
+    closePops(); toast("Memory saved — it now rides with every chat.");
+  });
+  $("btnClearMemory").addEventListener("click", async function () {
+    $("memoryText").value = "";
+    await api("/api/memory", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "" }) });
+    $("memoryLabel").textContent = "Memory";
+    toast("Memory cleared.");
+  });
+  $("btnCloseMemory").addEventListener("click", closePops);
+  $("recallChk").addEventListener("change", async function () {
+    await api("/api/config", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recall: $("recallChk").checked }) });
+    toast($("recallChk").checked
+      ? "Past conversations will be used as context."
+      : "Past conversations stay out of new chats.");
   });
   [["tempSl", "tempVal", "temperature"], ["toppSl", "toppVal", "top_p"]]
     .forEach(function (row) {

@@ -567,9 +567,11 @@ class Server:
                 "temperature": float(params.get("temperature", 0.7)),
                 "top_p": float(params.get("top_p", 0.95)),
                 "max_tokens": int(params.get("max_tokens", 1024))}
-        if params.get("system"):
+        sys_full = ((params.get("system") or "") +
+                    (params.get("system_extra") or "")).strip()
+        if sys_full:
             body["messages"] = [{"role": "system",
-                                 "content": params["system"]}] + messages
+                                 "content": sys_full}] + messages
         with requests.post(f"{self.url}/v1/chat/completions", json=body,
                            stream=True, timeout=600) as r:
             if r.status_code >= 400:

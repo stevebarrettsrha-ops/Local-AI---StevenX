@@ -27,6 +27,7 @@ import fit
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 CHATS_PATH = DATA_DIR / "chats.json"
+MEMORY_PATH = DATA_DIR / "memory.md"
 CONFIG_PATH = DATA_DIR / "config.json"
 WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("LLAMA_STUDIO_PORT", "7806"))
@@ -40,7 +41,7 @@ DEFAULTS = {
     "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 1024,
     "system": "", "kv_bits": 16, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
-    "run_command": "",
+    "run_command": "", "recall": True,
 }
 
 
@@ -143,10 +144,123 @@ def api_config():
     b = request.get_json(silent=True) or {}
     for key in ("ctx", "temperature", "top_p", "max_tokens", "system",
                 "kv_bits", "auto_start", "hf_token", "hf_endpoint",
-                "plan_for", "setup_complete"):
+                "plan_for", "setup_complete", "recall"):
         if key in b:
             cfg[key] = b[key]
     save_config(cfg)
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# memory (persistent notes + recall of relevant past conversations)
+# --------------------------------------------------------------------------- #
+MEMORY_CAP = 16_000        # characters kept in the memory file
+MEMORY_INJECT = 4_000      # characters of it sent with each request
+
+
+def read_memory() -> str:
+    try:
+        return MEMORY_PATH.read_text(encoding="utf-8") \
+            if MEMORY_PATH.exists() else ""
+    except OSError:
+        return ""
+
+
+def write_memory(text: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MEMORY_PATH.write_text(text[:MEMORY_CAP], encoding="utf-8")
+
+
+def remember_lines(reply: str) -> int:
+    """Lines the model marked `remember:` become permanent memory. The
+    file is user-editable and capped, so a chatty model cannot flood it."""
+    new = [ln.strip()[9:].strip() for ln in reply.splitlines()
+           if ln.strip().lower().startswith("remember:")]
+    new = [n for n in new if n]
+    if not new:
+        return 0
+    mem = read_memory()
+    have = {ln.lstrip("- ").strip().lower() for ln in mem.splitlines()}
+    added = [n for n in new if n.lower() not in have]
+    if added:
+        write_memory((mem.rstrip() + "\n" if mem.strip() else "") +
+                     "\n".join("- " + n for n in added) + "\n")
+    return len(added)
+
+
+_STOP = {"the", "and", "that", "this", "with", "from", "have", "what",
+         "your", "about", "into", "does", "how", "can", "for", "you",
+         "are", "was", "were", "will", "would", "could", "should", "did",
+         "when", "where", "which", "there", "here", "then", "than",
+         "please", "make", "just", "like", "also", "some", "them",
+         "they", "their", "file", "files", "code"}
+
+
+def _terms(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower())
+            if w not in _STOP}
+
+
+def recall_snippets(query: str, exclude_id: str, limit: int = 2) -> list[str]:
+    """Excerpts from OTHER conversations that share enough distinct words
+    with the question to plausibly matter. Keyword overlap, not magic —
+    cheap, local, and inspectable."""
+    q = _terms(query)
+    if len(q) < 2:
+        return []
+    scored = []
+    for c in read_chats():
+        if c["id"] == exclude_id:
+            continue
+        msgs = c.get("messages", [])
+        for i, m in enumerate(msgs):
+            if m.get("role") != "user":
+                continue
+            reply = msgs[i + 1]["content"] if i + 1 < len(msgs) \
+                and msgs[i + 1].get("role") == "assistant" else ""
+            score = len(q & _terms(m.get("content", "") + " " + reply))
+            if score >= 2:
+                scored.append((score, c.get("title", ""),
+                               m.get("content", ""), reply))
+    scored.sort(key=lambda t: -t[0])
+    out = []
+    for _, title, um, am in scored[:limit]:
+        out.append('From the conversation "%s" — asked: "%s" — answered: '
+                   '"%s"' % (title, um[:200].replace("\n", " "),
+                             am[:400].replace("\n", " ")))
+    return out
+
+
+def context_extra(query: str, chat_id: str) -> str:
+    """What rides along with the system prompt: remembered notes, and
+    (when enabled) excerpts from earlier conversations."""
+    parts = []
+    mem = read_memory().strip()
+    if mem:
+        parts.append("Things to remember from earlier (persistent memory; "
+                     "the user can edit these):\n" + mem[:MEMORY_INJECT])
+    if cfg.get("recall", True):
+        snips = recall_snippets(query, chat_id)
+        if snips:
+            parts.append("Relevant excerpts from earlier conversations:\n" +
+                         "\n".join(snips))
+    if parts:
+        parts.append("To permanently remember a new important fact, put it "
+                     "on its own line starting with remember: in your "
+                     "reply.")
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+@app.get("/api/memory")
+def api_memory_get():
+    return jsonify({"text": read_memory(),
+                    "recall": bool(cfg.get("recall", True))})
+
+
+@app.post("/api/memory")
+def api_memory_set():
+    b = request.get_json(silent=True) or {}
+    write_memory(str(b.get("text") or ""))
     return jsonify({"ok": True})
 
 
@@ -706,7 +820,9 @@ def api_chat_send():
     params = {"temperature": b.get("temperature", cfg.get("temperature")),
               "top_p": b.get("top_p", cfg.get("top_p")),
               "max_tokens": b.get("max_tokens", cfg.get("max_tokens")),
-              "system": b.get("system", cfg.get("system"))}
+              "system": b.get("system", cfg.get("system")),
+              # persistent memory + excerpts from earlier conversations
+              "system_extra": context_extra(text, chat["id"])}
 
     def stream():
         started = time.time()
@@ -741,6 +857,9 @@ def api_chat_send():
                 chat["model"] = Path(server.model).name if server.model \
                     else chat.get("model")
                 put_chat(chat)
+                # Any `remember:` lines in the reply become permanent
+                # memory for every future conversation.
+                remember_lines(reply)
 
     return Response(stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",

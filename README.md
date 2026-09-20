@@ -106,6 +106,20 @@ Pasting a safetensors repo by hand does the same thing — the app checks whethe
 a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
 never a dead link.
 
+## Memory
+
+Two kinds, both plain files you can read and edit:
+
+- **Persistent memory** (`data/memory.md`) is sent with every request in
+  every conversation. Edit it from the **Memory** pill in the top bar, or
+  let the model add to it: any reply line starting with `remember:` is
+  appended (de-duplicated, size-capped). Delete lines you don't want kept.
+- **Recall**: when a new question shares enough distinct words with an
+  earlier conversation, short excerpts of that exchange ride along as
+  context, so "how did we fix that bug last week?" actually works. Plain
+  keyword overlap over `data/chats.json` — cheap, local, inspectable —
+  and a single toggle in the Memory panel turns it off.
+
 ## Web search (opt-in)
 
 The **Web** pill in the chat composer, when switched on, searches
