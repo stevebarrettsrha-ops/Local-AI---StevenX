@@ -6,14 +6,18 @@ Run:  python server.py        (opens http://127.0.0.1:7806)
 
 from __future__ import annotations
 
+import html as html_mod
 import json
 import os
+import re
 import threading
 import time
+import urllib.parse
 import uuid
 import webbrowser
 from pathlib import Path
 
+import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 import engine
@@ -146,7 +150,7 @@ def api_config():
 # --------------------------------------------------------------------------- #
 # engines (switchable model families in their own folders under ./models)
 # --------------------------------------------------------------------------- #
-ENGINE_ORDER = ["qwen", "gemma"]          # qwen listed first: the primary
+ENGINE_ORDER = ["qwen", "coder", "gemma", "glm"]   # qwen first: the primary
 SETUP_PLAN = [("qwen3-8b", "qwen"),       # (catalogue id, folder)
               ("gemma-4-e4b-unc", "gemma")]
 
@@ -452,6 +456,52 @@ def api_task_cancel(task_id: str):
     if task:
         task.cancel = True
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# web search (opt-in, per message; DuckDuckGo's keyless HTML endpoint)
+# --------------------------------------------------------------------------- #
+SEARCH_URL = os.environ.get("LLAMA_STUDIO_SEARCH_URL",
+                            "https://html.duckduckgo.com/html/")
+
+
+def _ddg_target(href: str) -> str:
+    """DuckDuckGo wraps result links in a redirect; unwrap to the real URL."""
+    m = re.search(r"[?&]uddg=([^&]+)", href)
+    return urllib.parse.unquote(m.group(1)) if m else href
+
+
+@app.get("/api/search")
+def api_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"error": "Nothing to search."}), 400
+    try:
+        r = requests.get(SEARCH_URL, params={"q": q}, timeout=12,
+                         headers={"User-Agent": "Mozilla/5.0 (LlamaStudio)"})
+        r.raise_for_status()
+        page = r.text
+        links = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            page, re.S)
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>',
+                              page, re.S)
+
+        def clean(s: str) -> str:
+            return html_mod.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+        results = []
+        for i, (href, title) in enumerate(links[:5]):
+            results.append({"title": clean(title),
+                            "url": _ddg_target(html_mod.unescape(href)),
+                            "snippet": clean(snippets[i])
+                            if i < len(snippets) else ""})
+        if not results:
+            return jsonify({"error": "The search engine returned nothing "
+                                     "readable."}), 502
+        return jsonify({"query": q, "results": results})
+    except requests.RequestException as exc:
+        return jsonify({"error": f"Search failed: {exc}"}), 502
 
 
 # --------------------------------------------------------------------------- #

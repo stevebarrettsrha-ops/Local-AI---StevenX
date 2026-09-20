@@ -131,6 +131,7 @@
   .msg .meta{font-size:11.5px;color:var(--dim);margin-top:7px}
   .msg .body code{background:#3a3936;border:1px solid #45443e;border-radius:6px;
                   padding:1px 6px;font-family:var(--mono);font-size:12px;color:#e9bd9b}
+  .msg .body a{color:#e8a87c}
   .codeblock{margin:10px 0;border:1px solid var(--line);border-radius:10px;
              overflow:hidden;background:#1c1b19}
   .cbhead{display:flex;align-items:center;justify-content:space-between;
@@ -319,6 +320,9 @@
             placeholder="Ask it something…"></textarea>
           <div class="crow">
             <span class="pill" id="ctxPill" title="Context length">8k ctx</span>
+            <button class="pill" id="webPill"
+              title="Search the web first and give the model the results">
+              Web</button>
             <span class="mlab" id="chatModelLab"></span>
             <button class="send" id="btnSend">Send</button>
             <button class="send" id="btnStop" hidden
@@ -338,6 +342,9 @@
             <button class="btn thin go" id="btnWsOpen">Open</button>
           </div>
           <div class="wsroot" id="wsRoot"></div>
+          <div style="padding:2px 10px 6px">
+            <button class="btn thin" id="btnWsAll" hidden>Attach all files</button>
+          </div>
           <div class="wslist" id="wsList">
             <div class="note" style="padding:4px 8px">Open a folder on this
               computer to read and edit its files with the model.</div>
@@ -488,8 +495,8 @@
 
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
-          setupKicked: false, cur: { chat: null, code: null },
-          ws: { path: "", attached: null, lastFile: "" } };
+          setupKicked: false, cur: { chat: null, code: null }, webOn: false,
+          ws: { path: "", attached: [], lastFile: "" } };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -501,7 +508,11 @@ var PANES = {
 };
 var CODE_SYSTEM = "You are a precise coding assistant. Lead with working " +
   "code in fenced blocks tagged with the language, then explain briefly. " +
-  "Prefer minimal, correct, idiomatic examples.";
+  "Prefer minimal, correct, idiomatic examples. When changing a project " +
+  "given to you as multiple files, output every file you create or modify " +
+  "as its own complete fenced block whose info line is the language " +
+  "followed by path=<relative path>, for example: ```python " +
+  "path=src/utils.py — always the whole file, never a fragment.";
 var CODE_CHIPS = [
   "Write a Python function that checks whether a string is a palindrome.",
   "Explain this error and how to fix it: TypeError: 'NoneType' object is not iterable",
@@ -557,20 +568,34 @@ function renderBody(text, withApply) {
   for (var i = 0; i < parts.length; i++) {
     if (i % 2 === 0) {
       html += '<span class="prose">' + esc(parts[i])
-        .replace(/`([^`\n]+)`/g, "<code>$1</code>") + "</span>";
+        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/(https?:\/\/[^\s<>"')\]]+)/g,
+          '<a href="$1" target="_blank" rel="noopener">$1</a>') + "</span>";
     } else {
+      // Info line: a language, optionally followed by path=<relative
+      // path> — the convention project-wide answers use so each block
+      // knows which file it belongs to.
       var seg = parts[i], nl = seg.indexOf("\n");
-      var lang = nl === -1 ? "" : seg.slice(0, nl).trim();
+      var info = nl === -1 ? "" : seg.slice(0, nl).trim();
       var codeTxt = nl === -1 ? seg : seg.slice(nl + 1);
-      if (lang && /[^\w+#.-]/.test(lang)) { lang = ""; codeTxt = seg; }
+      var toks = info ? info.split(/\s+/) : [];
+      var lang = toks[0] && /^[\w+#.-]+$/.test(toks[0]) ? toks[0] : "";
+      var fpath = "";
+      toks.forEach(function (t) {
+        var pm = t.match(/^path=(.+)$/);
+        if (pm) fpath = pm[1];
+      });
+      if (info && !lang && !fpath) codeTxt = seg;
+      var target = fpath || S.ws.lastFile;
       var canPreview = lang === "html" || lang === "svg";
       html += '<div class="codeblock"><div class="cbhead"><span>' +
-        esc(lang || "code") + '</span><span class="cbb">' +
+        esc(lang || "code") + (fpath ? " · " + esc(fpath) : "") +
+        '</span><span class="cbb">' +
         (canPreview ?
           '<button class="prev" type="button">Preview</button>' : "") +
-        (withApply && S.ws.lastFile ?
-          '<button class="apply" type="button" title="' +
-          esc(S.ws.lastFile) + '">Apply to file</button>' : "") +
+        (withApply && target ?
+          '<button class="apply" type="button" data-path="' + esc(fpath) +
+          '" title="' + esc(target) + '">Apply to file</button>' : "") +
         '<button class="dl" type="button">Save</button>' +
         '<button class="copy" type="button">Copy</button></span></div>' +
         "<pre>" + esc(codeTxt.replace(/\n$/, "")) + "</pre></div>";
@@ -634,10 +659,12 @@ async function loadTree() {
         "No readable files in that folder.</div>";
       return;
     }
+    $("btnWsAll").hidden = !d.files.length;
     d.files.forEach(function (f) {
       var b = document.createElement("button");
       b.className = "wsfile" +
-        (S.ws.attached && S.ws.attached.path === f.path ? " on" : "");
+        (S.ws.attached.some(function (a) { return a.path === f.path; })
+          ? " on" : "");
       b.textContent = f.path;
       b.title = f.path + " · " + (f.size / 1024).toFixed(1) + " KB";
       b.addEventListener("click", function () { attachFile(f.path); });
@@ -653,28 +680,90 @@ async function loadTree() {
   }
 }
 async function attachFile(path) {
+  var have = S.ws.attached.findIndex(function (a) { return a.path === path; });
+  if (have >= 0) {
+    S.ws.attached.splice(have, 1);
+    renderAttach(); loadTree();
+    return;
+  }
   try {
     var d = await api("/api/workspace/file?path=" + encodeURIComponent(path));
-    S.ws.attached = { path: d.path, content: d.content };
+    S.ws.attached.push({ path: d.path, content: d.content });
     S.ws.lastFile = d.path;
     renderAttach(); loadTree();
     $("codeInput").focus();
     toast(d.path + " attached — ask the model about it.");
   } catch (e) { toast(e.message, true); }
 }
+async function attachAll() {
+  var d;
+  try { d = await api("/api/workspace/tree"); }
+  catch (e) { toast(e.message, true); return; }
+  var budget = 120000, skipped = 0;
+  S.ws.attached = [];
+  for (var i = 0; i < d.files.length; i++) {
+    var f = d.files[i];
+    if (f.size > 40000 || f.size > budget) { skipped++; continue; }
+    try {
+      var r = await api("/api/workspace/file?path=" +
+        encodeURIComponent(f.path));
+      S.ws.attached.push({ path: r.path, content: r.content });
+      budget -= f.size;
+    } catch (e) { skipped++; }
+  }
+  S.ws.lastFile = "";
+  renderAttach(); loadTree();
+  toast("Attached " + S.ws.attached.length + " files" +
+    (skipped ? " — " + skipped + " skipped (too large or unreadable)." : "."));
+}
 function renderAttach() {
   var row = $("wsAttach");
-  row.hidden = !S.ws.attached;
+  row.hidden = !S.ws.attached.length;
   row.innerHTML = "";
-  if (!S.ws.attached) return;
-  var chip = document.createElement("span");
-  chip.className = "pill on";
-  chip.innerHTML = esc(S.ws.attached.path) +
-    ' <span style="cursor:pointer" title="Detach">×</span>';
-  chip.querySelector("span").addEventListener("click", function () {
-    S.ws.attached = null; renderAttach(); loadTree();
+  S.ws.attached.forEach(function (a, i) {
+    var chip = document.createElement("span");
+    chip.className = "pill on";
+    chip.innerHTML = esc(a.path) +
+      ' <span style="cursor:pointer" title="Detach">×</span>';
+    chip.querySelector("span").addEventListener("click", function () {
+      S.ws.attached.splice(i, 1); renderAttach(); loadTree();
+    });
+    row.appendChild(chip);
   });
-  row.appendChild(chip);
+}
+// Every fenced block in a reply that names its own file via path=.
+function pathBlocks(content) {
+  var parts = String(content == null ? "" : content).split("```"), out = [];
+  for (var i = 1; i < parts.length; i += 2) {
+    var seg = parts[i], nl = seg.indexOf("\n");
+    var info = nl === -1 ? "" : seg.slice(0, nl).trim();
+    var m = /(?:^|\s)path=(\S+)/.exec(info);
+    if (m) out.push({ path: m[1],
+                      code: (nl === -1 ? "" : seg.slice(nl + 1))
+                        .replace(/\n$/, "") });
+  }
+  return out;
+}
+async function applyAll(content) {
+  var jobs = pathBlocks(content);
+  if (!jobs.length) return;
+  if (!confirm("Write " + jobs.length + " file(s) into the open folder?\n\n" +
+      jobs.map(function (j) { return j.path; }).join("\n") +
+      "\n\nPrevious versions are kept as .bak."))
+    return;
+  var done = 0;
+  for (var i = 0; i < jobs.length; i++) {
+    try {
+      await api("/api/workspace/file", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: jobs[i].path,
+                               content: jobs[i].code }) });
+      done++;
+    } catch (e) { toast(jobs[i].path + ": " + e.message, true); }
+  }
+  toast("Applied " + done + " of " + jobs.length +
+    " files — previous versions kept as .bak.");
+  loadTree();
 }
 function fenceLang(path) {
   var e = (path.split(".").pop() || "").toLowerCase();
@@ -683,8 +772,7 @@ function fenceLang(path) {
             yml: "yaml" };
   return m[e] || e;
 }
-async function applyToFile(codeText) {
-  var file = S.ws.lastFile;
+async function applyToFile(codeText, file) {
   if (!file) return;
   if (!confirm("Write this code to " + file + "?\nThe previous version " +
                "is kept beside it as " + file.split("/").pop() + ".bak"))
@@ -695,6 +783,7 @@ async function applyToFile(codeText) {
       body: JSON.stringify({ path: file, content: codeText }) });
     toast("Saved to " + d.path +
       (d.backup ? " — previous version kept as " + d.backup : "."));
+    loadTree();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -838,6 +927,11 @@ function renderThread(mode) {
       acts.appendChild(mkBtn("Save .html", function () {
         saveBlob(fileSlug() + ".html", docHtml(m.content), "text/html");
       }, "miniBtn"));
+      if (pathBlocks(m.content).length > 1) {
+        acts.appendChild(mkBtn("Apply all files", function () {
+          applyAll(m.content);
+        }, "miniBtn"));
+      }
       el.appendChild(acts);
     }
     box.appendChild(el);
@@ -919,15 +1013,37 @@ async function send(mode) {
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
   var acc = "", doneMeta = null;
   var outgoing = text;
-  if (mode === "code" && S.ws.attached) {
-    // The question leads (it becomes the chat title); the file rides along
-    // underneath it, then detaches so later turns stay light.
-    outgoing = text + "\n\nHere is `" + S.ws.attached.path + "`:\n```" +
-      fenceLang(S.ws.attached.path) + "\n" + S.ws.attached.content +
-      "\n```";
+  if (mode === "code" && S.ws.attached.length) {
+    // The question leads (it becomes the chat title); the files ride along
+    // underneath it, then detach so later turns stay light. Each file is
+    // fenced with path= so replies can address files by name.
+    outgoing = text + "\n\nProject files:";
+    S.ws.attached.forEach(function (f) {
+      outgoing += "\n\n`" + f.path + "`:\n```" + fenceLang(f.path) +
+        " path=" + f.path + "\n" + f.content + "\n```";
+    });
     chat.messages[chat.messages.length - 1].content = outgoing;
-    S.ws.attached = null;
+    S.ws.attached = [];
     renderAttach(); loadTree();
+  }
+  if (mode === "chat" && S.webOn) {
+    // Opt-in, per message: fetch results first, hand them to the model.
+    body.innerHTML = '<span class="prose" style="color:var(--dim)">' +
+      "Searching the web…</span>";
+    try {
+      var sr = await api("/api/search?q=" + encodeURIComponent(text));
+      outgoing = text + "\n\nWeb search results:\n" +
+        sr.results.map(function (r, i) {
+          return "[" + (i + 1) + "] " + r.title + " — " + r.snippet +
+            " (" + r.url + ")";
+        }).join("\n") +
+        "\n\nUse these results where they help and cite them as [1], [2].";
+      chat.messages[chat.messages.length - 1].content = outgoing;
+    } catch (e) {
+      toast("Web search failed: " + e.message +
+        " — answering without it.", true);
+    }
+    body.innerHTML = '<span class="caret"></span>';
   }
   var payload = { chat: chat.id || "", message: outgoing, mode: mode };
   if (mode === "code") {
@@ -1363,7 +1479,7 @@ function wire() {
       t.textContent = "Saved";
       setTimeout(function () { t.textContent = "Save"; }, 1400);
     } else if (t.classList.contains("apply")) {
-      applyToFile(pre.textContent);
+      applyToFile(pre.textContent, t.dataset.path || S.ws.lastFile);
     } else if (t.classList.contains("prev")) {
       // The page the model wrote, rendered for real in a new tab.
       var url = URL.createObjectURL(new Blob([pre.textContent],
@@ -1423,13 +1539,21 @@ function wire() {
       var d = await api("/api/workspace", { method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: $("wsPath").value.trim() }) });
-      S.ws.path = d.path; S.ws.attached = null; S.ws.lastFile = "";
+      S.ws.path = d.path; S.ws.attached = []; S.ws.lastFile = "";
       renderAttach(); loadTree();
       toast(d.path ? "Opened " + d.path : "Folder closed.");
     } catch (e) { toast(e.message, true); }
   });
   $("wsPath").addEventListener("keydown", function (e) {
     if (e.key === "Enter") $("btnWsOpen").click(); });
+  $("btnWsAll").addEventListener("click", attachAll);
+  $("webPill").addEventListener("click", function () {
+    S.webOn = !S.webOn;
+    $("webPill").classList.toggle("on", S.webOn);
+    toast(S.webOn
+      ? "Web search on — each question searches first and cites sources."
+      : "Web search off — answers come from the model alone.");
+  });
   $("btnSetupRetry").addEventListener("click", startSetup);
   $("btnSetupSkip").addEventListener("click", async function () {
     await api("/api/config", { method: "POST",

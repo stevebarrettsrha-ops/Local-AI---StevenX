@@ -106,16 +106,28 @@ Pasting a safetensors repo by hand does the same thing — the app checks whethe
 a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
 never a dead link.
 
+## Web search (opt-in)
+
+The **Web** pill in the chat composer, when switched on, searches
+DuckDuckGo first, hands the top results to the local model, and the reply
+cites them as [1], [2]… with clickable links. It is off by default and
+per-message, so the app stays fully offline unless you ask otherwise
+(`LLAMA_STUDIO_SEARCH_URL` points it at a different search endpoint).
+
 ## Working on a folder of code
 
 The Code page can open any folder on this computer: type its path, press
 Open, and its files appear in the explorer (common noise like `.git`,
-`node_modules` and `__pycache__` is skipped). Click a file to attach it to
-your next question — the model sees the real contents — and the reply's
-code blocks gain an **Apply to file** button that writes the model's
-version back to disk. Every apply keeps the previous version beside the
-file as `.bak`, so nothing is ever silently lost. Reads are capped at
-300 KB per file and writes can only land inside the opened folder.
+`node_modules` and `__pycache__` is skipped). Click files to attach them —
+or **Attach all files** to hand the model the whole project (size-capped) —
+and ask. Replies follow a convention where every changed file is its own
+fenced block tagged `path=<relative path>`, so each block gets an
+**Apply to file** button and a multi-file reply gets **Apply all files**,
+which writes every changed file back to disk in one go. Every apply keeps
+the previous version beside the file as `.bak`, so nothing is ever
+silently lost. Reads are capped at 300 KB per file and writes can only
+land inside the opened folder. For this whole-project mode the Qwen3
+Coder 30B A3B entry in the catalogue is the model to reach for.
 
 ## Documents and files
 
