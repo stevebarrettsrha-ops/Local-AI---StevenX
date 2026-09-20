@@ -118,10 +118,12 @@ def api_status():
         "running": server.alive(), "ready": server.ready(),
         "model": Path(server.model).name if server.model else "",
         "models": engine.local_models(),
+        "models_dir": str(engine.MODELS_DIR),
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
-                    "kv_bits", "auto_start", "last_model")},
+                    "kv_bits", "auto_start", "last_model", "plan_for")},
         "catalogue": fit.CATALOGUE,
+        "presets": fit.presets(),
         "setup_complete": bool(cfg.get("setup_complete")),
         "tail": server.tail(12),
     })

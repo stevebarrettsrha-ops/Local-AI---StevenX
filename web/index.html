@@ -595,7 +595,9 @@ async function renderCatalogue() {
       }));
     box.appendChild(card);
     if (S.openModel === m.id) {
-      var slot = card.querySelector("#q-" + m.id);
+      // Catalogue ids can contain dots (qwen2.5-coder-7b), which are not
+      // valid unescaped in a selector — find the slot by class instead.
+      var slot = card.querySelector(".quants");
       var cached = S.fitCache[m.id];
       if (cached) renderQuants(slot, cached);
       else slot.innerHTML = '<div class="note">Reading file sizes…</div>';
