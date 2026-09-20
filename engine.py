@@ -31,7 +31,10 @@ DATA_DIR = APP_DIR / "data"
 BIN_DIR = APP_DIR / "llama.cpp"
 MODELS_DIR = APP_DIR / "models"
 
-RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+# Overridable for corporate mirrors and offline test rigs.
+GH_API = os.environ.get("LLAMA_STUDIO_GITHUB_API",
+                        "https://api.github.com").rstrip("/")
+RELEASES = f"{GH_API}/repos/ggml-org/llama.cpp/releases"
 HF_BASE = "https://huggingface.co"
 
 
@@ -102,20 +105,97 @@ def task_list() -> list[Task]:
 # --------------------------------------------------------------------------- #
 # picking a build
 # --------------------------------------------------------------------------- #
-def asset_pattern(hw: dict) -> tuple[str, str]:
-    """(substring to look for in the release asset names, why)."""
+def asset_choices(hw: dict) -> list[tuple[list[str], str]]:
+    """Substring sets to look for in release asset names, best first.
+    Later entries are graceful fallbacks — a CPU build that runs beats a
+    CUDA build that was never found."""
     system = platform.system()
     if system == "Windows":
+        cpu = [(["win", "cpu"], "CPU build"),
+               (["win", "avx2"], "CPU build")]
         if hw.get("vendor") == "nvidia":
-            return "bin-win-cuda", "CUDA build for your NVIDIA card"
+            return [(["win", "cuda"],
+                     "CUDA build for your NVIDIA card")] + cpu
         if hw.get("vendor") == "amd":
-            return "bin-win-hip", "HIP build for your AMD card"
-        return "bin-win-cpu", "CPU build"
+            return [(["win", "hip"], "HIP build for your AMD card"),
+                    (["win", "vulkan"], "Vulkan build for your AMD card")] \
+                + cpu
+        return cpu
     if system == "Darwin":
-        return "bin-macos-arm64", "Apple Silicon build with Metal"
+        return [(["macos", "arm64"], "Apple Silicon build with Metal")]
+    cpu = [(["ubuntu", "x64"], "CPU build"),
+           (["linux", "x64"], "CPU build")]
     if hw.get("vendor") == "nvidia":
-        return "bin-ubuntu-cuda", "CUDA build for your NVIDIA card"
-    return "bin-ubuntu-x64", "CPU build"
+        return [(["ubuntu", "cuda"], "CUDA build for your NVIDIA card"),
+                (["linux", "cuda"], "CUDA build for your NVIDIA card")] + cpu
+    return cpu
+
+
+def _pick_asset(assets: list[dict],
+                choices: list[tuple[list[str], str]]) -> tuple[dict, str] | None:
+    """The best zip in this release for this machine. The cudart zips are
+    runtime DLLs, not builds — never the main pick."""
+    for tokens, why in choices:
+        for a in assets:
+            low = (a.get("name") or "").lower()
+            if (low.endswith(".zip") and "cudart" not in low
+                    and all(t in low for t in tokens)):
+                return a, why
+    return None
+
+
+def _resolve_release(choices: list[tuple[list[str], str]],
+                     task: Task) -> tuple[dict, dict, str]:
+    """(release, asset, why) for the newest release that really carries a
+    build for this machine.
+
+    llama.cpp's 'latest' release is sometimes only a pointer: a tiny
+    *tag*.txt asset naming the tag of the release the binaries actually
+    live in. Follow that pointer, and failing that walk the recent
+    releases, rather than declaring there is nothing to install."""
+    headers = {"Accept": "application/vnd.github+json"}
+    tried: list[str] = []
+    r = requests.get(RELEASES + "/latest", timeout=30, headers=headers)
+    r.raise_for_status()
+    release = r.json()
+    found = _pick_asset(release.get("assets", []), choices)
+    if found:
+        return release, found[0], found[1]
+    tried.append(release.get("tag_name") or "latest")
+    pointer = next((a for a in release.get("assets", [])
+                    if (a.get("name") or "").lower().endswith(".txt")
+                    and "tag" in (a.get("name") or "").lower()), None)
+    if pointer:
+        try:
+            text = requests.get(pointer["browser_download_url"],
+                                timeout=30).text
+            tag = text.strip().splitlines()[0].strip() if text.strip() else ""
+        except Exception:
+            tag = ""
+        if tag:
+            task.log(f"{release.get('tag_name')} only points at the real "
+                     f"build — following it to {tag}.")
+            rr = requests.get(f"{RELEASES}/tags/{tag}", timeout=30,
+                              headers=headers)
+            if rr.status_code == 200:
+                rel = rr.json()
+                found = _pick_asset(rel.get("assets", []), choices)
+                if found:
+                    return rel, found[0], found[1]
+                tried.append(tag)
+    rr = requests.get(RELEASES + "?per_page=15", timeout=30, headers=headers)
+    if rr.status_code == 200:
+        for rel in rr.json():
+            found = _pick_asset(rel.get("assets", []), choices)
+            if found:
+                return rel, found[0], found[1]
+            tried.append(rel.get("tag_name") or "?")
+    sample = ", ".join(a.get("name", "")
+                       for a in release.get("assets", [])[:8])
+    raise RuntimeError(
+        "No usable llama.cpp build in recent releases (looked at " +
+        ", ".join(tried[:8]) + "). The latest release offers: " +
+        (sample or "nothing") + ".")
 
 
 def server_binary() -> Path | None:
@@ -135,41 +215,53 @@ def server_binary() -> Path | None:
 
 def install(hw: dict) -> Task:
     """Download an official release build and unpack it into ./llama.cpp."""
-    return spawn("install", "llama.cpp", lambda t: install_sync(t, hw),
-                 {"pattern": asset_pattern(hw)[0]})
+    return spawn("install", "llama.cpp", lambda t: install_sync(t, hw))
+
+
+def _fetch_zip(task: Task, asset: dict, pct_from: float,
+               pct_to: float) -> bool:
+    """Download one release zip into BIN_DIR and unpack it there. False
+    means the task was cancelled mid-way."""
+    archive = BIN_DIR / asset["name"]
+    span = pct_to - pct_from
+    _stream(asset["browser_download_url"], archive, {},
+            lambda got, total, speed, eta: task.set(
+                pct=pct_from + ((got / total * span) if total else 0),
+                detail=f"{asset['name']}: {got/1e6:.0f} of "
+                       f"{total/1e6:.0f} MB"),
+            lambda: task.cancel)
+    if task.cancel:
+        archive.unlink(missing_ok=True)
+        return False
+    task.set(detail=f"Unpacking {asset['name']}…")
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(BIN_DIR)
+    archive.unlink(missing_ok=True)
+    return True
 
 
 def install_sync(task: Task, hw: dict) -> None:
     """The install itself, runnable inside another task (first-run setup)."""
-    pattern, why = asset_pattern(hw)
     task.set(detail="Asking GitHub for the latest release…")
-    r = requests.get(RELEASES, timeout=30,
-                     headers={"Accept": "application/vnd.github+json"})
-    r.raise_for_status()
-    release = r.json()
-    assets = release.get("assets", [])
-    match = next((a for a in assets
-                  if pattern in a["name"] and a["name"].endswith(".zip")), None)
-    if not match:
-        names = ", ".join(a["name"] for a in assets[:8])
-        raise RuntimeError(
-            f"No asset matching '{pattern}' in {release.get('tag_name')}. "
-            f"Available: {names}")
+    release, match, why = _resolve_release(asset_choices(hw), task)
     task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
     BIN_DIR.mkdir(parents=True, exist_ok=True)
-    archive = BIN_DIR / match["name"]
-    _stream(match["browser_download_url"], archive, {},
-            lambda got, total, speed, eta: task.set(
-                pct=(got / total * 100) if total else 0,
-                detail=f"{got/1e6:.0f} of {total/1e6:.0f} MB"),
-            lambda: task.cancel)
-    if task.cancel:
+    if not _fetch_zip(task, match, 0, 80):
         task.set(state="cancelled", detail="Cancelled")
         return
-    task.set(detail="Unpacking…")
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(BIN_DIR)
-    archive.unlink(missing_ok=True)
+    # A CUDA build on Windows needs the CUDA runtime DLLs too, shipped as
+    # a separate cudart zip beside it — without them llama-server.exe
+    # only starts on machines that happen to have the CUDA toolkit.
+    if "cuda" in match["name"].lower() and platform.system() == "Windows":
+        runtime = next((a for a in release.get("assets", [])
+                        if "cudart" in (a.get("name") or "").lower()
+                        and (a.get("name") or "").lower().endswith(".zip")),
+                       None)
+        if runtime:
+            task.set(pct=80, detail="Fetching the CUDA runtime DLLs…")
+            if not _fetch_zip(task, runtime, 80, 95):
+                task.set(state="cancelled", detail="Cancelled")
+                return
     binary = server_binary()
     if not binary:
         raise RuntimeError("Unpacked, but no llama-server binary was found "
