@@ -6,7 +6,9 @@ Run:  python server.py        (opens http://127.0.0.1:7806)
 
 from __future__ import annotations
 
+import csv
 import html as html_mod
+import io
 import json
 import os
 import re
@@ -19,7 +21,8 @@ import webbrowser
 from pathlib import Path
 
 import requests
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import (Flask, Response, jsonify, request, send_file,
+                   send_from_directory)
 
 import engine
 import fit
@@ -354,6 +357,150 @@ def api_embed_install():
     return jsonify({"ok": True,
                     "task": engine.spawn("download", "recall model",
                                          run).view()})
+
+
+# ---- Office documents: xlsx / docx / pptx built from tagged blocks ---- #
+# The model writes a fenced block tagged xlsx, docx or pptx in a simple
+# format (told to it via DOC_HOWTO); these builders turn that text into
+# the real file. Libraries are imported lazily so the app still runs if
+# they were not installed.
+DOC_HOWTO = (
+    "\n\nWhen the user asks for a spreadsheet, a Word document or a "
+    "PowerPoint deck, put the content in ONE fenced code block tagged "
+    "xlsx, docx or pptx. xlsx: lines of '# Sheet: <name>' each followed "
+    "by CSV rows, first row the headers. docx: Markdown-style # headings, "
+    "paragraphs, - bullets and **bold**. pptx: '# <slide title>' followed "
+    "by - bullet lines, one group per slide. The app offers the real file "
+    "for download from that block.")
+
+
+def build_xlsx(text: str) -> tuple[bytes, str]:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    wb = Workbook()
+    wb.remove(wb.active)
+    sheets, name, rows = [], "Sheet1", []
+    for line in text.splitlines():
+        m = re.match(r"\s*#+\s*Sheet\s*:\s*(.+)$", line, re.I)
+        if m:
+            if rows:
+                sheets.append((name, rows))
+            name, rows = m.group(1).strip()[:31], []
+        elif line.strip():
+            rows.append(next(csv.reader([line])))
+    if rows:
+        sheets.append((name, rows))
+    if not sheets:
+        raise RuntimeError("No rows found in the block.")
+    for sname, srows in sheets:
+        ws = wb.create_sheet(title=sname or "Sheet")
+        for r, row in enumerate(srows, 1):
+            for c, val in enumerate(row, 1):
+                v = val.strip()
+                if v and re.fullmatch(r"-?\d+(\.\d+)?", v):
+                    v = float(v) if "." in v else int(v)
+                cell = ws.cell(row=r, column=c, value=v)
+                if r == 1:
+                    cell.font = Font(bold=True)
+        for col in ws.columns:
+            width = max((len(str(c.value)) for c in col if c.value
+                         is not None), default=8)
+            ws.column_dimensions[col[0].column_letter].width = \
+                min(40, width + 2)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".spreadsheetml.sheet")
+
+
+def _docx_runs(paragraph, text: str) -> None:
+    for i, part in enumerate(re.split(r"\*\*(.+?)\*\*", text)):
+        if part:
+            paragraph.add_run(part).bold = (i % 2 == 1)
+
+
+def build_docx(text: str) -> tuple[bytes, str]:
+    from docx import Document
+    doc = Document()
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m = re.match(r"(#{1,4})\s+(.*)", line)
+        if m:
+            doc.add_heading(re.sub(r"\*\*", "", m.group(2)),
+                            level=min(len(m.group(1)), 4))
+            continue
+        m = re.match(r"\s*[-*]\s+(.*)", line)
+        if m:
+            _docx_runs(doc.add_paragraph(style="List Bullet"), m.group(1))
+            continue
+        m = re.match(r"\s*\d+[.)]\s+(.*)", line)
+        if m:
+            _docx_runs(doc.add_paragraph(style="List Number"), m.group(1))
+            continue
+        _docx_runs(doc.add_paragraph(), line.strip())
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".wordprocessingml.document")
+
+
+def build_pptx(text: str) -> tuple[bytes, str]:
+    from pptx import Presentation
+    prs = Presentation()
+    slides, cur = [], None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = re.match(r"#+\s+(.*)", s)
+        if m:
+            cur = {"title": re.sub(r"\*\*", "", m.group(1)), "bullets": []}
+            slides.append(cur)
+        else:
+            if cur is None:
+                cur = {"title": "", "bullets": []}
+                slides.append(cur)
+            cur["bullets"].append(
+                re.sub(r"\*\*", "", re.sub(r"^[-*]\s+", "", s)))
+    if not slides:
+        raise RuntimeError("No slides found in the block.")
+    layout = prs.slide_layouts[1]          # title and content
+    for sl in slides:
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = sl["title"][:90]
+        frame = slide.placeholders[1].text_frame
+        for i, btxt in enumerate(sl["bullets"][:12]):
+            para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+            para.text = btxt[:200]
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".presentationml.presentation")
+
+
+DOC_BUILDERS = {"xlsx": build_xlsx, "docx": build_docx, "pptx": build_pptx}
+
+
+@app.post("/api/doc")
+def api_doc():
+    b = request.get_json(silent=True) or {}
+    kind = (b.get("kind") or "").lower()
+    if kind not in DOC_BUILDERS:
+        return jsonify({"error": "Unknown document kind."}), 400
+    title = re.sub(r"[^A-Za-z0-9 _-]+", "",
+                   b.get("title") or "document").strip()[:48] or "document"
+    try:
+        data, mime = DOC_BUILDERS[kind](b.get("content") or "")
+    except ImportError as exc:
+        return jsonify({"error": f"The .{kind} exporter needs a Python "
+                        f"package that is not installed ({exc}). Run: "
+                        "pip install -r requirements.txt"}), 500
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+    return send_file(io.BytesIO(data), mimetype=mime, as_attachment=True,
+                     download_name=f"{title}.{kind}")
 
 
 # ---- images: local text-to-image via stable-diffusion.cpp ---- #
@@ -1204,8 +1351,9 @@ def api_chat_send():
               "top_p": b.get("top_p", cfg.get("top_p")),
               "max_tokens": b.get("max_tokens", cfg.get("max_tokens")),
               "system": b.get("system", cfg.get("system")),
-              # persistent memory + excerpts from earlier conversations
-              "system_extra": context_extra(text, chat["id"])}
+              # persistent memory, past-conversation excerpts, and the
+              # Office-document block convention
+              "system_extra": context_extra(text, chat["id"]) + DOC_HOWTO}
 
     def stream():
         started = time.time()

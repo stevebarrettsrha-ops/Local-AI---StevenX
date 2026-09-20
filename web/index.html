@@ -718,9 +718,13 @@ function renderBody(text, withApply) {
       if (info && !lang && !fpath) codeTxt = seg;
       var target = fpath || S.ws.lastFile;
       var canPreview = lang === "html" || lang === "svg";
+      var docKind = { xlsx: "Excel", docx: "Word", pptx: "PowerPoint" }[lang];
       html += '<div class="codeblock"><div class="cbhead"><span>' +
         esc(lang || "code") + (fpath ? " · " + esc(fpath) : "") +
         '</span><span class="cbb">' +
+        (docKind ? '<button class="docgen" type="button" data-kind="' +
+          lang + '" title="Build the real ' + docKind +
+          ' file">Download .' + lang + "</button>" : "") +
         (canPreview ?
           '<button class="prev" type="button">Preview</button>' : "") +
         (withApply && target ?
@@ -751,6 +755,28 @@ function saveBlob(name, text, mime) {
   a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+}
+// A tagged block becomes a real Office file, built by the backend.
+async function makeDoc(kind, content, btn) {
+  var old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Building…";
+  try {
+    var r = await fetch("/api/doc", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: kind, content: content,
+                             title: fileSlug() }) });
+    if (!r.ok) {
+      var e = await r.json().catch(function () { return {}; });
+      throw new Error(e.error || "Export failed.");
+    }
+    var url = URL.createObjectURL(await r.blob());
+    var a = document.createElement("a");
+    a.href = url; a.download = fileSlug() + "." + kind;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    toast("Saved " + fileSlug() + "." + kind);
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; btn.textContent = old; }
 }
 // A reply wrapped as a standalone, printable HTML document.
 function docHtml(content) {
@@ -1926,6 +1952,8 @@ function wire() {
       setTimeout(function () { t.textContent = "Save"; }, 1400);
     } else if (t.classList.contains("apply")) {
       applyToFile(pre.textContent, t.dataset.path || S.ws.lastFile);
+    } else if (t.classList.contains("docgen")) {
+      makeDoc(t.dataset.kind, pre.textContent, t);
     } else if (t.classList.contains("prev")) {
       // The page the model wrote, rendered for real in a new tab.
       var url = URL.createObjectURL(new Blob([pre.textContent],
