@@ -1,0 +1,110 @@
+# Llama Studio
+
+A local chat frontend for **llama.cpp**. It works out which models your card can
+actually hold, downloads the right GGUF, runs `llama-server`, and talks to it.
+
+Port 7806. `run.bat` on Windows, `./run.sh` elsewhere.
+
+---
+
+## The fit check
+
+The same job the canirun.ai page does with dropdowns, except nothing is assumed:
+
+| What | Where it comes from |
+|---|---|
+| Weights | the real GGUF byte size, read from the HuggingFace API |
+| KV cache | the model's own `config.json` — layers × KV heads × head dim × context |
+| Fit | weights + KV + ~0.6 GB working space against your measured VRAM |
+| Speed | memory bandwidth ÷ bytes read per token, at 80% efficiency |
+
+That last one is why quant choice matters: a token reads the whole weight file
+once, so halving the file roughly doubles the speed. It is an estimate and the
+app says so; where your card is not in the bandwidth table, no number is shown
+rather than a guessed one.
+
+On an **RTX 4060 8 GB at 8k context**, Qwen3 8B comes out:
+
+| Quant | Weights | Verdict | Estimate |
+|---|---|---|---|
+| Q4_K_M | 4.6 GB | fits, all 36 layers on the GPU | ~44 tok/s |
+| Q5_K_M | 5.3 GB | fits | ~38 tok/s |
+| Q6_K | 6.3 GB | tight — every layer fits but nothing is spare | ~32 tok/s |
+| Q8_0 | 8.1 GB | 27 of 36 layers on the GPU, rest on the CPU | ~13 tok/s |
+
+Which is the useful correction to "recommended: Q6_K" — that recommendation
+ignores the 1.1 GB of KV cache sitting beside the weights.
+
+Sizes are shown in GiB, the unit a GPU reports, so they read slightly smaller
+than HuggingFace's decimal figures. Same bytes.
+
+**Plan for another card** on the Engine page re-runs every judgement against a
+GPU you do not own, so you can see what an upgrade buys before buying it.
+Loading a model always uses the real hardware.
+
+---
+
+## Running a model
+
+1. **Engine → Install or update** fetches an official llama.cpp release build
+   matching your GPU (CUDA, HIP, Metal or CPU). No compiler.
+2. **Models** lists models worth running here. Open one, read the fit column,
+   download the quant you want — resumable, with progress.
+3. **Load** starts `llama-server` with `-ngl` set from the fit calculation, so
+   as many layers as will fit go on the GPU and no more.
+4. Chat. Replies stream, and each one reports its measured tokens per second.
+
+Any GGUF repo can be checked by pasting `user/Model-GGUF` into the box on the
+Models page.
+
+Parameters (context, temperature, top-p, reply limit, KV cache precision) are in
+the prompt bar. Context and KV precision only take effect on reload — the button
+does the reload for you. Setting KV cache to q8 halves that 1.1 GB, which is
+often what moves a model from *tight* to *fits*.
+
+---
+
+## Big models on a small card
+
+A 27B like `orcarouter/Qwen3.8-27B-Uncensored-GGUF` is past an RTX 4060 at every
+quant — even Q2_K is ~10 GiB against 8 GB of VRAM, so roughly two thirds of the
+layers sit on the GPU and the rest stream from system RAM at a few tokens a
+second. The fit column says exactly how many layers land where, so the decision
+is yours rather than a surprise after a 10 GB download.
+
+Two details that model family exposes, both handled:
+
+- **Hybrid attention.** Qwen3.8 alternates linear-attention layers with full
+  attention, and only the full-attention layers keep a KV cache. Counting all 64
+  layers would overstate the cache four-fold and wrongly condemn quants that
+  actually fit.
+- **mmproj files.** The vision projector in a GGUF repo is not a model; it is
+  loaded beside one with `--mmproj`. It is listed as a companion rather than as
+  a candidate.
+
+Repos in FP8, NVFP4, INT8 or MLX are for vLLM, TensorRT and Apple MLX — llama.cpp
+loads GGUF only. Both builds of that family are in the catalogue: the FP8 one is
+listed for reference and says plainly that it cannot run here (and that it wants
+~28 GB resident with no CPU offload), with a button through to the GGUF build.
+Pasting a safetensors repo by hand does the same thing — the app checks whether
+a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
+never a dead link.
+
+## Notes
+
+- Conversations are stored in `data/chats.json`. The user's message is saved
+  before generation starts, and a partial reply is kept if you press Stop, so
+  nothing is lost mid-answer.
+- Models live in `./models`. Delete from the Models page.
+- Split GGUF files (`-of-` in the name) are listed but not auto-downloaded;
+  they need joining by hand.
+- Nothing leaves the machine except the model downloads themselves.
+
+```
+server.py       Flask API — chat streaming, fit, downloads, engine control
+fit.py          Hardware detection, model catalogue, the fit calculator
+engine.py       llama.cpp release install, llama-server process, GGUF downloads
+web/index.html  The interface — one file, no build step
+```
+
+Port: `LLAMA_STUDIO_PORT`. `LLAMA_STUDIO_NO_BROWSER=1` stops it opening a tab.
