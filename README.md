@@ -106,6 +106,85 @@ Pasting a safetensors repo by hand does the same thing — the app checks whethe
 a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
 never a dead link.
 
+## Memory
+
+Two kinds, both plain files you can read and edit:
+
+- **Persistent memory** (`data/memory.md`) is sent with every request in
+  every conversation. Edit it from the **Memory** pill in the top bar, or
+  let the model add to it: any reply line starting with `remember:` is
+  appended (de-duplicated, size-capped). Delete lines you don't want kept.
+- **Recall**: excerpts of earlier conversations that match the new
+  question ride along as context, so "how did we fix that bug last
+  week?" actually works. With the tiny **semantic recall** model
+  installed (nomic-embed-text, ~150 MB, one click in the Memory panel),
+  matching is by *meaning*: a second `llama-server --embeddings`
+  instance runs it on the CPU beside the chat model, every finished
+  exchange is embedded into `data/embeddings.json`, and questions are
+  matched by cosine similarity. Without it, plain keyword overlap over
+  `data/chats.json` is used instead. Either way it is local,
+  inspectable, and switched off by one toggle.
+
+## Images
+
+The Images page generates pictures locally with **stable-diffusion.cpp**
+(the diffusion engine from the same ggml family): one click downloads the
+official release build — the CUDA variant for NVIDIA cards, with its
+runtime DLLs — plus the Stable Diffusion 1.5 Q8 GGUF (~1.8 GB) into
+`models/image/`. Prompt, size and steps in, PNGs out, with progress per
+sampling step; everything lands in `data/images` with its prompt saved
+beside it, browsable in the gallery. On an RTX 4060 a 512×512 at 20 steps
+takes a few seconds. Swap any sd.cpp-compatible GGUF into `models/image/`
+to change models.
+
+## Voice
+
+- **Speech in**: the mic button beside Send records, then transcribes
+  locally with **whisper.cpp** — the official release binary running as a
+  small server, with the `ggml-base` model in `models/voice/` (one-click
+  download under Parameters, ~160 MB total). The browser converts your
+  recording to 16 kHz WAV itself, so no converter is needed, and no audio
+  ever leaves the machine. The browser's built-in cloud speech
+  recognition is deliberately not used.
+- **Speech out**: the Voice pill in the top bar reads replies aloud with
+  the voices built into your operating system (code blocks are skipped,
+  links read as "a link"); every reply also has a Speak button.
+
+## Web search (opt-in)
+
+The **Web** pill in the chat composer, when switched on, searches
+DuckDuckGo first, hands the top results to the local model, and the reply
+cites them as [1], [2]… with clickable links. It is off by default and
+per-message, so the app stays fully offline unless you ask otherwise
+(`LLAMA_STUDIO_SEARCH_URL` points it at a different search endpoint).
+
+## Working on a folder of code
+
+The Code page can open any folder on this computer: type its path, press
+Open, and its files appear in the explorer (common noise like `.git`,
+`node_modules` and `__pycache__` is skipped). Click files to attach them —
+or **Attach all files** to hand the model the whole project (size-capped) —
+and ask. Replies follow a convention where every changed file is its own
+fenced block tagged `path=<relative path>`, so each block gets an
+**Apply to file** button and a multi-file reply gets **Apply all files**,
+which writes every changed file back to disk in one go. Every apply keeps
+the previous version beside the file as `.bak`, so nothing is ever
+silently lost. Reads are capped at 300 KB per file and writes can only
+land inside the opened folder. For this whole-project mode the Qwen3
+Coder 30B A3B entry in the catalogue is the model to reach for.
+
+### Run &amp; fix
+
+Set a run command under the file list — `python app.py`, `npm test`,
+whatever proves the project works — and **Run** executes it inside the
+open folder with the output in a console. **Run &amp; fix** is the
+autonomous loop: run; on a non-zero exit, send the error output and the
+current files to the model, apply the corrected files it returns (each
+with a `.bak` of the previous version), and run again — up to three
+rounds, stopping the moment the command passes, the model returns no
+file changes, or the rounds run out. The command is always the one you
+typed; model output never chooses what gets executed.
+
 ## Documents and files
 
 Everything the model writes can leave the chat as a real file, entirely in

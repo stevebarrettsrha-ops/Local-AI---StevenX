@@ -77,6 +77,22 @@ CATALOGUE = [
      "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
      "config_repo": "Qwen/Qwen2.5-Coder-7B-Instruct",
      "note": "For code. Fill-in-the-middle as well as chat."},
+    {"id": "qwen3-coder-30b", "name": "Qwen3 Coder 30B A3B", "params": 30.5,
+     "family": "coder",
+     "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+     "config_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+     "note": "The big agentic coder. Mixture of experts — only ~3B of the "
+             "30B runs per token — so it stays usable with most layers in "
+             "system RAM: the practical way to run a big coder on an 8 GB "
+             "card beside 32 GB of RAM. Quantise the KV cache (q8) for "
+             "long contexts."},
+    {"id": "glm-4.7-flash", "name": "GLM 4.7 Flash", "params": 30.0,
+     "family": "glm",
+     "repo": "unsloth/GLM-4.7-Flash-GGUF",
+     "config_repo": "zai-org/GLM-4.7-Flash",
+     "note": "30B-class mixture of experts tuned for agentic work; the Q4 "
+             "builds are notably smaller than Qwen3 Coder's, so more of it "
+             "fits on an 8 GB card. A strong second opinion for code."},
     {"id": "qwen38-27b-unc-fp8", "name": "Qwen3.8 27B Uncensored — FP8",
      "params": 27.0, "runtime": "vllm",
      "repo": "orcarouter/Qwen3.8-27B-Uncensored-FP8",
@@ -313,17 +329,25 @@ def model_config(cfg: dict, repo: str) -> dict:
         hidden = int(text.get("hidden_size") or 0)
         head_dim = int(text.get("head_dim") or
                        (hidden // heads if heads else 0))
+        # Mixture-of-experts models read only a few experts per token, so
+        # "file size ÷ bandwidth" would overstate the read several-fold.
+        # The exact bytes per token cannot be measured from config.json
+        # (shared weights are always read), so the speed estimate is
+        # withheld for these rather than invented.
+        experts = int(text.get("num_experts") or text.get("n_routed_experts")
+                      or text.get("num_local_experts") or 0)
         if layers and kv_heads and head_dim:
             out = {"layers": layers, "kv_layers": kv_layers,
                    "kv_heads": kv_heads, "head_dim": head_dim,
                    "exact": True,
-                   "hybrid": kv_layers != layers}
+                   "hybrid": kv_layers != layers,
+                   "moe": experts > 1}
             _CONFIG_CACHE[repo] = out
             return out
     except Exception:
         pass
     return {"layers": 32, "kv_layers": 32, "kv_heads": 8, "head_dim": 128,
-            "exact": False, "hybrid": False}
+            "exact": False, "hybrid": False, "moe": False}
 
 
 def kv_bytes(conf: dict, ctx: int, kv_bits: int = 16) -> int:
@@ -371,7 +395,9 @@ def assess(weights: int, conf: dict, hw: dict, ctx: int = 8192,
     speed = None
     # Below ~50 MB it is not a real model file (a stub, or a truncated
     # download), and bandwidth over size would report a fantasy number.
-    if bw and weights > 50 * 1024 * 1024:
+    # MoE models read only part of the file per token, so the formula does
+    # not apply — no number beats a wrong one.
+    if bw and weights > 50 * 1024 * 1024 and not conf.get("moe"):
         on_gpu = min(gpu_layers / layers, 1.0) if layers else 0
         gpu_part = weights * on_gpu
         cpu_part = weights * (1 - on_gpu)
@@ -387,6 +413,7 @@ def assess(weights: int, conf: dict, hw: dict, ctx: int = 8192,
             "speed": speed, "speed_is_estimate": True,
             "exact_kv": conf.get("exact", False), "fits_ram": fits_ram,
             "hybrid": conf.get("hybrid", False),
+            "moe": conf.get("moe", False),
             "ctx": ctx}
 
 
@@ -410,15 +437,21 @@ def verdict_text(a: dict, hw: dict) -> str:
                     f"{a['gpu_layers']} of {a['layers']} layers sit on the GPU "
                     "and the rest on the CPU. A shorter context buys them back.")
     elif a["verdict"] == "spills":
-        base = (f"Spills: only {a['gpu_layers']} of {a['layers']} layers fit. "
-                "Most of each token is read from system RAM, which is roughly "
-                "an order of magnitude slower.")
+        base = f"Spills: only {a['gpu_layers']} of {a['layers']} layers fit."
+        if not a.get("moe"):
+            base += (" Most of each token is read from system RAM, which is "
+                     "roughly an order of magnitude slower.")
     else:
         base = "No GPU detected, so this runs on the CPU."
     if a.get("hybrid"):
         base += (" Hybrid attention: only the full-attention layers hold a KV "
                  "cache, which is why it is smaller than the layer count "
                  "suggests.")
+    if a.get("moe"):
+        base += (" Mixture of experts: only a few experts run per token, so "
+                 "layers in system RAM cost far less speed than they would "
+                 "for a dense model this size. No speed estimate — the bytes "
+                 "read per token cannot be measured from the file size.")
     if not a["exact_kv"]:
         base += (" KV cache is estimated — the model's config.json could not "
                  "be read.")

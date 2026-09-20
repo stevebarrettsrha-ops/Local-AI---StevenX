@@ -88,6 +88,31 @@
   .seg:hover{color:var(--text)}
   .seg.on{background:rgba(217,119,87,.16);color:#eeb296}
 
+  /* ---------- workspace (Code page file explorer) ---------- */
+  .codewrap{display:flex;flex:1;min-height:0}
+  .codecol{flex:1;display:flex;flex-direction:column;min-width:0}
+  .ws{width:256px;flex:none;border-right:1px solid var(--hair);
+      background:var(--chrome);display:flex;flex-direction:column;min-height:0}
+  .wshead{padding:10px;display:flex;gap:6px;border-bottom:1px solid var(--hair)}
+  .wshead input{font-size:11.5px;font-family:var(--mono);padding:7px 9px}
+  .wsroot{padding:8px 12px 2px;font-size:10.5px;color:var(--dim);
+      font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap}
+  .wslist{overflow-y:auto;flex:1;padding:6px 8px}
+  .wsfile{display:block;width:100%;text-align:left;padding:4px 9px;
+      border-radius:7px;color:var(--muted);font-family:var(--mono);
+      font-size:11.5px;white-space:nowrap;overflow:hidden;
+      text-overflow:ellipsis}
+  .wsfile:hover{background:#2a2926;color:var(--text)}
+  .wsfile.on{background:var(--raised);color:var(--text)}
+  .attachrow{display:flex;gap:6px;padding:0 4px 6px;flex-wrap:wrap}
+  .wsrun{border-top:1px solid var(--hair);padding:10px;display:flex;
+      flex-direction:column;gap:6px}
+  .wsrun input{font-size:11.5px;font-family:var(--mono);padding:7px 9px}
+  .wsrunbtns{display:flex;gap:6px}
+  .wsconsole{height:130px;font-size:10.5px;padding:8px;line-height:1.5}
+  @media (max-width:820px){.ws{display:none}}
+
   /* ---------- first-run setup ---------- */
   .setupbar{display:flex;align-items:center;gap:14px;padding:10px 20px;
         border-bottom:1px solid var(--hair);background:var(--panel);
@@ -111,6 +136,7 @@
   .msg .meta{font-size:11.5px;color:var(--dim);margin-top:7px}
   .msg .body code{background:#3a3936;border:1px solid #45443e;border-radius:6px;
                   padding:1px 6px;font-family:var(--mono);font-size:12px;color:#e9bd9b}
+  .msg .body a{color:#e8a87c}
   .codeblock{margin:10px 0;border:1px solid var(--line);border-radius:10px;
              overflow:hidden;background:#1c1b19}
   .cbhead{display:flex;align-items:center;justify-content:space-between;
@@ -129,6 +155,11 @@
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
          vertical-align:-2px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:0}}
+  .mic{padding:7px 12px;border-radius:9px;background:#3a3935;color:var(--muted)}
+  .mic:hover{color:var(--text)}
+  .mic svg{width:16px;height:16px;display:block}
+  .mic.rec{background:var(--err);color:#fff;animation:pulse 1.2s infinite}
+  @keyframes pulse{50%{opacity:.55}}
   .composer{padding:10px 22px 18px}
   .cwrap{max-width:780px;margin:0 auto;background:#302f2c;
          border:1px solid var(--line);border-radius:14px;padding:10px 10px 8px;
@@ -208,6 +239,17 @@
   .bar i{display:block;height:100%;border-radius:3px;transition:width .4s ease;
          background:var(--accent)}
 
+  /* ---------- image gallery ---------- */
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+      gap:12px}
+  .gimg{background:var(--raised);border:1px solid var(--line);border-radius:12px;
+      overflow:hidden;display:flex;flex-direction:column}
+  .gimg img{width:100%;display:block;cursor:zoom-in;background:#1c1b19}
+  .gimg .cap{padding:8px 10px;font-size:11px;color:var(--muted);line-height:1.5;
+      overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;
+      -webkit-box-orient:vertical}
+  .gimg .gacts{display:flex;gap:6px;padding:0 8px 8px}
+
   /* ---------- popover ---------- */
   .pop{position:fixed;z-index:40;background:var(--panel);border:1px solid var(--line);
        border-radius:14px;padding:16px;width:min(420px,92vw);
@@ -252,6 +294,8 @@
       <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/></svg>Chat</button>
     <button class="nav" data-view="code">
       <svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></svg>Code</button>
+    <button class="nav" data-view="images">
+      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m3 17 5-5 4 4 3-3 6 6"/></svg>Images</button>
     <button class="nav" data-view="models">
       <svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5zM3 16l9 5 9-5M3 12l9 5 9-5"/></svg>Models
       <span class="tag" id="modelsTag" hidden>!</span></button>
@@ -277,6 +321,13 @@
       <button class="pill" id="btnSystem">
         <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/></svg>
         <span id="systemLabel">System prompt</span></button>
+      <button class="pill" id="btnMemory">
+        <svg viewBox="0 0 24 24"><path d="M12 3a4 4 0 0 0-4 4v1a4 4 0 0 0-2 7 4 4 0 0 0 3 6h6a4 4 0 0 0 3-6 4 4 0 0 0-2-7V7a4 4 0 0 0-4-4z"/></svg>
+        <span id="memoryLabel">Memory</span></button>
+      <button class="pill" id="voicePill" title="Read replies aloud with the
+system's own voice">
+        <svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg>
+        Voice</button>
       <span class="pill" id="speedPill" hidden></span>
     </div>
 
@@ -299,7 +350,12 @@
             placeholder="Ask it something…"></textarea>
           <div class="crow">
             <span class="pill" id="ctxPill" title="Context length">8k ctx</span>
+            <button class="pill" id="webPill"
+              title="Search the web first and give the model the results">
+              Web</button>
             <span class="mlab" id="chatModelLab"></span>
+            <button class="mic" id="btnMic" title="Speak instead of typing">
+              <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
             <button class="send" id="btnSend">Send</button>
             <button class="send" id="btnStop" hidden
               style="background:#3a3935">Stop</button>
@@ -310,18 +366,97 @@
 
     <!-- code -->
     <section class="chatpane" data-page="code" hidden>
-      <div class="thread" id="codeThread"><div class="inner" id="codeInner"></div></div>
-      <div class="composer">
-        <div class="cwrap">
-          <textarea id="codeInput" rows="1" spellcheck="false"
-            placeholder="Describe the code you need, or paste code to fix…"></textarea>
-          <div class="crow">
-            <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
-            <span class="mlab" id="codeModelLab"></span>
-            <button class="send" id="btnCodeSend">Send</button>
-            <button class="send" id="btnCodeStop" hidden
-              style="background:#3a3935">Stop</button>
+      <div class="codewrap">
+        <aside class="ws">
+          <div class="wshead">
+            <input type="text" id="wsPath"
+              placeholder="C:\Projects\my-app  or  /home/me/app">
+            <button class="btn thin go" id="btnWsOpen">Open</button>
           </div>
+          <div class="wsroot" id="wsRoot"></div>
+          <div style="padding:2px 10px 6px">
+            <button class="btn thin" id="btnWsAll" hidden>Attach all files</button>
+          </div>
+          <div class="wslist" id="wsList">
+            <div class="note" style="padding:4px 8px">Open a folder on this
+              computer to read and edit its files with the model.</div>
+          </div>
+          <div class="wsrun">
+            <input type="text" id="wsRunCmd"
+              placeholder="Run command — e.g. python app.py">
+            <div class="wsrunbtns">
+              <button class="btn thin" id="btnWsRun">Run</button>
+              <button class="btn thin go" id="btnWsAutoFix"
+                title="Run the command; on failure, send the error and the
+files to the model, apply its fixes, and run again — up to 3 rounds.">
+                Run &amp; fix</button>
+            </div>
+            <div class="log wsconsole" id="wsConsole" hidden></div>
+          </div>
+        </aside>
+        <div class="codecol">
+          <div class="thread" id="codeThread"><div class="inner" id="codeInner"></div></div>
+          <div class="composer">
+            <div class="cwrap">
+              <div class="attachrow" id="wsAttach" hidden></div>
+              <textarea id="codeInput" rows="1" spellcheck="false"
+                placeholder="Describe the code you need, or paste code to fix…"></textarea>
+              <div class="crow">
+                <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
+                <span class="mlab" id="codeModelLab"></span>
+                <button class="mic" id="btnCodeMic"
+                  title="Speak instead of typing">
+                  <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+                <button class="send" id="btnCodeSend">Send</button>
+                <button class="send" id="btnCodeStop" hidden
+                  style="background:#3a3935">Stop</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- images -->
+    <section class="page" data-page="images" hidden>
+      <div class="wrap">
+        <div class="panel">
+          <h2>Create an image</h2>
+          <p class="sub">Generated on this machine by stable-diffusion.cpp
+            — the image engine from the same family as the chat models.
+            Nothing leaves your computer.</p>
+          <div class="orow"><span class="lab">Image engine</span>
+            <div class="ctl"><span class="state" id="imgState">checking…</span>
+            <button class="btn thin" id="btnImageInstall" hidden>Download
+              (~1.8 GB)</button></div></div>
+          <textarea id="imgPrompt" rows="3" placeholder="A cosy cabin in a
+snowy forest at dusk, warm light in the windows, oil painting"></textarea>
+          <div class="frow" style="margin-top:10px">
+            <select id="imgSize">
+              <option value="512x512" selected>512 × 512</option>
+              <option value="512x768">512 × 768 — portrait</option>
+              <option value="768x512">768 × 512 — landscape</option>
+              <option value="640x640">640 × 640</option>
+            </select>
+            <select id="imgSteps">
+              <option value="20" selected>20 steps — balanced</option>
+              <option value="12">12 steps — quick</option>
+              <option value="30">30 steps — detailed</option>
+            </select>
+            <button class="btn go" id="btnImgGen">Generate</button>
+          </div>
+          <div class="fitem" id="imgTask" hidden
+            style="display:block;margin-top:12px">
+            <div class="n"><b>Generating…</b>
+              <span id="imgTaskDetail"></span></div>
+            <div class="bar"><i id="imgTaskBar" style="width:0%"></i></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Gallery</h2>
+          <p class="sub" id="galleryNote">Everything you generate is kept in
+            data/images.</p>
+          <div class="gallery" id="gallery"></div>
         </div>
       </div>
     </section>
@@ -421,6 +556,13 @@
   <div class="orow"><span class="lab">KV cache</span><div class="ctl">
     <select id="kvSel"><option value="16">f16 — exact</option>
       <option value="8">q8 — half the memory</option></select></div></div>
+  <div class="orow"><span class="lab">Voice input (Whisper)</span><div class="ctl">
+    <span class="state" id="voiceState">checking…</span>
+    <button class="btn thin" id="btnVoiceInstall" hidden>Download
+      (~160 MB)</button></div></div>
+  <p class="note">Local speech recognition via whisper.cpp — official
+    binaries, your audio never leaves this machine. Spoken replies use the
+    voices built into your operating system.</p>
   <p class="note" id="paramNote"></p>
   <p class="note">The Code page always answers at temperature 0.2 for
     reproducible code; the slider applies to the Chat page.</p>
@@ -444,6 +586,34 @@
   </div>
 </div>
 
+<!-- memory -->
+<div class="pop" id="memoryPop" hidden>
+  <h3>Memory</h3>
+  <textarea id="memoryText" rows="8" spellcheck="false"
+    placeholder="- Facts worth keeping across conversations, one per line.
+The model adds lines here itself when a reply contains remember: …"></textarea>
+  <p class="note">Sent with every conversation, in every chat. The model can
+    add to it by writing a line starting with <b>remember:</b> — edit or
+    delete anything here, it is just a text file
+    (<span style="font-family:var(--mono)">data/memory.md</span>).</p>
+  <div class="orow"><span class="lab">Use past conversations as context</span>
+    <div class="ctl"><input type="checkbox" id="recallChk"
+      style="width:auto"></div></div>
+  <div class="orow"><span class="lab">Semantic recall</span><div class="ctl">
+    <span class="state" id="embedState">checking…</span>
+    <button class="btn thin" id="btnEmbedInstall" hidden>Download
+      (~150 MB)</button></div></div>
+  <p class="note">With the tiny embedding model installed
+    (nomic-embed-text, runs on the CPU beside the chat model), recall
+    matches past conversations by <b>meaning</b>, not just shared words.
+    Without it, keyword matching is used instead.</p>
+  <div class="rowbtn">
+    <button class="btn thin go" id="btnSaveMemory">Save</button>
+    <button class="btn thin" id="btnClearMemory">Clear</button>
+    <button class="btn thin" id="btnCloseMemory">Done</button>
+  </div>
+</div>
+
 <div class="toast" id="toast" hidden></div>
 
 <script>
@@ -451,7 +621,8 @@
 
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
-          setupKicked: false, cur: { chat: null, code: null } };
+          setupKicked: false, cur: { chat: null, code: null }, webOn: false,
+          ws: { path: "", attached: [], lastFile: "" } };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -463,7 +634,11 @@ var PANES = {
 };
 var CODE_SYSTEM = "You are a precise coding assistant. Lead with working " +
   "code in fenced blocks tagged with the language, then explain briefly. " +
-  "Prefer minimal, correct, idiomatic examples.";
+  "Prefer minimal, correct, idiomatic examples. When changing a project " +
+  "given to you as multiple files, output every file you create or modify " +
+  "as its own complete fenced block whose info line is the language " +
+  "followed by path=<relative path>, for example: ```python " +
+  "path=src/utils.py — always the whole file, never a fragment.";
 var CODE_CHIPS = [
   "Write a Python function that checks whether a string is a palindrome.",
   "Explain this error and how to fix it: TypeError: 'NoneType' object is not iterable",
@@ -509,27 +684,48 @@ function placePop(pop, anchor) {
   pop.style.left = Math.max(12,
     Math.min(r.left, window.innerWidth - pop.offsetWidth - 12)) + "px";
 }
-function closePops() { $("paramsPop").hidden = true; $("systemPop").hidden = true; }
+function closePops() {
+  $("paramsPop").hidden = true;
+  $("systemPop").hidden = true;
+  $("memoryPop").hidden = true;
+}
 
 // Markdown-lite: fenced code blocks and inline code only, everything
 // escaped. An unclosed fence (mid-stream) renders as a code block too.
-function renderBody(text) {
+function renderBody(text, withApply) {
   var parts = String(text == null ? "" : text).split("```");
   var html = "";
   for (var i = 0; i < parts.length; i++) {
     if (i % 2 === 0) {
       html += '<span class="prose">' + esc(parts[i])
-        .replace(/`([^`\n]+)`/g, "<code>$1</code>") + "</span>";
+        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/(https?:\/\/[^\s<>"')\]]+)/g,
+          '<a href="$1" target="_blank" rel="noopener">$1</a>') + "</span>";
     } else {
+      // Info line: a language, optionally followed by path=<relative
+      // path> — the convention project-wide answers use so each block
+      // knows which file it belongs to.
       var seg = parts[i], nl = seg.indexOf("\n");
-      var lang = nl === -1 ? "" : seg.slice(0, nl).trim();
+      var info = nl === -1 ? "" : seg.slice(0, nl).trim();
       var codeTxt = nl === -1 ? seg : seg.slice(nl + 1);
-      if (lang && /[^\w+#.-]/.test(lang)) { lang = ""; codeTxt = seg; }
+      var toks = info ? info.split(/\s+/) : [];
+      var lang = toks[0] && /^[\w+#.-]+$/.test(toks[0]) ? toks[0] : "";
+      var fpath = "";
+      toks.forEach(function (t) {
+        var pm = t.match(/^path=(.+)$/);
+        if (pm) fpath = pm[1];
+      });
+      if (info && !lang && !fpath) codeTxt = seg;
+      var target = fpath || S.ws.lastFile;
       var canPreview = lang === "html" || lang === "svg";
       html += '<div class="codeblock"><div class="cbhead"><span>' +
-        esc(lang || "code") + '</span><span class="cbb">' +
+        esc(lang || "code") + (fpath ? " · " + esc(fpath) : "") +
+        '</span><span class="cbb">' +
         (canPreview ?
           '<button class="prev" type="button">Preview</button>' : "") +
+        (withApply && target ?
+          '<button class="apply" type="button" data-path="' + esc(fpath) +
+          '" title="' + esc(target) + '">Apply to file</button>' : "") +
         '<button class="dl" type="button">Save</button>' +
         '<button class="copy" type="button">Copy</button></span></div>' +
         "<pre>" + esc(codeTxt.replace(/\n$/, "")) + "</pre></div>";
@@ -573,6 +769,430 @@ function docHtml(content) {
     "pre{margin:0;padding:12px 14px;overflow-x:auto;background:#faf9f7;" +
     "font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.55}" +
     "</style></head><body>" + renderBody(content) + "</body></html>";
+}
+
+/* ========================= workspace ========================= */
+function loadWorkspace() {
+  var w = (S.status && S.status.workspace) || "";
+  if (!$("wsPath").value) $("wsPath").value = w;
+  if (w && w !== S.ws.path) { S.ws.path = w; loadTree(); }
+}
+async function loadTree() {
+  var box = $("wsList");
+  try {
+    var d = await api("/api/workspace/tree");
+    $("wsRoot").textContent = d.path || "";
+    if (!d.path) return;
+    box.innerHTML = "";
+    if (!d.files.length) {
+      box.innerHTML = '<div class="note" style="padding:4px 8px">' +
+        "No readable files in that folder.</div>";
+      return;
+    }
+    $("btnWsAll").hidden = !d.files.length;
+    d.files.forEach(function (f) {
+      var b = document.createElement("button");
+      b.className = "wsfile" +
+        (S.ws.attached.some(function (a) { return a.path === f.path; })
+          ? " on" : "");
+      b.textContent = f.path;
+      b.title = f.path + " · " + (f.size / 1024).toFixed(1) + " KB";
+      b.addEventListener("click", function () { attachFile(f.path); });
+      box.appendChild(b);
+    });
+    if (d.truncated) {
+      box.innerHTML += '<div class="note" style="padding:4px 8px">' +
+        "Large folder — only the first 400 files are listed.</div>";
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="note bad-text" style="padding:4px 8px">' +
+      esc(e.message) + "</div>";
+  }
+}
+async function attachFile(path) {
+  var have = S.ws.attached.findIndex(function (a) { return a.path === path; });
+  if (have >= 0) {
+    S.ws.attached.splice(have, 1);
+    renderAttach(); loadTree();
+    return;
+  }
+  try {
+    var d = await api("/api/workspace/file?path=" + encodeURIComponent(path));
+    S.ws.attached.push({ path: d.path, content: d.content });
+    S.ws.lastFile = d.path;
+    renderAttach(); loadTree();
+    $("codeInput").focus();
+    toast(d.path + " attached — ask the model about it.");
+  } catch (e) { toast(e.message, true); }
+}
+async function attachAll(quiet) {
+  var d;
+  try { d = await api("/api/workspace/tree"); }
+  catch (e) { toast(e.message, true); return; }
+  var budget = 120000, skipped = 0;
+  S.ws.attached = [];
+  for (var i = 0; i < d.files.length; i++) {
+    var f = d.files[i];
+    if (f.size > 40000 || f.size > budget) { skipped++; continue; }
+    try {
+      var r = await api("/api/workspace/file?path=" +
+        encodeURIComponent(f.path));
+      S.ws.attached.push({ path: r.path, content: r.content });
+      budget -= f.size;
+    } catch (e) { skipped++; }
+  }
+  S.ws.lastFile = "";
+  renderAttach(); loadTree();
+  if (quiet !== true)
+    toast("Attached " + S.ws.attached.length + " files" + (skipped
+      ? " — " + skipped + " skipped (too large or unreadable)." : "."));
+}
+function renderAttach() {
+  var row = $("wsAttach");
+  row.hidden = !S.ws.attached.length;
+  row.innerHTML = "";
+  S.ws.attached.forEach(function (a, i) {
+    var chip = document.createElement("span");
+    chip.className = "pill on";
+    chip.innerHTML = esc(a.path) +
+      ' <span style="cursor:pointer" title="Detach">×</span>';
+    chip.querySelector("span").addEventListener("click", function () {
+      S.ws.attached.splice(i, 1); renderAttach(); loadTree();
+    });
+    row.appendChild(chip);
+  });
+}
+// Every fenced block in a reply that names its own file via path=.
+function pathBlocks(content) {
+  var parts = String(content == null ? "" : content).split("```"), out = [];
+  for (var i = 1; i < parts.length; i += 2) {
+    var seg = parts[i], nl = seg.indexOf("\n");
+    var info = nl === -1 ? "" : seg.slice(0, nl).trim();
+    var m = /(?:^|\s)path=(\S+)/.exec(info);
+    if (m) out.push({ path: m[1],
+                      code: (nl === -1 ? "" : seg.slice(nl + 1))
+                        .replace(/\n$/, "") });
+  }
+  return out;
+}
+async function applyJobs(jobs, quiet) {
+  var done = 0;
+  for (var i = 0; i < jobs.length; i++) {
+    try {
+      await api("/api/workspace/file", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: jobs[i].path,
+                               content: jobs[i].code }) });
+      done++;
+    } catch (e) { toast(jobs[i].path + ": " + e.message, true); }
+  }
+  if (quiet !== true)
+    toast("Applied " + done + " of " + jobs.length +
+      " files — previous versions kept as .bak.");
+  loadTree();
+  return done;
+}
+async function applyAll(content) {
+  var jobs = pathBlocks(content);
+  if (!jobs.length) return;
+  if (!confirm("Write " + jobs.length + " file(s) into the open folder?\n\n" +
+      jobs.map(function (j) { return j.path; }).join("\n") +
+      "\n\nPrevious versions are kept as .bak."))
+    return;
+  await applyJobs(jobs);
+}
+
+/* ---------------- run the project, fix failures autonomously ----------- */
+var AUTOFIX_ROUNDS = 3;
+function consoleLine(text) {
+  var box = $("wsConsole");
+  box.hidden = false;
+  box.textContent += (box.textContent ? "\n" : "") + text;
+  box.scrollTop = box.scrollHeight;
+}
+async function runCmd() {
+  var cmd = $("wsRunCmd").value.trim();
+  if (!cmd) {
+    toast("Set a run command first — e.g. python app.py", true);
+    return null;
+  }
+  consoleLine("$ " + cmd);
+  try {
+    var d = await api("/api/workspace/run", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: cmd }) });
+    consoleLine((d.output || "(no output)") +
+      "\n[exit " + d.exit + " · " + d.seconds + " s]");
+    return d;
+  } catch (e) {
+    consoleLine(e.message);
+    toast(e.message, true);
+    return null;
+  }
+}
+async function autoFix() {
+  if (S.streaming || S.autoFixOn) return;
+  if (!S.status || !S.status.ready) {
+    toast("Load a model first — the Models page shows which ones fit.", true);
+    return;
+  }
+  if (!S.ws.path) { toast("Open a folder first.", true); return; }
+  var cmd = $("wsRunCmd").value.trim();
+  if (!cmd) {
+    toast("Set a run command first — e.g. python app.py", true);
+    return;
+  }
+  S.autoFixOn = true;
+  var btn = $("btnWsAutoFix");
+  btn.disabled = true; btn.textContent = "Fixing…";
+  try {
+    for (var attempt = 1; attempt <= AUTOFIX_ROUNDS; attempt++) {
+      var r = await runCmd();
+      if (!r) return;
+      if (r.exit === 0) {
+        consoleLine("— passing —");
+        toast("Passing: `" + cmd + "` exited 0" + (attempt > 1
+          ? " after " + (attempt - 1) + " fix round(s)." : "."));
+        return;
+      }
+      if (attempt === AUTOFIX_ROUNDS) {
+        toast("Still failing after " + (AUTOFIX_ROUNDS - 1) +
+          " fix rounds — the last error is in the console and the "
+          + "conversation.", true);
+        return;
+      }
+      consoleLine("— failed, asking the model (round " + attempt + ") —");
+      await attachAll(true);
+      await sendMessage("code",
+        "Auto-fix round " + attempt + ": running `" + cmd + "` in this " +
+        "project failed with exit code " + r.exit + ". Output:\n```\n" +
+        r.output + "\n```\nFind the cause and output the corrected " +
+        "files.");
+      var msgs = (S.cur.code && S.cur.code.messages) || [];
+      var last = msgs[msgs.length - 1] || {};
+      var jobs = last.role === "assistant" ? pathBlocks(last.content) : [];
+      if (!jobs.length) {
+        toast("The model returned no file changes — stopping so nothing "
+          + "is guessed.", true);
+        return;
+      }
+      var done = await applyJobs(jobs, true);
+      consoleLine("— applied " + done + " file(s), previous versions "
+        + "kept as .bak —");
+    }
+  } finally {
+    S.autoFixOn = false;
+    btn.disabled = false; btn.textContent = "Run & fix";
+  }
+}
+function fenceLang(path) {
+  var e = (path.split(".").pop() || "").toLowerCase();
+  var m = { py: "python", js: "javascript", ts: "typescript", htm: "html",
+            html: "html", css: "css", md: "markdown", sh: "bash",
+            yml: "yaml" };
+  return m[e] || e;
+}
+async function applyToFile(codeText, file) {
+  if (!file) return;
+  if (!confirm("Write this code to " + file + "?\nThe previous version " +
+               "is kept beside it as " + file.split("/").pop() + ".bak"))
+    return;
+  try {
+    var d = await api("/api/workspace/file", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: file, content: codeText }) });
+    toast("Saved to " + d.path +
+      (d.backup ? " — previous version kept as " + d.backup : "."));
+    loadTree();
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ========================= images ========================= */
+function renderImages() {
+  var im = (S.status && S.status.image) || {};
+  var st = $("imgState"), btn = $("btnImageInstall");
+  if (im.installed) {
+    st.textContent = "ready"; st.className = "state ok"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed"; st.className = "state";
+    btn.hidden = false;
+  }
+}
+async function loadGallery() {
+  var box = $("gallery");
+  try {
+    var d = await api("/api/images");
+    box.innerHTML = "";
+    if (!d.images.length) {
+      box.innerHTML = '<div class="note">Nothing yet — describe an image '
+        + "above and press Generate.</div>";
+      return;
+    }
+    d.images.forEach(function (im) {
+      var el = document.createElement("div");
+      el.className = "gimg";
+      el.innerHTML = '<img src="' + esc(im.url) + '" alt="" title="' +
+        esc(im.prompt) + '"><div class="cap">' + esc(im.prompt || im.name) +
+        '</div><div class="gacts"></div>';
+      el.querySelector("img").addEventListener("click", function () {
+        window.open(im.url, "_blank");
+      });
+      var acts = el.querySelector(".gacts");
+      acts.appendChild(mkBtn("Open", function () {
+        window.open(im.url, "_blank"); }, "miniBtn"));
+      acts.appendChild(mkBtn("Delete", async function () {
+        if (!confirm("Delete this image?")) return;
+        await api("/api/images", { method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: im.name }) });
+        loadGallery();
+      }, "miniBtn"));
+      box.appendChild(el);
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="note bad-text">' + esc(e.message) +
+      "</div>";
+  }
+}
+async function generateImage() {
+  var prompt = $("imgPrompt").value.trim();
+  if (!prompt) { toast("Describe the image first.", true); return; }
+  var wh = $("imgSize").value.split("x");
+  try {
+    await api("/api/image/generate", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: prompt, width: Number(wh[0]),
+        height: Number(wh[1]), steps: Number($("imgSteps").value) }) });
+    $("imgTask").hidden = false;
+    $("imgTaskDetail").textContent = "Starting…";
+    $("imgTaskBar").style.width = "0%";
+    pollTasks();
+  } catch (e) { toast(e.message, true); }
+}
+function renderImageTask(t) {
+  if (t.state === "running") {
+    $("imgTask").hidden = false;
+    $("imgTaskDetail").textContent = t.detail || "Working…";
+    $("imgTaskBar").style.width = Math.round(t.pct) + "%";
+  } else {
+    if (!$("imgTask").hidden) {
+      $("imgTask").hidden = true;
+      if (t.state === "done") { toast("Image saved."); loadGallery(); }
+      else if (t.state === "error") toast(t.detail || "Generation failed.",
+        true);
+    }
+  }
+}
+
+/* ========================= voice ========================= */
+var REC = { active: false, mode: "", mr: null, chunks: [] };
+function micBtn(mode) { return $(mode === "code" ? "btnCodeMic" : "btnMic"); }
+function renderVoice() {
+  var v = (S.status && S.status.voice) || {};
+  var st = $("voiceState"), btn = $("btnVoiceInstall");
+  if (v.installed && v.ready) {
+    st.textContent = "ready"; st.className = "state ok"; btn.hidden = true;
+  } else if (v.installed) {
+    st.textContent = "starting…"; st.className = "state"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed"; st.className = "state";
+    btn.hidden = false;
+  }
+}
+// 16 kHz mono 16-bit WAV — the format whisper-server takes with no
+// external converter.
+async function toWav16k(blob) {
+  var buf = await blob.arrayBuffer();
+  var ac = new (window.AudioContext || window.webkitAudioContext)();
+  var audio = await ac.decodeAudioData(buf);
+  if (ac.close) ac.close();
+  var rate = 16000;
+  var oc = new OfflineAudioContext(1, Math.ceil(audio.duration * rate) || 1,
+                                   rate);
+  var src = oc.createBufferSource();
+  src.buffer = audio; src.connect(oc.destination); src.start();
+  var out = (await oc.startRendering()).getChannelData(0);
+  var wav = new DataView(new ArrayBuffer(44 + out.length * 2));
+  function ws(o, s) {
+    for (var i = 0; i < s.length; i++) wav.setUint8(o + i, s.charCodeAt(i));
+  }
+  ws(0, "RIFF"); wav.setUint32(4, 36 + out.length * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); wav.setUint32(16, 16, true); wav.setUint16(20, 1, true);
+  wav.setUint16(22, 1, true); wav.setUint32(24, rate, true);
+  wav.setUint32(28, rate * 2, true); wav.setUint16(32, 2, true);
+  wav.setUint16(34, 16, true); ws(36, "data");
+  wav.setUint32(40, out.length * 2, true);
+  for (var i = 0; i < out.length; i++) {
+    var s = Math.max(-1, Math.min(1, out[i]));
+    wav.setInt16(44 + i * 2, s * 32767, true);
+  }
+  return wav.buffer;
+}
+async function toggleMic(mode) {
+  if (REC.active) { REC.mr.stop(); return; }
+  if (!S.status || !S.status.voice || !S.status.voice.installed) {
+    toast("Voice input needs the Whisper model — download it under "
+      + "Parameters.", true);
+    closePops(); placePop($("paramsPop"), $("btnParams"));
+    return;
+  }
+  var stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { toast("Microphone permission was refused.", true); return; }
+  REC = { active: true, mode: mode, chunks: [], mr: new MediaRecorder(stream) };
+  REC.mr.ondataavailable = function (e) { REC.chunks.push(e.data); };
+  REC.mr.onstop = async function () {
+    stream.getTracks().forEach(function (t) { t.stop(); });
+    micBtn(mode).classList.remove("rec");
+    REC.active = false;
+    toast("Transcribing…");
+    try {
+      var wav = await toWav16k(new Blob(REC.chunks));
+      var r = await fetch("/api/voice/transcribe", { method: "POST",
+        headers: { "Content-Type": "audio/wav" }, body: wav });
+      var d = await r.json().catch(function () { return {}; });
+      if (!r.ok) throw new Error(d.error || "Transcription failed.");
+      if (!(d.text || "").trim()) { toast("Heard nothing.", true); return; }
+      var input = $(PANES[mode].input);
+      input.value = (input.value ? input.value + " " : "") + d.text.trim();
+      grow(input); input.focus();
+      toast("Heard: " + d.text.trim().slice(0, 80));
+    } catch (e) { toast(e.message, true); }
+  };
+  REC.mr.start();
+  micBtn(mode).classList.add("rec");
+  toast("Recording — press the mic again to stop.");
+}
+// Spoken replies use the operating system's own voices: local, instant.
+function speak(text) {
+  if (!("speechSynthesis" in window)) {
+    toast("This browser offers no speech output.", true);
+    return;
+  }
+  var clean = String(text == null ? "" : text).split("```")
+    .filter(function (_, i) { return i % 2 === 0; })
+    .join(" — code block skipped — ")
+    .replace(/`([^`]+)`/g, "$1").replace(/https?:\/\/\S+/g, "a link")
+    .replace(/\s+/g, " ").trim();
+  if (!clean) return;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(new SpeechSynthesisUtterance(clean.slice(0, 1500)));
+}
+
+function renderEmbed() {
+  var e = (S.status && S.status.embed) || {};
+  var st = $("embedState"), btn = $("btnEmbedInstall");
+  if (e.installed && e.ready) {
+    st.textContent = "ready · " + (e.indexed || 0) + " indexed";
+    st.className = "state ok"; btn.hidden = true;
+  } else if (e.installed) {
+    st.textContent = "starting…";
+    st.className = "state"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed";
+    st.className = "state"; btn.hidden = false;
+  }
 }
 
 /* ========================= engines + first run ========================= */
@@ -637,7 +1257,7 @@ function renderSetupTask(t) {
 
 /* ========================= views ========================= */
 function updateTitle() {
-  var t = { models: "Models", engine: "Engine" }[S.view];
+  var t = { models: "Models", engine: "Engine", images: "Images" }[S.view];
   if (!t) {
     var c = S.cur[S.view];
     t = (c && c.title) || (S.view === "code" ? "Code" : "Chat");
@@ -656,6 +1276,8 @@ function show(view) {
   updateTitle();
   if (view === "models") { loadLocal(); renderCatalogue(); pollTasks(); }
   if (view === "engine") { renderHardware(); pollLog(); }
+  if (view === "code") loadWorkspace();
+  if (view === "images") { renderImages(); loadGallery(); pollTasks(); }
 }
 
 /* ========================= chat + code ========================= */
@@ -695,7 +1317,8 @@ function renderThread(mode) {
   chat.messages.forEach(function (m) {
     var el = document.createElement("div");
     el.className = "msg" + (m.role === "user" ? " me" : "");
-    el.innerHTML = '<div class="body">' + renderBody(m.content) + "</div>" +
+    el.innerHTML = '<div class="body">' +
+      renderBody(m.content, m.role !== "user") + "</div>" +
       (m.tps || m.stopped ? '<div class="meta">' +
         (m.tps ? m.tps + " tok/s · " + m.seconds + " s" : "") +
         (m.stopped ? (m.tps ? " · " : "") + "stopped" : "") + "</div>" : "");
@@ -713,6 +1336,13 @@ function renderThread(mode) {
       acts.appendChild(mkBtn("Save .html", function () {
         saveBlob(fileSlug() + ".html", docHtml(m.content), "text/html");
       }, "miniBtn"));
+      if (pathBlocks(m.content).length > 1) {
+        acts.appendChild(mkBtn("Apply all files", function () {
+          applyAll(m.content);
+        }, "miniBtn"));
+      }
+      acts.appendChild(mkBtn("Speak", function () { speak(m.content); },
+        "miniBtn"));
       el.appendChild(acts);
     }
     box.appendChild(el);
@@ -771,6 +1401,12 @@ async function send(mode) {
   var ui = PANES[mode];
   var text = $(ui.input).value.trim();
   if (!text || S.streaming) return;
+  $(ui.input).value = ""; grow($(ui.input));
+  await sendMessage(mode, text);
+}
+async function sendMessage(mode, text) {
+  var ui = PANES[mode];
+  if (!text || S.streaming) return;
   if (!S.status || !S.status.ready) {
     toast("Load a model first — the Models page shows which ones fit.", true);
     show("models");
@@ -780,7 +1416,6 @@ async function send(mode) {
     S.cur[mode] = { id: "", title: text.slice(0, 60), mode: mode, messages: [] };
   var chat = S.cur[mode];
   chat.messages.push({ role: "user", content: text });
-  $(ui.input).value = ""; grow($(ui.input));
   renderThread(mode); updateTitle();
 
   var el = document.createElement("div");
@@ -793,7 +1428,40 @@ async function send(mode) {
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
   var acc = "", doneMeta = null;
-  var payload = { chat: chat.id || "", message: text, mode: mode };
+  var outgoing = text;
+  if (mode === "code" && S.ws.attached.length) {
+    // The question leads (it becomes the chat title); the files ride along
+    // underneath it, then detach so later turns stay light. Each file is
+    // fenced with path= so replies can address files by name.
+    outgoing = text + "\n\nProject files:";
+    S.ws.attached.forEach(function (f) {
+      outgoing += "\n\n`" + f.path + "`:\n```" + fenceLang(f.path) +
+        " path=" + f.path + "\n" + f.content + "\n```";
+    });
+    chat.messages[chat.messages.length - 1].content = outgoing;
+    S.ws.attached = [];
+    renderAttach(); loadTree();
+  }
+  if (mode === "chat" && S.webOn) {
+    // Opt-in, per message: fetch results first, hand them to the model.
+    body.innerHTML = '<span class="prose" style="color:var(--dim)">' +
+      "Searching the web…</span>";
+    try {
+      var sr = await api("/api/search?q=" + encodeURIComponent(text));
+      outgoing = text + "\n\nWeb search results:\n" +
+        sr.results.map(function (r, i) {
+          return "[" + (i + 1) + "] " + r.title + " — " + r.snippet +
+            " (" + r.url + ")";
+        }).join("\n") +
+        "\n\nUse these results where they help and cite them as [1], [2].";
+      chat.messages[chat.messages.length - 1].content = outgoing;
+    } catch (e) {
+      toast("Web search failed: " + e.message +
+        " — answering without it.", true);
+    }
+    body.innerHTML = '<span class="caret"></span>';
+  }
+  var payload = { chat: chat.id || "", message: outgoing, mode: mode };
   if (mode === "code") {
     // Deterministic-ish output for code; the built-in prompt steps aside
     // the moment the user sets their own.
@@ -826,12 +1494,13 @@ async function send(mode) {
         if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
         if (d.delta) {
           acc += d.delta;
-          body.innerHTML = renderBody(acc) + '<span class="caret"></span>';
+          body.innerHTML = renderBody(acc, true) +
+            '<span class="caret"></span>';
           $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
         if (d.error) { toast(d.error, true); }
         if (d.done) {
-          body.innerHTML = renderBody(acc);
+          body.innerHTML = renderBody(acc, true);
           doneMeta = { tps: d.tps, seconds: d.seconds };
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
@@ -841,6 +1510,7 @@ async function send(mode) {
     chat.messages.push({ role: "assistant", content: acc,
       tps: doneMeta && doneMeta.tps, seconds: doneMeta && doneMeta.seconds });
     renderThread(mode);
+    if (S.speakOn) speak(acc);
   } catch (e) {
     if (e.name === "AbortError") {
       chat.messages.push({ role: "assistant", content: acc, stopped: true });
@@ -1061,6 +1731,8 @@ async function pollTasks() {
   }
   var setup = list.filter(function (t) { return t.kind === "setup"; })[0];
   if (setup) renderSetupTask(setup);
+  var img = list.filter(function (t) { return t.kind === "image"; })[0];
+  if (img) renderImageTask(img);
   var inst = list.filter(function (t) { return t.kind === "install"; })[0];
   if (inst && $("engineState")) {
     var line = $("installLine");
@@ -1171,7 +1843,12 @@ async function refresh() {
   $("paramNote").textContent = st.model
     ? "Context and KV cache only take effect when the model is reloaded."
     : "No model loaded yet.";
+  if (!$("wsRunCmd").value && c.run_command)
+    $("wsRunCmd").value = c.run_command;
   renderEngines();
+  renderVoice();
+  renderImages();
+  if (!$("memoryPop").hidden) renderEmbed();
   if (st.setup_complete === false && !S.setupKicked) {
     // First run: fetch Qwen (primary) and Gemma into their own folders.
     S.setupKicked = true;
@@ -1225,6 +1902,8 @@ function wire() {
         ext === "html" ? "text/html" : "text/plain");
       t.textContent = "Saved";
       setTimeout(function () { t.textContent = "Save"; }, 1400);
+    } else if (t.classList.contains("apply")) {
+      applyToFile(pre.textContent, t.dataset.path || S.ws.lastFile);
     } else if (t.classList.contains("prev")) {
       // The page the model wrote, rendered for real in a new tab.
       var url = URL.createObjectURL(new Blob([pre.textContent],
@@ -1245,13 +1924,66 @@ function wire() {
   $("btnCloseParams").addEventListener("click", closePops);
   $("btnCloseSystem").addEventListener("click", closePops);
   document.addEventListener("pointerdown", function (e) {
-    ["paramsPop", "systemPop"].forEach(function (id) {
+    ["paramsPop", "systemPop", "memoryPop"].forEach(function (id) {
       var pop = $(id);
       if (pop.hidden || pop.contains(e.target)) return;
-      if ($("btnParams").contains(e.target) || $("btnSystem").contains(e.target))
+      if ($("btnParams").contains(e.target) ||
+          $("btnSystem").contains(e.target) ||
+          $("btnMemory").contains(e.target))
         return;
       pop.hidden = true;
     });
+  });
+  $("btnMemory").addEventListener("click", async function () {
+    var pop = $("memoryPop"), open = !pop.hidden;
+    closePops();
+    if (open) return;
+    try {
+      var d = await api("/api/memory");
+      $("memoryText").value = d.text || "";
+      $("recallChk").checked = !!d.recall;
+      $("memoryLabel").textContent = (d.text || "").trim()
+        ? "Memory · set" : "Memory";
+    } catch (e) { /* still show the editor */ }
+    renderEmbed();
+    placePop(pop, $("btnMemory"));
+  });
+  $("btnEmbedInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/embed/install", { method: "POST" });
+      toast(d.already
+        ? "Already installed — re-indexing past conversations."
+        : "Downloading the recall model — progress is under Models → "
+          + "Downloads.");
+      $("embedState").textContent = "downloading…";
+      $("btnEmbedInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
+  });
+  $("btnSaveMemory").addEventListener("click", async function () {
+    await api("/api/memory", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: $("memoryText").value }) });
+    $("memoryLabel").textContent = $("memoryText").value.trim()
+      ? "Memory · set" : "Memory";
+    closePops(); toast("Memory saved — it now rides with every chat.");
+  });
+  $("btnClearMemory").addEventListener("click", async function () {
+    $("memoryText").value = "";
+    await api("/api/memory", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "" }) });
+    $("memoryLabel").textContent = "Memory";
+    toast("Memory cleared.");
+  });
+  $("btnCloseMemory").addEventListener("click", closePops);
+  $("recallChk").addEventListener("change", async function () {
+    await api("/api/config", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recall: $("recallChk").checked }) });
+    toast($("recallChk").checked
+      ? "Past conversations will be used as context."
+      : "Past conversations stay out of new chats.");
   });
   [["tempSl", "tempVal", "temperature"], ["toppSl", "toppVal", "top_p"]]
     .forEach(function (row) {
@@ -1279,6 +2011,63 @@ function wire() {
     $("systemText").value = ""; await saveParams(); toast("Cleared.");
   });
 
+  $("btnWsOpen").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/workspace", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: $("wsPath").value.trim() }) });
+      S.ws.path = d.path; S.ws.attached = []; S.ws.lastFile = "";
+      renderAttach(); loadTree();
+      toast(d.path ? "Opened " + d.path : "Folder closed.");
+    } catch (e) { toast(e.message, true); }
+  });
+  $("wsPath").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("btnWsOpen").click(); });
+  $("btnWsAll").addEventListener("click", function () { attachAll(); });
+  $("btnWsRun").addEventListener("click", runCmd);
+  $("btnWsAutoFix").addEventListener("click", autoFix);
+  $("wsRunCmd").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") runCmd(); });
+  $("btnImgGen").addEventListener("click", generateImage);
+  $("btnImageInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/image/install", { method: "POST" });
+      toast(d.already ? "Already installed."
+        : "Downloading stable-diffusion.cpp and the SD 1.5 model — "
+          + "progress is under Models → Downloads.");
+      $("imgState").textContent = "downloading…";
+      $("btnImageInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
+  });
+  $("btnMic").addEventListener("click", function () { toggleMic("chat"); });
+  $("btnCodeMic").addEventListener("click", function () {
+    toggleMic("code"); });
+  $("voicePill").addEventListener("click", function () {
+    S.speakOn = !S.speakOn;
+    $("voicePill").classList.toggle("on", S.speakOn);
+    if (!S.speakOn && "speechSynthesis" in window) speechSynthesis.cancel();
+    toast(S.speakOn ? "Replies will be read aloud."
+                    : "Voice replies off.");
+  });
+  $("btnVoiceInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/voice/install", { method: "POST" });
+      toast(d.already ? "Voice is already set up."
+        : "Downloading whisper.cpp and the voice model — progress is "
+          + "under Models → Downloads.");
+      $("voiceState").textContent = "downloading…";
+      $("btnVoiceInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
+  });
+  $("webPill").addEventListener("click", function () {
+    S.webOn = !S.webOn;
+    $("webPill").classList.toggle("on", S.webOn);
+    toast(S.webOn
+      ? "Web search on — each question searches first and cites sources."
+      : "Web search off — answers come from the model alone.");
+  });
   $("btnSetupRetry").addEventListener("click", startSetup);
   $("btnSetupSkip").addEventListener("click", async function () {
     await api("/api/config", { method: "POST",
