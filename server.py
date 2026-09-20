@@ -371,12 +371,17 @@ DOC_HOWTO = (
     "by CSV rows, first row the headers; after a sheet's rows you may add "
     "'# Chart: bar <title>' (or line, or pie) to embed a chart of that "
     "sheet — first column is the labels, the other columns the numbers. "
-    "Use bar to compare categories, line for change over time, pie only "
-    "for a few shares of a whole. docx: Markdown-style # headings, "
-    "paragraphs, - bullets, **bold**, and Markdown tables (| cell | "
-    "rows), which become real Word tables. pptx: '# <slide title>' "
-    "followed by - bullet lines, one group per slide. The app offers the "
-    "real file for download from that block.")
+    "Chart types: bar to compare categories, line for change over time, "
+    "stacked for parts within categories, scatter for two numeric "
+    "columns, pie only for a few shares of a whole. Cells starting with "
+    "= are real Excel formulas (e.g. =SUM(B2:B4), =B2*C2). docx: "
+    "Markdown-style # headings, paragraphs, - bullets, **bold**, and "
+    "Markdown tables (| cell | rows), which become real Word tables. "
+    "pptx: optionally start with '# Theme: dark' or '# Theme: #RRGGBB'; "
+    "then '# <slide title>' followed by - bullet lines per slide; a line "
+    "'- image: <file in data/images>' (or 'image: latest' for the newest "
+    "generated picture) places that image on the slide. The app offers "
+    "the real file for download from that block.")
 
 
 def build_xlsx(text: str) -> tuple[bytes, str]:
@@ -389,8 +394,8 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
     # each sheet: (name, rows, chart) where chart is (type, title) or None
     sheets, name, rows, chart = [], "Sheet1", [], None
     for line in text.splitlines():
-        m = re.match(r"\s*#+\s*Chart\s*:\s*(bar|line|pie)\b\s*(.*)$",
-                     line, re.I)
+        m = re.match(r"\s*#+\s*Chart\s*:\s*(bar|line|pie|scatter|stacked)"
+                     r"\b\s*(.*)$", line, re.I)
         if m:
             chart = (m.group(1).lower(), m.group(2).strip())
             continue
@@ -426,16 +431,35 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
         # hand-picked here.
         ncols = max((len(r) for r in srows), default=0)
         if schart and len(srows) >= 2 and ncols >= 2:
+            from openpyxl.chart import ScatterChart, Series
             ctype, ctitle = schart
-            last_col = 2 if ctype == "pie" else ncols
-            ch = {"bar": BarChart, "line": LineChart,
-                  "pie": PieChart}[ctype]()
+            nrows = len(srows)
+            if ctype == "scatter":
+                # x from the first column, one series per further column
+                ch = ScatterChart()
+                ch.style = 13
+                xref = Reference(ws, min_col=1, min_row=2, max_row=nrows)
+                for c in range(2, ncols + 1):
+                    yref = Reference(ws, min_col=c, min_row=1,
+                                     max_row=nrows)
+                    ch.series.append(Series(yref, xref,
+                                            title_from_data=True))
+                ch.x_axis.title = str(srows[0][0]) if srows[0] else None
+            else:
+                if ctype == "stacked":
+                    ch = BarChart()
+                    ch.grouping = "stacked"
+                    ch.overlap = 100
+                else:
+                    ch = {"bar": BarChart, "line": LineChart,
+                          "pie": PieChart}[ctype]()
+                last_col = 2 if ctype == "pie" else ncols
+                data = Reference(ws, min_col=2, max_col=last_col,
+                                 min_row=1, max_row=nrows)
+                ch.add_data(data, titles_from_data=True)
+                ch.set_categories(Reference(ws, min_col=1, min_row=2,
+                                            max_row=nrows))
             ch.title = ctitle or sname
-            data = Reference(ws, min_col=2, max_col=last_col,
-                             min_row=1, max_row=len(srows))
-            ch.add_data(data, titles_from_data=True)
-            ch.set_categories(Reference(ws, min_col=1, min_row=2,
-                                        max_row=len(srows)))
             ch.height, ch.width = 8, 15
             ws.add_chart(ch, f"{get_column_letter(ncols + 2)}2")
     buf = io.BytesIO()
@@ -504,34 +528,94 @@ def build_docx(text: str) -> tuple[bytes, str]:
                             ".wordprocessingml.document")
 
 
+def _pptx_image(name: str) -> Path | None:
+    """Only images from the app's own gallery (data/images); 'latest'
+    means the newest generated picture."""
+    name = name.strip()
+    if "/" in name or "\\" in name or ".." in name:
+        return None
+    if not IMAGES_OUT.is_dir():
+        return None
+    if name.lower() == "latest":
+        pngs = sorted(IMAGES_OUT.glob("*.png"),
+                      key=lambda p: -p.stat().st_mtime)
+        return pngs[0] if pngs else None
+    p = IMAGES_OUT / name
+    return p if p.is_file() and p.suffix.lower() in (".png", ".jpg",
+                                                     ".jpeg") else None
+
+
 def build_pptx(text: str) -> tuple[bytes, str]:
     from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
     prs = Presentation()
+    # optional theme: '# Theme: dark' or '# Theme: #RRGGBB' (accent only)
+    bg = fg = accent = None
     slides, cur = [], None
     for raw in text.splitlines():
         s = raw.strip()
         if not s:
             continue
+        m = re.match(r"#+\s*Theme\s*:\s*(\S+)", s, re.I)
+        if m:
+            t = m.group(1).lower()
+            if t == "dark":
+                bg, fg = RGBColor(0x1E, 0x1E, 0x1C), \
+                    RGBColor(0xEC, 0xEA, 0xE4)
+                accent = RGBColor(0xD9, 0x77, 0x57)
+            elif re.fullmatch(r"#?[0-9a-f]{6}", t):
+                h = t.lstrip("#")
+                accent = RGBColor(int(h[0:2], 16), int(h[2:4], 16),
+                                  int(h[4:6], 16))
+            continue
         m = re.match(r"#+\s+(.*)", s)
         if m:
-            cur = {"title": re.sub(r"\*\*", "", m.group(1)), "bullets": []}
+            cur = {"title": re.sub(r"\*\*", "", m.group(1)),
+                   "bullets": [], "images": []}
             slides.append(cur)
-        else:
-            if cur is None:
-                cur = {"title": "", "bullets": []}
-                slides.append(cur)
-            cur["bullets"].append(
-                re.sub(r"\*\*", "", re.sub(r"^[-*]\s+", "", s)))
+            continue
+        if cur is None:
+            cur = {"title": "", "bullets": [], "images": []}
+            slides.append(cur)
+        body = re.sub(r"^[-*]\s+", "", s)
+        m = re.match(r"(?:image|img)\s*:\s*(.+)$", body, re.I)
+        if m:
+            img = _pptx_image(m.group(1))
+            if img:
+                cur["images"].append(img)
+            continue
+        cur["bullets"].append(re.sub(r"\*\*", "", body))
     if not slides:
         raise RuntimeError("No slides found in the block.")
     layout = prs.slide_layouts[1]          # title and content
     for sl in slides:
         slide = prs.slides.add_slide(layout)
+        if bg is not None:
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = bg
         slide.shapes.title.text = sl["title"][:90]
+        for para in slide.shapes.title.text_frame.paragraphs:
+            for run in para.runs:
+                if accent is not None:
+                    run.font.color.rgb = accent
+                elif fg is not None:
+                    run.font.color.rgb = fg
         frame = slide.placeholders[1].text_frame
+        has_img = bool(sl["images"])
+        if has_img:
+            # bullets keep the left half; pictures take the right
+            slide.placeholders[1].width = Inches(4.6)
         for i, btxt in enumerate(sl["bullets"][:12]):
             para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
             para.text = btxt[:200]
+            for run in para.runs:
+                if fg is not None:
+                    run.font.color.rgb = fg
+        for j, img in enumerate(sl["images"][:2]):
+            slide.shapes.add_picture(str(img), Inches(5.2),
+                                     Inches(1.7 + j * 2.6),
+                                     width=Inches(4.3))
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
