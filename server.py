@@ -377,11 +377,78 @@ DOC_HOWTO = (
     "= are real Excel formulas (e.g. =SUM(B2:B4), =B2*C2). docx: "
     "Markdown-style # headings, paragraphs, - bullets, **bold**, and "
     "Markdown tables (| cell | rows), which become real Word tables. "
-    "pptx: optionally start with '# Theme: dark' or '# Theme: #RRGGBB'; "
-    "then '# <slide title>' followed by - bullet lines per slide; a line "
+    "pptx: optionally start with '# Template: <file>' to build on a "
+    "company template from data/templates (its fonts, colours, layouts "
+    "and master apply), or '# Theme: dark' / '# Theme: #RRGGBB'; then "
+    "'# <slide title>' followed by - bullet lines per slide; a line "
     "'- image: <file in data/images>' (or 'image: latest' for the newest "
     "generated picture) places that image on the slide. The app offers "
     "the real file for download from that block.")
+
+
+def deck_templates() -> list[str]:
+    d = DATA_DIR / "templates"
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir()
+                  if p.suffix.lower() in (".pptx", ".potx"))
+
+
+def doc_howto() -> str:
+    names = deck_templates()
+    if not names:
+        return DOC_HOWTO
+    return DOC_HOWTO + (" Available deck templates: " +
+                        ", ".join(names[:6]) + ".")
+
+
+def _load_template(fname: str) -> io.BytesIO:
+    """A template from data/templates, as bytes python-pptx will open.
+    .potx is the same zip as .pptx apart from its declared content type,
+    so that one line is patched on the way in."""
+    fname = (fname or "").strip()
+    if "/" in fname or "\\" in fname or ".." in fname:
+        raise RuntimeError("That template name is not allowed.")
+    p = DATA_DIR / "templates" / fname
+    if not p.is_file() or p.suffix.lower() not in (".pptx", ".potx"):
+        avail = ", ".join(deck_templates()) or ("none yet — put .potx or "
+                                                ".pptx files in "
+                                                "data/templates")
+        raise RuntimeError(f"No template called {fname}. Available: "
+                           f"{avail}.")
+    raw = p.read_bytes()
+    if p.suffix.lower() == ".potx":
+        import zipfile
+        zin = zipfile.ZipFile(io.BytesIO(raw))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "[Content_Types].xml":
+                    data = data.replace(
+                        b"presentationml.template.main+xml",
+                        b"presentationml.presentation.main+xml")
+                zo.writestr(item, data)
+        raw = out.getvalue()
+    return io.BytesIO(raw)
+
+
+def _clear_slides(prs) -> None:
+    """A .pptx used as a template may carry example slides; the deck
+    starts clean while master, layouts and theme stay."""
+    for sld in list(prs.slides._sldIdLst):
+        prs.part.drop_rel(sld.rId)
+        prs.slides._sldIdLst.remove(sld)
+
+
+def _pick_layout(prs):
+    """The first layout with a title placeholder (idx 0) and at least one
+    body placeholder — the shape of 'title and content' in any deck."""
+    for ly in prs.slide_layouts:
+        idxs = [ph.placeholder_format.idx for ph in ly.placeholders]
+        if 0 in idxs and any(i != 0 for i in idxs):
+            return ly
+    return prs.slide_layouts[0]
 
 
 def build_xlsx(text: str) -> tuple[bytes, str]:
@@ -548,14 +615,18 @@ def _pptx_image(name: str) -> Path | None:
 def build_pptx(text: str) -> tuple[bytes, str]:
     from pptx import Presentation
     from pptx.dml.color import RGBColor
-    from pptx.util import Inches
-    prs = Presentation()
-    # optional theme: '# Theme: dark' or '# Theme: #RRGGBB' (accent only)
+    # optional first lines: '# Template: <file>' (wins over Theme) or
+    # '# Theme: dark' / '# Theme: #RRGGBB'
+    template = None
     bg = fg = accent = None
     slides, cur = [], None
     for raw in text.splitlines():
         s = raw.strip()
         if not s:
+            continue
+        m = re.match(r"#+\s*Template\s*:\s*(.+)$", s, re.I)
+        if m:
+            template = m.group(1).strip()
             continue
         m = re.match(r"#+\s*Theme\s*:\s*(\S+)", s, re.I)
         if m:
@@ -588,24 +659,39 @@ def build_pptx(text: str) -> tuple[bytes, str]:
         cur["bullets"].append(re.sub(r"\*\*", "", body))
     if not slides:
         raise RuntimeError("No slides found in the block.")
-    layout = prs.slide_layouts[1]          # title and content
+    if template:
+        prs = Presentation(_load_template(template))
+        _clear_slides(prs)
+        bg = fg = accent = None      # the template owns the look
+    else:
+        prs = Presentation()
+    layout = _pick_layout(prs)
+    sw, sh = prs.slide_width, prs.slide_height
     for sl in slides:
         slide = prs.slides.add_slide(layout)
         if bg is not None:
             slide.background.fill.solid()
             slide.background.fill.fore_color.rgb = bg
-        slide.shapes.title.text = sl["title"][:90]
-        for para in slide.shapes.title.text_frame.paragraphs:
-            for run in para.runs:
-                if accent is not None:
-                    run.font.color.rgb = accent
-                elif fg is not None:
-                    run.font.color.rgb = fg
-        frame = slide.placeholders[1].text_frame
-        has_img = bool(sl["images"])
-        if has_img:
-            # bullets keep the left half; pictures take the right
-            slide.placeholders[1].width = Inches(4.6)
+        if slide.shapes.title is not None:
+            slide.shapes.title.text = sl["title"][:90]
+            for para in slide.shapes.title.text_frame.paragraphs:
+                for run in para.runs:
+                    if accent is not None:
+                        run.font.color.rgb = accent
+                    elif fg is not None:
+                        run.font.color.rgb = fg
+        body_ph = next((ph for ph in slide.placeholders
+                        if ph.placeholder_format.idx != 0
+                        and ph.has_text_frame), None)
+        if body_ph is None:
+            body_ph = slide.shapes.add_textbox(
+                int(sw * 0.06), int(sh * 0.25),
+                int(sw * 0.55), int(sh * 0.6))
+        frame = body_ph.text_frame
+        if sl["images"]:
+            # bullets keep the left; pictures take the right, whatever
+            # the template's slide size
+            body_ph.width = int(sw * 0.48)
         for i, btxt in enumerate(sl["bullets"][:12]):
             para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
             para.text = btxt[:200]
@@ -613,9 +699,9 @@ def build_pptx(text: str) -> tuple[bytes, str]:
                 if fg is not None:
                     run.font.color.rgb = fg
         for j, img in enumerate(sl["images"][:2]):
-            slide.shapes.add_picture(str(img), Inches(5.2),
-                                     Inches(1.7 + j * 2.6),
-                                     width=Inches(4.3))
+            slide.shapes.add_picture(str(img), int(sw * 0.54),
+                                     int(sh * (0.22 + j * 0.37)),
+                                     width=int(sw * 0.41))
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
@@ -1494,8 +1580,8 @@ def api_chat_send():
               "max_tokens": b.get("max_tokens", cfg.get("max_tokens")),
               "system": b.get("system", cfg.get("system")),
               # persistent memory, past-conversation excerpts, and the
-              # Office-document block convention
-              "system_extra": context_extra(text, chat["id"]) + DOC_HOWTO}
+              # Office-document block convention (with live template list)
+              "system_extra": context_extra(text, chat["id"]) + doc_howto()}
 
     def stream():
         started = time.time()
