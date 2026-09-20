@@ -128,6 +128,9 @@ def api_status():
         "models_dir": str(engine.MODELS_DIR),
         "engines": engines_list(),
         "workspace": str(workspace_root() or ""),
+        "embed": {"installed": bool(embed_model_file()),
+                  "ready": embedder.ready(),
+                  "indexed": len(emb_index())},
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
                     "kv_bits", "auto_start", "last_model", "plan_for",
@@ -188,6 +191,165 @@ def remember_lines(reply: str) -> int:
     return len(added)
 
 
+# ---- semantic recall: a small embedding model beside the chat model ---- #
+EMBED_REPO = "nomic-ai/nomic-embed-text-v1.5-GGUF"
+EMBED_DIR = "embed"
+EMBED_SIM_MIN = 0.5
+EMB_PATH = DATA_DIR / "embeddings.json"
+embedder = engine.EmbedServer(8082)
+_emb_lock = threading.Lock()
+_emb_index: dict | None = None
+_emb_busy = False
+
+
+def embed_model_file() -> Path | None:
+    d = engine.MODELS_DIR / EMBED_DIR
+    if d.is_dir():
+        for f in sorted(d.glob("*.gguf")):
+            return f
+    return None
+
+
+def emb_index() -> dict:
+    global _emb_index
+    with _emb_lock:
+        if _emb_index is None:
+            try:
+                _emb_index = json.loads(
+                    EMB_PATH.read_text(encoding="utf-8")) \
+                    if EMB_PATH.exists() else {}
+            except Exception:
+                _emb_index = {}
+        return _emb_index
+
+
+def emb_save() -> None:
+    with _emb_lock:
+        EMB_PATH.write_text(json.dumps(_emb_index), encoding="utf-8")
+
+
+def ensure_embedder(wait: int = 15) -> bool:
+    model = embed_model_file()
+    if not model or not engine.server_binary():
+        return False
+    if embedder.ready():
+        return True
+    if not embedder.alive():
+        try:
+            embedder.start(str(model), 0, 2048, ["--embeddings"])
+        except Exception:
+            return False
+    return embedder.wait_ready(wait)
+
+
+def _cos(a: list[float], b: list[float]) -> float:
+    num = sum(x * y for x, y in zip(a, b))
+    da = sum(x * x for x in a) ** 0.5
+    db = sum(y * y for y in b) ** 0.5
+    return num / (da * db) if da and db else 0.0
+
+
+def _exchange_rows():
+    for c in read_chats():
+        msgs = c.get("messages", [])
+        for i, m in enumerate(msgs):
+            if m.get("role") != "user":
+                continue
+            reply = msgs[i + 1]["content"] if i + 1 < len(msgs) \
+                and msgs[i + 1].get("role") == "assistant" else ""
+            yield c, i, m.get("content", ""), reply
+
+
+def index_exchanges() -> None:
+    """Embed every stored exchange the index does not have yet. The
+    nomic prefixes (search_document / search_query) are the model's own
+    convention for asymmetric retrieval."""
+    global _emb_busy
+    if _emb_busy or not ensure_embedder():
+        return
+    _emb_busy = True
+    try:
+        idx = emb_index()
+        todo = []
+        for c, i, um, am in _exchange_rows():
+            key = f'{c["id"]}:{i}'
+            # An exchange whose reply has not arrived yet is skipped, not
+            # indexed half-finished: once a key exists it is never
+            # revisited, so indexing early would freeze an empty answer.
+            if key in idx or not am.strip():
+                continue
+            doc = "search_document: " + um[:300].replace("\n", " ") + \
+                " " + am[:500].replace("\n", " ")
+            todo.append((key, c, um, am, doc))
+        for start in range(0, len(todo), 8):
+            batch = todo[start:start + 8]
+            try:
+                vecs = embedder.embed([t[4] for t in batch])
+            except Exception:
+                return
+            for (key, c, um, am, _), v in zip(batch, vecs):
+                idx[key] = {"chat": c["id"], "title": c.get("title", ""),
+                            "q": um[:200].replace("\n", " "),
+                            "a": am[:400].replace("\n", " "), "v": v}
+        if todo:
+            emb_save()
+    finally:
+        _emb_busy = False
+
+
+def semantic_recall(query: str, exclude_id: str,
+                    limit: int = 2) -> list[str] | None:
+    """None means the embedding model is not available — the caller
+    falls back to keyword matching rather than losing recall."""
+    if not ensure_embedder(wait=3):
+        return None
+    index_exchanges()
+    try:
+        qv = embedder.embed(["search_query: " + query[:1000]])[0]
+    except Exception:
+        return None
+    scored = sorted(((_cos(qv, e["v"]), e) for e in emb_index().values()
+                     if e.get("chat") != exclude_id),
+                    key=lambda t: -t[0])
+    out = []
+    for sim, e in scored[:limit]:
+        if sim < EMBED_SIM_MIN:
+            break
+        out.append('From the conversation "%s" — asked: "%s" — answered: '
+                   '"%s"' % (e["title"], e["q"], e["a"]))
+    return out
+
+
+@app.post("/api/embed/install")
+def api_embed_install():
+    if embed_model_file():
+        threading.Thread(target=index_exchanges, daemon=True).start()
+        return jsonify({"ok": True, "already": True})
+
+    def run(task):
+        files = engine.hf_files(cfg, EMBED_REPO)
+        cand = [f for f in files if not f["split"] and not f["companion"]]
+        pick = next((f for f in cand if f["quant"] == "Q8_0"), None) \
+            or (min(cand, key=lambda f: f["size"]) if cand else None)
+        if not pick:
+            raise RuntimeError(f"No GGUF found in {EMBED_REPO}.")
+        engine.download_sync(cfg, EMBED_REPO, pick["path"], EMBED_DIR,
+                             task, 0, 90, label="recall model")
+        if task.cancel:
+            return
+        task.set(pct=92, detail="Starting the embedding server…")
+        if not ensure_embedder(30):
+            raise RuntimeError("The embedding server did not come up.")
+        task.set(pct=95, detail="Indexing past conversations…")
+        index_exchanges()
+        task.set(pct=100,
+                 detail=f"Ready — {len(emb_index())} exchanges indexed.")
+
+    return jsonify({"ok": True,
+                    "task": engine.spawn("download", "recall model",
+                                         run).view()})
+
+
 _STOP = {"the", "and", "that", "this", "with", "from", "have", "what",
          "your", "about", "into", "does", "how", "can", "for", "you",
          "are", "was", "were", "will", "would", "could", "should", "did",
@@ -240,10 +402,14 @@ def context_extra(query: str, chat_id: str) -> str:
         parts.append("Things to remember from earlier (persistent memory; "
                      "the user can edit these):\n" + mem[:MEMORY_INJECT])
     if cfg.get("recall", True):
-        snips = recall_snippets(query, chat_id)
+        snips = semantic_recall(query, chat_id)
+        mode = "meaning"
+        if snips is None:
+            snips = recall_snippets(query, chat_id)
+            mode = "keywords"
         if snips:
-            parts.append("Relevant excerpts from earlier conversations:\n" +
-                         "\n".join(snips))
+            parts.append("Relevant excerpts from earlier conversations "
+                         "(matched by " + mode + "):\n" + "\n".join(snips))
     if parts:
         parts.append("To permanently remember a new important fact, put it "
                      "on its own line starting with remember: in your "
@@ -276,7 +442,8 @@ def engines_list() -> list[dict]:
     """One entry per engine family folder that holds a finished model."""
     groups: dict[str, list[dict]] = {}
     for m in engine.local_models():
-        if m["folder"] and not m["partial"]:
+        # the embedding model is a helper, never a chat engine
+        if m["folder"] and m["folder"] != EMBED_DIR and not m["partial"]:
             groups.setdefault(m["folder"], []).append(m)
     loaded_name = Path(server.model).name if server.model else ""
     out = []
@@ -399,7 +566,21 @@ def api_setup_firstrun():
                 return
             if model_id == SETUP_PLAN[0][0]:
                 primary_file = dest.name
-        task.set(pct=96, detail="Loading Qwen as the primary engine…")
+        # The tiny recall model rides along; skipping it never fails setup.
+        if not embed_model_file():
+            task.set(pct=95, detail="Fetching the small recall model…")
+            try:
+                files = engine.hf_files(cfg, EMBED_REPO)
+                cand = [f for f in files
+                        if not f["split"] and not f["companion"]]
+                pick = next((f for f in cand if f["quant"] == "Q8_0"),
+                            None) or min(cand, key=lambda f: f["size"])
+                engine.download_sync(cfg, EMBED_REPO, pick["path"],
+                                     EMBED_DIR, task, 95, 97,
+                                     label="recall model")
+            except Exception as exc:  # noqa: BLE001
+                task.log(f"Recall model skipped: {exc}")
+        task.set(pct=97, detail="Loading Qwen as the primary engine…")
         try:
             load_model_by_name(primary_file)
             task.log(f"Loaded {primary_file}.")
@@ -466,6 +647,8 @@ def api_fit_local():
     ctx = int(request.args.get("ctx") or cfg.get("ctx") or 8192)
     out = []
     for m in engine.local_models():
+        if m.get("folder") == EMBED_DIR:
+            continue
         entry = fit.catalogue_match(m["name"])
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
             if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
@@ -858,8 +1041,11 @@ def api_chat_send():
                     else chat.get("model")
                 put_chat(chat)
                 # Any `remember:` lines in the reply become permanent
-                # memory for every future conversation.
+                # memory for every future conversation, and the fresh
+                # exchange joins the semantic index in the background.
                 remember_lines(reply)
+                threading.Thread(target=index_exchanges,
+                                 daemon=True).start()
 
     return Response(stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache",
@@ -894,6 +1080,7 @@ def main() -> None:
         app.run(host="127.0.0.1", port=PORT, threaded=True, debug=False)
     finally:
         server.stop()
+        embedder.stop()
 
 
 if __name__ == "__main__":

@@ -521,8 +521,14 @@ The model adds lines here itself when a reply contains remember: …"></textarea
   <div class="orow"><span class="lab">Use past conversations as context</span>
     <div class="ctl"><input type="checkbox" id="recallChk"
       style="width:auto"></div></div>
-  <p class="note">When on, excerpts of earlier chats that share enough words
-    with your question ride along so the model can refer back to them.</p>
+  <div class="orow"><span class="lab">Semantic recall</span><div class="ctl">
+    <span class="state" id="embedState">checking…</span>
+    <button class="btn thin" id="btnEmbedInstall" hidden>Download
+      (~150 MB)</button></div></div>
+  <p class="note">With the tiny embedding model installed
+    (nomic-embed-text, runs on the CPU beside the chat model), recall
+    matches past conversations by <b>meaning</b>, not just shared words.
+    Without it, keyword matching is used instead.</p>
   <div class="rowbtn">
     <button class="btn thin go" id="btnSaveMemory">Save</button>
     <button class="btn thin" id="btnClearMemory">Clear</button>
@@ -921,6 +927,21 @@ async function applyToFile(codeText, file) {
       (d.backup ? " — previous version kept as " + d.backup : "."));
     loadTree();
   } catch (e) { toast(e.message, true); }
+}
+
+function renderEmbed() {
+  var e = (S.status && S.status.embed) || {};
+  var st = $("embedState"), btn = $("btnEmbedInstall");
+  if (e.installed && e.ready) {
+    st.textContent = "ready · " + (e.indexed || 0) + " indexed";
+    st.className = "state ok"; btn.hidden = true;
+  } else if (e.installed) {
+    st.textContent = "starting…";
+    st.className = "state"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed";
+    st.className = "state"; btn.hidden = false;
+  }
 }
 
 /* ========================= engines + first run ========================= */
@@ -1568,6 +1589,7 @@ async function refresh() {
   if (!$("wsRunCmd").value && c.run_command)
     $("wsRunCmd").value = c.run_command;
   renderEngines();
+  if (!$("memoryPop").hidden) renderEmbed();
   if (st.setup_complete === false && !S.setupKicked) {
     // First run: fetch Qwen (primary) and Gemma into their own folders.
     S.setupKicked = true;
@@ -1664,7 +1686,20 @@ function wire() {
       $("memoryLabel").textContent = (d.text || "").trim()
         ? "Memory · set" : "Memory";
     } catch (e) { /* still show the editor */ }
+    renderEmbed();
     placePop(pop, $("btnMemory"));
+  });
+  $("btnEmbedInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/embed/install", { method: "POST" });
+      toast(d.already
+        ? "Already installed — re-indexing past conversations."
+        : "Downloading the recall model — progress is under Models → "
+          + "Downloads.");
+      $("embedState").textContent = "downloading…";
+      $("btnEmbedInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
   });
   $("btnSaveMemory").addEventListener("click", async function () {
     await api("/api/memory", { method: "POST",

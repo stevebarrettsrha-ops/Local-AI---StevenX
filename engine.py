@@ -596,3 +596,17 @@ class Server:
             return requests.get(f"{self.url}/props", timeout=5).json()
         except Exception:
             return {}
+
+
+class EmbedServer(Server):
+    """A second llama-server running a small embedding model — used to
+    match new questions to past conversations by meaning. Same official
+    release binary, just started with --embeddings on its own port."""
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        r = requests.post(f"{self.url}/v1/embeddings",
+                          json={"input": texts}, timeout=60)
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        return [d["embedding"]
+                for d in sorted(data, key=lambda x: x["index"])]

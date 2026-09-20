@@ -114,11 +114,16 @@ Two kinds, both plain files you can read and edit:
   every conversation. Edit it from the **Memory** pill in the top bar, or
   let the model add to it: any reply line starting with `remember:` is
   appended (de-duplicated, size-capped). Delete lines you don't want kept.
-- **Recall**: when a new question shares enough distinct words with an
-  earlier conversation, short excerpts of that exchange ride along as
-  context, so "how did we fix that bug last week?" actually works. Plain
-  keyword overlap over `data/chats.json` — cheap, local, inspectable —
-  and a single toggle in the Memory panel turns it off.
+- **Recall**: excerpts of earlier conversations that match the new
+  question ride along as context, so "how did we fix that bug last
+  week?" actually works. With the tiny **semantic recall** model
+  installed (nomic-embed-text, ~150 MB, one click in the Memory panel),
+  matching is by *meaning*: a second `llama-server --embeddings`
+  instance runs it on the CPU beside the chat model, every finished
+  exchange is embedded into `data/embeddings.json`, and questions are
+  matched by cosine similarity. Without it, plain keyword overlap over
+  `data/chats.json` is used instead. Either way it is local,
+  inspectable, and switched off by one toggle.
 
 ## Web search (opt-in)
 
