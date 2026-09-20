@@ -200,6 +200,27 @@ the browser — nothing is uploaded anywhere:
 So "write me a status report page" ends as an .html file you can open,
 print, host or send.
 
+### Excel, Word and PowerPoint
+
+Ask for a spreadsheet, a Word document or a deck and the model answers
+with a block tagged `xlsx`, `docx` or `pptx` in a simple text form (the
+convention rides with every request). That block carries a
+**Download .xlsx / .docx / .pptx** button: the backend builds the real
+Office file — typed numbers and bold headers per sheet, proper heading,
+bullet and numbered styles with **bold**, one titled slide per section —
+using openpyxl, python-docx and python-pptx, offline. Spreadsheets can
+embed a native Excel chart (`# Chart: bar <title>` — also line, pie,
+stacked or scatter — after a sheet's rows; labels from the first column,
+Excel's own theme colours) and cells starting with `=` are stored as
+live formulas (`=SUM(B2:B4)` really sums). Markdown tables in a docx
+block become real Word tables with a bold header row. Decks take an
+optional `# Theme: dark` (or `# Theme: #RRGGBB` accent) and a
+`- image: <file>` line places a picture from `data/images` on the
+slide — `image: latest` uses the newest generated one, wiring the
+Images page straight into your slides. Missing packages
+degrade to a clear "pip install -r requirements.txt" message rather than
+a broken button.
+
 ## Using other agent tools with the engine
 
 The loaded engine is an ordinary OpenAI-compatible server on

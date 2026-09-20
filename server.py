@@ -6,7 +6,9 @@ Run:  python server.py        (opens http://127.0.0.1:7806)
 
 from __future__ import annotations
 
+import csv
 import html as html_mod
+import io
 import json
 import os
 import re
@@ -19,7 +21,8 @@ import webbrowser
 from pathlib import Path
 
 import requests
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import (Flask, Response, jsonify, request, send_file,
+                   send_from_directory)
 
 import engine
 import fit
@@ -354,6 +357,292 @@ def api_embed_install():
     return jsonify({"ok": True,
                     "task": engine.spawn("download", "recall model",
                                          run).view()})
+
+
+# ---- Office documents: xlsx / docx / pptx built from tagged blocks ---- #
+# The model writes a fenced block tagged xlsx, docx or pptx in a simple
+# format (told to it via DOC_HOWTO); these builders turn that text into
+# the real file. Libraries are imported lazily so the app still runs if
+# they were not installed.
+DOC_HOWTO = (
+    "\n\nWhen the user asks for a spreadsheet, a Word document or a "
+    "PowerPoint deck, put the content in ONE fenced code block tagged "
+    "xlsx, docx or pptx. xlsx: lines of '# Sheet: <name>' each followed "
+    "by CSV rows, first row the headers; after a sheet's rows you may add "
+    "'# Chart: bar <title>' (or line, or pie) to embed a chart of that "
+    "sheet — first column is the labels, the other columns the numbers. "
+    "Chart types: bar to compare categories, line for change over time, "
+    "stacked for parts within categories, scatter for two numeric "
+    "columns, pie only for a few shares of a whole. Cells starting with "
+    "= are real Excel formulas (e.g. =SUM(B2:B4), =B2*C2). docx: "
+    "Markdown-style # headings, paragraphs, - bullets, **bold**, and "
+    "Markdown tables (| cell | rows), which become real Word tables. "
+    "pptx: optionally start with '# Theme: dark' or '# Theme: #RRGGBB'; "
+    "then '# <slide title>' followed by - bullet lines per slide; a line "
+    "'- image: <file in data/images>' (or 'image: latest' for the newest "
+    "generated picture) places that image on the slide. The app offers "
+    "the real file for download from that block.")
+
+
+def build_xlsx(text: str) -> tuple[bytes, str]:
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    wb.remove(wb.active)
+    # each sheet: (name, rows, chart) where chart is (type, title) or None
+    sheets, name, rows, chart = [], "Sheet1", [], None
+    for line in text.splitlines():
+        m = re.match(r"\s*#+\s*Chart\s*:\s*(bar|line|pie|scatter|stacked)"
+                     r"\b\s*(.*)$", line, re.I)
+        if m:
+            chart = (m.group(1).lower(), m.group(2).strip())
+            continue
+        m = re.match(r"\s*#+\s*Sheet\s*:\s*(.+)$", line, re.I)
+        if m:
+            if rows:
+                sheets.append((name, rows, chart))
+            name, rows, chart = m.group(1).strip()[:31], [], None
+        elif line.strip():
+            rows.append(next(csv.reader([line])))
+    if rows:
+        sheets.append((name, rows, chart))
+    if not sheets:
+        raise RuntimeError("No rows found in the block.")
+    for sname, srows, schart in sheets:
+        ws = wb.create_sheet(title=sname or "Sheet")
+        for r, row in enumerate(srows, 1):
+            for c, val in enumerate(row, 1):
+                v = val.strip()
+                if v and re.fullmatch(r"-?\d+(\.\d+)?", v):
+                    v = float(v) if "." in v else int(v)
+                cell = ws.cell(row=r, column=c, value=v)
+                if r == 1:
+                    cell.font = Font(bold=True)
+        for col in ws.columns:
+            width = max((len(str(c.value)) for c in col if c.value
+                         is not None), default=8)
+            ws.column_dimensions[col[0].column_letter].width = \
+                min(40, width + 2)
+        # An embedded chart of this sheet's data: labels from the first
+        # column, values from the rest, series named by the header row.
+        # Colors stay Excel's own theme — a fixed-order palette, never
+        # hand-picked here.
+        ncols = max((len(r) for r in srows), default=0)
+        if schart and len(srows) >= 2 and ncols >= 2:
+            from openpyxl.chart import ScatterChart, Series
+            ctype, ctitle = schart
+            nrows = len(srows)
+            if ctype == "scatter":
+                # x from the first column, one series per further column
+                ch = ScatterChart()
+                ch.style = 13
+                xref = Reference(ws, min_col=1, min_row=2, max_row=nrows)
+                for c in range(2, ncols + 1):
+                    yref = Reference(ws, min_col=c, min_row=1,
+                                     max_row=nrows)
+                    ch.series.append(Series(yref, xref,
+                                            title_from_data=True))
+                ch.x_axis.title = str(srows[0][0]) if srows[0] else None
+            else:
+                if ctype == "stacked":
+                    ch = BarChart()
+                    ch.grouping = "stacked"
+                    ch.overlap = 100
+                else:
+                    ch = {"bar": BarChart, "line": LineChart,
+                          "pie": PieChart}[ctype]()
+                last_col = 2 if ctype == "pie" else ncols
+                data = Reference(ws, min_col=2, max_col=last_col,
+                                 min_row=1, max_row=nrows)
+                ch.add_data(data, titles_from_data=True)
+                ch.set_categories(Reference(ws, min_col=1, min_row=2,
+                                            max_row=nrows))
+            ch.title = ctitle or sname
+            ch.height, ch.width = 8, 15
+            ws.add_chart(ch, f"{get_column_letter(ncols + 2)}2")
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".spreadsheetml.sheet")
+
+
+def _docx_runs(paragraph, text: str) -> None:
+    for i, part in enumerate(re.split(r"\*\*(.+?)\*\*", text)):
+        if part:
+            paragraph.add_run(part).bold = (i % 2 == 1)
+
+
+def build_docx(text: str) -> tuple[bytes, str]:
+    from docx import Document
+    doc = Document()
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        s = line.strip()
+        if not s:
+            i += 1
+            continue
+        # A run of |-delimited lines is a Markdown table: header row bold,
+        # the |---| separator dropped, rendered as a real Word table.
+        if s.startswith("|") and s.endswith("|"):
+            tbl = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in
+                         lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
+                    tbl.append(cells)
+                i += 1
+            if tbl:
+                cols = max(len(r) for r in tbl)
+                t = doc.add_table(rows=len(tbl), cols=cols)
+                t.style = "Table Grid"
+                for r, rowvals in enumerate(tbl):
+                    for c in range(cols):
+                        para = t.cell(r, c).paragraphs[0]
+                        txt = rowvals[c] if c < len(rowvals) else ""
+                        if r == 0:
+                            para.add_run(
+                                re.sub(r"\*\*", "", txt)).bold = True
+                        else:
+                            _docx_runs(para, txt)
+            continue
+        m = re.match(r"(#{1,4})\s+(.*)", line)
+        if m:
+            doc.add_heading(re.sub(r"\*\*", "", m.group(2)),
+                            level=min(len(m.group(1)), 4))
+        elif re.match(r"\s*[-*]\s+", line):
+            _docx_runs(doc.add_paragraph(style="List Bullet"),
+                       re.sub(r"^\s*[-*]\s+", "", line))
+        elif re.match(r"\s*\d+[.)]\s+", line):
+            _docx_runs(doc.add_paragraph(style="List Number"),
+                       re.sub(r"^\s*\d+[.)]\s+", "", line))
+        else:
+            _docx_runs(doc.add_paragraph(), s)
+        i += 1
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".wordprocessingml.document")
+
+
+def _pptx_image(name: str) -> Path | None:
+    """Only images from the app's own gallery (data/images); 'latest'
+    means the newest generated picture."""
+    name = name.strip()
+    if "/" in name or "\\" in name or ".." in name:
+        return None
+    if not IMAGES_OUT.is_dir():
+        return None
+    if name.lower() == "latest":
+        pngs = sorted(IMAGES_OUT.glob("*.png"),
+                      key=lambda p: -p.stat().st_mtime)
+        return pngs[0] if pngs else None
+    p = IMAGES_OUT / name
+    return p if p.is_file() and p.suffix.lower() in (".png", ".jpg",
+                                                     ".jpeg") else None
+
+
+def build_pptx(text: str) -> tuple[bytes, str]:
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.util import Inches
+    prs = Presentation()
+    # optional theme: '# Theme: dark' or '# Theme: #RRGGBB' (accent only)
+    bg = fg = accent = None
+    slides, cur = [], None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = re.match(r"#+\s*Theme\s*:\s*(\S+)", s, re.I)
+        if m:
+            t = m.group(1).lower()
+            if t == "dark":
+                bg, fg = RGBColor(0x1E, 0x1E, 0x1C), \
+                    RGBColor(0xEC, 0xEA, 0xE4)
+                accent = RGBColor(0xD9, 0x77, 0x57)
+            elif re.fullmatch(r"#?[0-9a-f]{6}", t):
+                h = t.lstrip("#")
+                accent = RGBColor(int(h[0:2], 16), int(h[2:4], 16),
+                                  int(h[4:6], 16))
+            continue
+        m = re.match(r"#+\s+(.*)", s)
+        if m:
+            cur = {"title": re.sub(r"\*\*", "", m.group(1)),
+                   "bullets": [], "images": []}
+            slides.append(cur)
+            continue
+        if cur is None:
+            cur = {"title": "", "bullets": [], "images": []}
+            slides.append(cur)
+        body = re.sub(r"^[-*]\s+", "", s)
+        m = re.match(r"(?:image|img)\s*:\s*(.+)$", body, re.I)
+        if m:
+            img = _pptx_image(m.group(1))
+            if img:
+                cur["images"].append(img)
+            continue
+        cur["bullets"].append(re.sub(r"\*\*", "", body))
+    if not slides:
+        raise RuntimeError("No slides found in the block.")
+    layout = prs.slide_layouts[1]          # title and content
+    for sl in slides:
+        slide = prs.slides.add_slide(layout)
+        if bg is not None:
+            slide.background.fill.solid()
+            slide.background.fill.fore_color.rgb = bg
+        slide.shapes.title.text = sl["title"][:90]
+        for para in slide.shapes.title.text_frame.paragraphs:
+            for run in para.runs:
+                if accent is not None:
+                    run.font.color.rgb = accent
+                elif fg is not None:
+                    run.font.color.rgb = fg
+        frame = slide.placeholders[1].text_frame
+        has_img = bool(sl["images"])
+        if has_img:
+            # bullets keep the left half; pictures take the right
+            slide.placeholders[1].width = Inches(4.6)
+        for i, btxt in enumerate(sl["bullets"][:12]):
+            para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
+            para.text = btxt[:200]
+            for run in para.runs:
+                if fg is not None:
+                    run.font.color.rgb = fg
+        for j, img in enumerate(sl["images"][:2]):
+            slide.shapes.add_picture(str(img), Inches(5.2),
+                                     Inches(1.7 + j * 2.6),
+                                     width=Inches(4.3))
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
+                            ".presentationml.presentation")
+
+
+DOC_BUILDERS = {"xlsx": build_xlsx, "docx": build_docx, "pptx": build_pptx}
+
+
+@app.post("/api/doc")
+def api_doc():
+    b = request.get_json(silent=True) or {}
+    kind = (b.get("kind") or "").lower()
+    if kind not in DOC_BUILDERS:
+        return jsonify({"error": "Unknown document kind."}), 400
+    title = re.sub(r"[^A-Za-z0-9 _-]+", "",
+                   b.get("title") or "document").strip()[:48] or "document"
+    try:
+        data, mime = DOC_BUILDERS[kind](b.get("content") or "")
+    except ImportError as exc:
+        return jsonify({"error": f"The .{kind} exporter needs a Python "
+                        f"package that is not installed ({exc}). Run: "
+                        "pip install -r requirements.txt"}), 500
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+    return send_file(io.BytesIO(data), mimetype=mime, as_attachment=True,
+                     download_name=f"{title}.{kind}")
 
 
 # ---- images: local text-to-image via stable-diffusion.cpp ---- #
@@ -1204,8 +1493,9 @@ def api_chat_send():
               "top_p": b.get("top_p", cfg.get("top_p")),
               "max_tokens": b.get("max_tokens", cfg.get("max_tokens")),
               "system": b.get("system", cfg.get("system")),
-              # persistent memory + excerpts from earlier conversations
-              "system_extra": context_extra(text, chat["id"])}
+              # persistent memory, past-conversation excerpts, and the
+              # Office-document block convention
+              "system_extra": context_extra(text, chat["id"]) + DOC_HOWTO}
 
     def stream():
         started = time.time()
