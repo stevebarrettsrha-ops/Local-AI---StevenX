@@ -125,6 +125,18 @@ Two kinds, both plain files you can read and edit:
   `data/chats.json` is used instead. Either way it is local,
   inspectable, and switched off by one toggle.
 
+## Images
+
+The Images page generates pictures locally with **stable-diffusion.cpp**
+(the diffusion engine from the same ggml family): one click downloads the
+official release build — the CUDA variant for NVIDIA cards, with its
+runtime DLLs — plus the Stable Diffusion 1.5 Q8 GGUF (~1.8 GB) into
+`models/image/`. Prompt, size and steps in, PNGs out, with progress per
+sampling step; everything lands in `data/images` with its prompt saved
+beside it, browsable in the gallery. On an RTX 4060 a 512×512 at 20 steps
+takes a few seconds. Swap any sd.cpp-compatible GGUF into `models/image/`
+to change models.
+
 ## Voice
 
 - **Speech in**: the mic button beside Send records, then transcribes

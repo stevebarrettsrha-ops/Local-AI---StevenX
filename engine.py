@@ -37,6 +37,8 @@ GH_API = os.environ.get("LLAMA_STUDIO_GITHUB_API",
 RELEASES = f"{GH_API}/repos/ggml-org/llama.cpp/releases"
 WHISPER_RELEASES = f"{GH_API}/repos/ggml-org/whisper.cpp/releases"
 WHISPER_DIR = APP_DIR / "whisper.cpp"
+SD_RELEASES = f"{GH_API}/repos/leejet/stable-diffusion.cpp/releases"
+SD_DIR = APP_DIR / "stable-diffusion.cpp"
 HF_BASE = "https://huggingface.co"
 
 
@@ -257,6 +259,53 @@ def whisper_install_sync(task: Task) -> None:
                 f.chmod(0o755)
             except OSError:
                 pass
+
+
+def sd_binary() -> Path | None:
+    name = "sd.exe" if platform.system() == "Windows" else "sd"
+    if SD_DIR.is_dir():
+        direct = SD_DIR / name
+        if direct.exists():
+            return direct
+        for found in SD_DIR.rglob(name):
+            return found
+    return None
+
+
+def sd_install_sync(task: Task, hw: dict) -> None:
+    """stable-diffusion.cpp's CLI from the official releases (assets are
+    sd-master-<hash>-bin-win-<backend>-x64.zip, with a cudart companion
+    for the CUDA build)."""
+    if platform.system() != "Windows":
+        raise RuntimeError(
+            "stable-diffusion.cpp publishes prebuilt binaries for Windows "
+            "only. On this OS, put an sd binary into "
+            "./stable-diffusion.cpp yourself and retry.")
+    choices = [(["win", "avx2"], "CPU build")]
+    if hw.get("vendor") == "nvidia":
+        choices = [(["win", "cuda12"],
+                    "CUDA build for your NVIDIA card")] + choices
+    task.set(detail="Asking GitHub for the latest stable-diffusion.cpp "
+                    "release…")
+    release, match, why = _resolve_release(choices, task, base=SD_RELEASES)
+    task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
+    SD_DIR.mkdir(parents=True, exist_ok=True)
+    if not _fetch_zip(task, match, 0, 22, dest_dir=SD_DIR):
+        task.set(state="cancelled", detail="Cancelled")
+        return
+    if "cuda" in match["name"].lower():
+        runtime = next((a for a in release.get("assets", [])
+                        if "cudart" in (a.get("name") or "").lower()
+                        and (a.get("name") or "").lower().endswith(".zip")),
+                       None)
+        if runtime:
+            task.set(pct=22, detail="Fetching the CUDA runtime DLLs…")
+            if not _fetch_zip(task, runtime, 22, 30, dest_dir=SD_DIR):
+                task.set(state="cancelled", detail="Cancelled")
+                return
+    if not sd_binary():
+        raise RuntimeError("Unpacked, but no sd binary was found inside "
+                           "the archive.")
 
 
 def install(hw: dict) -> Task:

@@ -239,6 +239,17 @@
   .bar i{display:block;height:100%;border-radius:3px;transition:width .4s ease;
          background:var(--accent)}
 
+  /* ---------- image gallery ---------- */
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
+      gap:12px}
+  .gimg{background:var(--raised);border:1px solid var(--line);border-radius:12px;
+      overflow:hidden;display:flex;flex-direction:column}
+  .gimg img{width:100%;display:block;cursor:zoom-in;background:#1c1b19}
+  .gimg .cap{padding:8px 10px;font-size:11px;color:var(--muted);line-height:1.5;
+      overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;
+      -webkit-box-orient:vertical}
+  .gimg .gacts{display:flex;gap:6px;padding:0 8px 8px}
+
   /* ---------- popover ---------- */
   .pop{position:fixed;z-index:40;background:var(--panel);border:1px solid var(--line);
        border-radius:14px;padding:16px;width:min(420px,92vw);
@@ -283,6 +294,8 @@
       <svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/></svg>Chat</button>
     <button class="nav" data-view="code">
       <svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></svg>Code</button>
+    <button class="nav" data-view="images">
+      <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="m3 17 5-5 4 4 3-3 6 6"/></svg>Images</button>
     <button class="nav" data-view="models">
       <svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5zM3 16l9 5 9-5M3 12l9 5 9-5"/></svg>Models
       <span class="tag" id="modelsTag" hidden>!</span></button>
@@ -400,6 +413,50 @@ files to the model, apply its fixes, and run again — up to 3 rounds.">
               </div>
             </div>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- images -->
+    <section class="page" data-page="images" hidden>
+      <div class="wrap">
+        <div class="panel">
+          <h2>Create an image</h2>
+          <p class="sub">Generated on this machine by stable-diffusion.cpp
+            — the image engine from the same family as the chat models.
+            Nothing leaves your computer.</p>
+          <div class="orow"><span class="lab">Image engine</span>
+            <div class="ctl"><span class="state" id="imgState">checking…</span>
+            <button class="btn thin" id="btnImageInstall" hidden>Download
+              (~1.8 GB)</button></div></div>
+          <textarea id="imgPrompt" rows="3" placeholder="A cosy cabin in a
+snowy forest at dusk, warm light in the windows, oil painting"></textarea>
+          <div class="frow" style="margin-top:10px">
+            <select id="imgSize">
+              <option value="512x512" selected>512 × 512</option>
+              <option value="512x768">512 × 768 — portrait</option>
+              <option value="768x512">768 × 512 — landscape</option>
+              <option value="640x640">640 × 640</option>
+            </select>
+            <select id="imgSteps">
+              <option value="20" selected>20 steps — balanced</option>
+              <option value="12">12 steps — quick</option>
+              <option value="30">30 steps — detailed</option>
+            </select>
+            <button class="btn go" id="btnImgGen">Generate</button>
+          </div>
+          <div class="fitem" id="imgTask" hidden
+            style="display:block;margin-top:12px">
+            <div class="n"><b>Generating…</b>
+              <span id="imgTaskDetail"></span></div>
+            <div class="bar"><i id="imgTaskBar" style="width:0%"></i></div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Gallery</h2>
+          <p class="sub" id="galleryNote">Everything you generate is kept in
+            data/images.</p>
+          <div class="gallery" id="gallery"></div>
         </div>
       </div>
     </section>
@@ -950,6 +1007,83 @@ async function applyToFile(codeText, file) {
   } catch (e) { toast(e.message, true); }
 }
 
+/* ========================= images ========================= */
+function renderImages() {
+  var im = (S.status && S.status.image) || {};
+  var st = $("imgState"), btn = $("btnImageInstall");
+  if (im.installed) {
+    st.textContent = "ready"; st.className = "state ok"; btn.hidden = true;
+  } else {
+    st.textContent = "not installed"; st.className = "state";
+    btn.hidden = false;
+  }
+}
+async function loadGallery() {
+  var box = $("gallery");
+  try {
+    var d = await api("/api/images");
+    box.innerHTML = "";
+    if (!d.images.length) {
+      box.innerHTML = '<div class="note">Nothing yet — describe an image '
+        + "above and press Generate.</div>";
+      return;
+    }
+    d.images.forEach(function (im) {
+      var el = document.createElement("div");
+      el.className = "gimg";
+      el.innerHTML = '<img src="' + esc(im.url) + '" alt="" title="' +
+        esc(im.prompt) + '"><div class="cap">' + esc(im.prompt || im.name) +
+        '</div><div class="gacts"></div>';
+      el.querySelector("img").addEventListener("click", function () {
+        window.open(im.url, "_blank");
+      });
+      var acts = el.querySelector(".gacts");
+      acts.appendChild(mkBtn("Open", function () {
+        window.open(im.url, "_blank"); }, "miniBtn"));
+      acts.appendChild(mkBtn("Delete", async function () {
+        if (!confirm("Delete this image?")) return;
+        await api("/api/images", { method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: im.name }) });
+        loadGallery();
+      }, "miniBtn"));
+      box.appendChild(el);
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="note bad-text">' + esc(e.message) +
+      "</div>";
+  }
+}
+async function generateImage() {
+  var prompt = $("imgPrompt").value.trim();
+  if (!prompt) { toast("Describe the image first.", true); return; }
+  var wh = $("imgSize").value.split("x");
+  try {
+    await api("/api/image/generate", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: prompt, width: Number(wh[0]),
+        height: Number(wh[1]), steps: Number($("imgSteps").value) }) });
+    $("imgTask").hidden = false;
+    $("imgTaskDetail").textContent = "Starting…";
+    $("imgTaskBar").style.width = "0%";
+    pollTasks();
+  } catch (e) { toast(e.message, true); }
+}
+function renderImageTask(t) {
+  if (t.state === "running") {
+    $("imgTask").hidden = false;
+    $("imgTaskDetail").textContent = t.detail || "Working…";
+    $("imgTaskBar").style.width = Math.round(t.pct) + "%";
+  } else {
+    if (!$("imgTask").hidden) {
+      $("imgTask").hidden = true;
+      if (t.state === "done") { toast("Image saved."); loadGallery(); }
+      else if (t.state === "error") toast(t.detail || "Generation failed.",
+        true);
+    }
+  }
+}
+
 /* ========================= voice ========================= */
 var REC = { active: false, mode: "", mr: null, chunks: [] };
 function micBtn(mode) { return $(mode === "code" ? "btnCodeMic" : "btnMic"); }
@@ -1123,7 +1257,7 @@ function renderSetupTask(t) {
 
 /* ========================= views ========================= */
 function updateTitle() {
-  var t = { models: "Models", engine: "Engine" }[S.view];
+  var t = { models: "Models", engine: "Engine", images: "Images" }[S.view];
   if (!t) {
     var c = S.cur[S.view];
     t = (c && c.title) || (S.view === "code" ? "Code" : "Chat");
@@ -1143,6 +1277,7 @@ function show(view) {
   if (view === "models") { loadLocal(); renderCatalogue(); pollTasks(); }
   if (view === "engine") { renderHardware(); pollLog(); }
   if (view === "code") loadWorkspace();
+  if (view === "images") { renderImages(); loadGallery(); pollTasks(); }
 }
 
 /* ========================= chat + code ========================= */
@@ -1596,6 +1731,8 @@ async function pollTasks() {
   }
   var setup = list.filter(function (t) { return t.kind === "setup"; })[0];
   if (setup) renderSetupTask(setup);
+  var img = list.filter(function (t) { return t.kind === "image"; })[0];
+  if (img) renderImageTask(img);
   var inst = list.filter(function (t) { return t.kind === "install"; })[0];
   if (inst && $("engineState")) {
     var line = $("installLine");
@@ -1710,6 +1847,7 @@ async function refresh() {
     $("wsRunCmd").value = c.run_command;
   renderEngines();
   renderVoice();
+  renderImages();
   if (!$("memoryPop").hidden) renderEmbed();
   if (st.setup_complete === false && !S.setupKicked) {
     // First run: fetch Qwen (primary) and Gemma into their own folders.
@@ -1890,6 +2028,18 @@ function wire() {
   $("btnWsAutoFix").addEventListener("click", autoFix);
   $("wsRunCmd").addEventListener("keydown", function (e) {
     if (e.key === "Enter") runCmd(); });
+  $("btnImgGen").addEventListener("click", generateImage);
+  $("btnImageInstall").addEventListener("click", async function () {
+    try {
+      var d = await api("/api/image/install", { method: "POST" });
+      toast(d.already ? "Already installed."
+        : "Downloading stable-diffusion.cpp and the SD 1.5 model — "
+          + "progress is under Models → Downloads.");
+      $("imgState").textContent = "downloading…";
+      $("btnImageInstall").hidden = true;
+      pollTasks();
+    } catch (e) { toast(e.message, true); }
+  });
   $("btnMic").addEventListener("click", function () { toggleMic("chat"); });
   $("btnCodeMic").addEventListener("click", function () {
     toggleMic("code"); });

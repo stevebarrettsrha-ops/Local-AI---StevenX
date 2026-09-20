@@ -134,6 +134,8 @@ def api_status():
         "voice": {"installed": bool(engine.whisper_binary()
                                     and voice_model_file()),
                   "ready": whisper.ready()},
+        "image": {"installed": bool(engine.sd_binary()
+                                    and image_model_file())},
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
                     "kv_bits", "auto_start", "last_model", "plan_for",
@@ -353,6 +355,129 @@ def api_embed_install():
                                          run).view()})
 
 
+# ---- images: local text-to-image via stable-diffusion.cpp ---- #
+IMAGE_MODEL_REPO = "second-state/stable-diffusion-v1-5-GGUF"
+IMAGE_MODEL_FILE = "stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf"
+IMAGE_DIR = "image"
+IMAGES_OUT = DATA_DIR / "images"
+
+
+def image_model_file() -> Path | None:
+    d = engine.MODELS_DIR / IMAGE_DIR
+    if d.is_dir():
+        for f in sorted(d.glob("*.gguf")):
+            return f
+    return None
+
+
+@app.post("/api/image/install")
+def api_image_install():
+    if engine.sd_binary() and image_model_file():
+        return jsonify({"ok": True, "already": True})
+
+    def run(task):
+        if not engine.sd_binary():
+            engine.sd_install_sync(task, fit.hardware({}))
+        if not image_model_file():
+            engine.download_sync(cfg, IMAGE_MODEL_REPO, IMAGE_MODEL_FILE,
+                                 IMAGE_DIR, task, 30, 100,
+                                 label="image model")
+
+    return jsonify({"ok": True,
+                    "task": engine.spawn("download", "image engine",
+                                         run).view()})
+
+
+@app.post("/api/image/generate")
+def api_image_generate():
+    b = request.get_json(silent=True) or {}
+    prompt = (b.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Describe the image first."}), 400
+    binary, model = engine.sd_binary(), image_model_file()
+    if not binary or not model:
+        return jsonify({"error": "The image engine is not installed yet — "
+                                 "download it on the Images page."}), 400
+    w = max(256, min(768, int(b.get("width") or 512))) // 64 * 64
+    h = max(256, min(768, int(b.get("height") or 512))) // 64 * 64
+    steps = max(1, min(50, int(b.get("steps") or 20)))
+    seed = int(b.get("seed") or time.time()) % 2_000_000_000
+
+    def run(task):
+        IMAGES_OUT.mkdir(parents=True, exist_ok=True)
+        name = f"img-{int(time.time())}-{seed}.png"
+        out = IMAGES_OUT / name
+        cmd = [str(binary), "-m", str(model), "-p", prompt,
+               "-o", str(out), "--steps", str(steps),
+               "-W", str(w), "-H", str(h), "-s", str(seed)]
+        task.log(" ".join(cmd))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                bufsize=1, cwd=str(engine.SD_DIR))
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            task.log(line)
+            task.set(detail=line[:120])
+            m = re.search(r"(\d+)\s*/\s*(\d+)", line)
+            if m and int(m.group(2)) == steps:
+                task.set(pct=int(m.group(1)) / steps * 100)
+            if task.cancel:
+                proc.kill()
+                task.set(state="cancelled", detail="Cancelled")
+                return
+        proc.wait()
+        if proc.returncode != 0 or not out.exists():
+            raise RuntimeError(f"sd exited with code {proc.returncode} — "
+                               "see the task log.")
+        (IMAGES_OUT / (name + ".json")).write_text(
+            json.dumps({"prompt": prompt, "seed": seed, "w": w, "h": h,
+                        "steps": steps}), encoding="utf-8")
+        task.meta["file"] = name
+        task.set(pct=100, detail=f"Saved {name}")
+
+    return jsonify({"ok": True,
+                    "task": engine.spawn("image", prompt[:48],
+                                         run).view()})
+
+
+@app.get("/api/images")
+def api_images_list():
+    out = []
+    if IMAGES_OUT.is_dir():
+        for f in sorted(IMAGES_OUT.glob("*.png"),
+                        key=lambda p: -p.stat().st_mtime)[:60]:
+            meta = {}
+            side = IMAGES_OUT / (f.name + ".json")
+            if side.exists():
+                try:
+                    meta = json.loads(side.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            out.append({"name": f.name, "url": f"/images/{f.name}",
+                        "prompt": meta.get("prompt", ""),
+                        "created": f.stat().st_mtime})
+    return jsonify({"images": out})
+
+
+@app.get("/images/<name>")
+def api_image_file(name: str):
+    if "/" in name or "\\" in name or ".." in name:
+        return jsonify({"error": "Bad name."}), 400
+    return send_from_directory(IMAGES_OUT, name)
+
+
+@app.delete("/api/images")
+def api_image_delete():
+    name = ((request.get_json(silent=True) or {}).get("name") or "")
+    if "/" in name or "\\" in name or ".." in name or not name:
+        return jsonify({"error": "Bad name."}), 400
+    (IMAGES_OUT / name).unlink(missing_ok=True)
+    (IMAGES_OUT / (name + ".json")).unlink(missing_ok=True)
+    return jsonify({"ok": True})
+
+
 # ---- voice: local speech-to-text via whisper.cpp ---- #
 WHISPER_MODEL_REPO = "ggerganov/whisper.cpp"
 WHISPER_MODEL_FILE = "ggml-base.bin"
@@ -515,8 +640,9 @@ def engines_list() -> list[dict]:
     """One entry per engine family folder that holds a finished model."""
     groups: dict[str, list[dict]] = {}
     for m in engine.local_models():
-        # the embedding model is a helper, never a chat engine
-        if m["folder"] and m["folder"] != EMBED_DIR and not m["partial"]:
+        # embedding and image models are helpers, never chat engines
+        if m["folder"] and m["folder"] not in (EMBED_DIR, IMAGE_DIR) \
+                and not m["partial"]:
             groups.setdefault(m["folder"], []).append(m)
     loaded_name = Path(server.model).name if server.model else ""
     out = []
@@ -720,7 +846,7 @@ def api_fit_local():
     ctx = int(request.args.get("ctx") or cfg.get("ctx") or 8192)
     out = []
     for m in engine.local_models():
-        if m.get("folder") == EMBED_DIR:
+        if m.get("folder") in (EMBED_DIR, IMAGE_DIR):
             continue
         entry = fit.catalogue_match(m["name"])
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
