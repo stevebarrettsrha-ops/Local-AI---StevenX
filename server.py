@@ -368,31 +368,44 @@ DOC_HOWTO = (
     "\n\nWhen the user asks for a spreadsheet, a Word document or a "
     "PowerPoint deck, put the content in ONE fenced code block tagged "
     "xlsx, docx or pptx. xlsx: lines of '# Sheet: <name>' each followed "
-    "by CSV rows, first row the headers. docx: Markdown-style # headings, "
-    "paragraphs, - bullets and **bold**. pptx: '# <slide title>' followed "
-    "by - bullet lines, one group per slide. The app offers the real file "
-    "for download from that block.")
+    "by CSV rows, first row the headers; after a sheet's rows you may add "
+    "'# Chart: bar <title>' (or line, or pie) to embed a chart of that "
+    "sheet — first column is the labels, the other columns the numbers. "
+    "Use bar to compare categories, line for change over time, pie only "
+    "for a few shares of a whole. docx: Markdown-style # headings, "
+    "paragraphs, - bullets, **bold**, and Markdown tables (| cell | "
+    "rows), which become real Word tables. pptx: '# <slide title>' "
+    "followed by - bullet lines, one group per slide. The app offers the "
+    "real file for download from that block.")
 
 
 def build_xlsx(text: str) -> tuple[bytes, str]:
     from openpyxl import Workbook
+    from openpyxl.chart import BarChart, LineChart, PieChart, Reference
     from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
     wb = Workbook()
     wb.remove(wb.active)
-    sheets, name, rows = [], "Sheet1", []
+    # each sheet: (name, rows, chart) where chart is (type, title) or None
+    sheets, name, rows, chart = [], "Sheet1", [], None
     for line in text.splitlines():
+        m = re.match(r"\s*#+\s*Chart\s*:\s*(bar|line|pie)\b\s*(.*)$",
+                     line, re.I)
+        if m:
+            chart = (m.group(1).lower(), m.group(2).strip())
+            continue
         m = re.match(r"\s*#+\s*Sheet\s*:\s*(.+)$", line, re.I)
         if m:
             if rows:
-                sheets.append((name, rows))
-            name, rows = m.group(1).strip()[:31], []
+                sheets.append((name, rows, chart))
+            name, rows, chart = m.group(1).strip()[:31], [], None
         elif line.strip():
             rows.append(next(csv.reader([line])))
     if rows:
-        sheets.append((name, rows))
+        sheets.append((name, rows, chart))
     if not sheets:
         raise RuntimeError("No rows found in the block.")
-    for sname, srows in sheets:
+    for sname, srows, schart in sheets:
         ws = wb.create_sheet(title=sname or "Sheet")
         for r, row in enumerate(srows, 1):
             for c, val in enumerate(row, 1):
@@ -407,6 +420,24 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
                          is not None), default=8)
             ws.column_dimensions[col[0].column_letter].width = \
                 min(40, width + 2)
+        # An embedded chart of this sheet's data: labels from the first
+        # column, values from the rest, series named by the header row.
+        # Colors stay Excel's own theme — a fixed-order palette, never
+        # hand-picked here.
+        ncols = max((len(r) for r in srows), default=0)
+        if schart and len(srows) >= 2 and ncols >= 2:
+            ctype, ctitle = schart
+            last_col = 2 if ctype == "pie" else ncols
+            ch = {"bar": BarChart, "line": LineChart,
+                  "pie": PieChart}[ctype]()
+            ch.title = ctitle or sname
+            data = Reference(ws, min_col=2, max_col=last_col,
+                             min_row=1, max_row=len(srows))
+            ch.add_data(data, titles_from_data=True)
+            ch.set_categories(Reference(ws, min_col=1, min_row=2,
+                                        max_row=len(srows)))
+            ch.height, ch.width = 8, 15
+            ws.add_chart(ch, f"{get_column_letter(ncols + 2)}2")
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
@@ -422,24 +453,51 @@ def _docx_runs(paragraph, text: str) -> None:
 def build_docx(text: str) -> tuple[bytes, str]:
     from docx import Document
     doc = Document()
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if not line.strip():
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        s = line.strip()
+        if not s:
+            i += 1
+            continue
+        # A run of |-delimited lines is a Markdown table: header row bold,
+        # the |---| separator dropped, rendered as a real Word table.
+        if s.startswith("|") and s.endswith("|"):
+            tbl = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cells = [c.strip() for c in
+                         lines[i].strip().strip("|").split("|")]
+                if not all(re.fullmatch(r":?-{2,}:?", c) for c in cells):
+                    tbl.append(cells)
+                i += 1
+            if tbl:
+                cols = max(len(r) for r in tbl)
+                t = doc.add_table(rows=len(tbl), cols=cols)
+                t.style = "Table Grid"
+                for r, rowvals in enumerate(tbl):
+                    for c in range(cols):
+                        para = t.cell(r, c).paragraphs[0]
+                        txt = rowvals[c] if c < len(rowvals) else ""
+                        if r == 0:
+                            para.add_run(
+                                re.sub(r"\*\*", "", txt)).bold = True
+                        else:
+                            _docx_runs(para, txt)
             continue
         m = re.match(r"(#{1,4})\s+(.*)", line)
         if m:
             doc.add_heading(re.sub(r"\*\*", "", m.group(2)),
                             level=min(len(m.group(1)), 4))
-            continue
-        m = re.match(r"\s*[-*]\s+(.*)", line)
-        if m:
-            _docx_runs(doc.add_paragraph(style="List Bullet"), m.group(1))
-            continue
-        m = re.match(r"\s*\d+[.)]\s+(.*)", line)
-        if m:
-            _docx_runs(doc.add_paragraph(style="List Number"), m.group(1))
-            continue
-        _docx_runs(doc.add_paragraph(), line.strip())
+        elif re.match(r"\s*[-*]\s+", line):
+            _docx_runs(doc.add_paragraph(style="List Bullet"),
+                       re.sub(r"^\s*[-*]\s+", "", line))
+        elif re.match(r"\s*\d+[.)]\s+", line):
+            _docx_runs(doc.add_paragraph(style="List Number"),
+                       re.sub(r"^\s*\d+[.)]\s+", "", line))
+        else:
+            _docx_runs(doc.add_paragraph(), s)
+        i += 1
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
