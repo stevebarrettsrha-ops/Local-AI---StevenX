@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -134,50 +135,52 @@ def server_binary() -> Path | None:
 
 def install(hw: dict) -> Task:
     """Download an official release build and unpack it into ./llama.cpp."""
+    return spawn("install", "llama.cpp", lambda t: install_sync(t, hw),
+                 {"pattern": asset_pattern(hw)[0]})
+
+
+def install_sync(task: Task, hw: dict) -> None:
+    """The install itself, runnable inside another task (first-run setup)."""
     pattern, why = asset_pattern(hw)
-
-    def run(task: Task) -> None:
-        task.set(detail="Asking GitHub for the latest release…")
-        r = requests.get(RELEASES, timeout=30,
-                         headers={"Accept": "application/vnd.github+json"})
-        r.raise_for_status()
-        release = r.json()
-        assets = release.get("assets", [])
-        match = next((a for a in assets
-                      if pattern in a["name"] and a["name"].endswith(".zip")), None)
-        if not match:
-            names = ", ".join(a["name"] for a in assets[:8])
-            raise RuntimeError(
-                f"No asset matching '{pattern}' in {release.get('tag_name')}. "
-                f"Available: {names}")
-        task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
-        BIN_DIR.mkdir(parents=True, exist_ok=True)
-        archive = BIN_DIR / match["name"]
-        _stream(match["browser_download_url"], archive, {},
-                lambda got, total, speed, eta: task.set(
-                    pct=(got / total * 100) if total else 0,
-                    detail=f"{got/1e6:.0f} of {total/1e6:.0f} MB"),
-                lambda: task.cancel)
-        if task.cancel:
-            task.set(state="cancelled", detail="Cancelled")
-            return
-        task.set(detail="Unpacking…")
-        with zipfile.ZipFile(archive) as z:
-            z.extractall(BIN_DIR)
-        archive.unlink(missing_ok=True)
-        binary = server_binary()
-        if not binary:
-            raise RuntimeError("Unpacked, but no llama-server binary was found "
-                               "inside the archive.")
-        if platform.system() != "Windows":
-            for f in BIN_DIR.rglob("llama-*"):
-                try:
-                    f.chmod(0o755)
-                except OSError:
-                    pass
-        task.set(detail=f"Ready — {binary}")
-
-    return spawn("install", "llama.cpp", run, {"pattern": pattern})
+    task.set(detail="Asking GitHub for the latest release…")
+    r = requests.get(RELEASES, timeout=30,
+                     headers={"Accept": "application/vnd.github+json"})
+    r.raise_for_status()
+    release = r.json()
+    assets = release.get("assets", [])
+    match = next((a for a in assets
+                  if pattern in a["name"] and a["name"].endswith(".zip")), None)
+    if not match:
+        names = ", ".join(a["name"] for a in assets[:8])
+        raise RuntimeError(
+            f"No asset matching '{pattern}' in {release.get('tag_name')}. "
+            f"Available: {names}")
+    task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    archive = BIN_DIR / match["name"]
+    _stream(match["browser_download_url"], archive, {},
+            lambda got, total, speed, eta: task.set(
+                pct=(got / total * 100) if total else 0,
+                detail=f"{got/1e6:.0f} of {total/1e6:.0f} MB"),
+            lambda: task.cancel)
+    if task.cancel:
+        task.set(state="cancelled", detail="Cancelled")
+        return
+    task.set(detail="Unpacking…")
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(BIN_DIR)
+    archive.unlink(missing_ok=True)
+    binary = server_binary()
+    if not binary:
+        raise RuntimeError("Unpacked, but no llama-server binary was found "
+                           "inside the archive.")
+    if platform.system() != "Windows":
+        for f in BIN_DIR.rglob("llama-*"):
+            try:
+                f.chmod(0o755)
+            except OSError:
+                pass
+    task.set(detail=f"Ready — {binary}")
 
 
 # --------------------------------------------------------------------------- #
@@ -188,7 +191,10 @@ def local_models() -> list[dict]:
     out = []
     for f in sorted(MODELS_DIR.rglob("*")):
         if f.is_file() and f.suffix.lower() in (".gguf", ".part"):
+            rel = f.relative_to(MODELS_DIR)
             out.append({"name": f.name, "path": str(f),
+                        # the engine family folder it lives in, if any
+                        "folder": rel.parts[0] if len(rel.parts) > 1 else "",
                         "size": f.stat().st_size,
                         "quant": fit.quant_of(f.name),
                         "partial": f.suffix.lower() == ".part"})
@@ -264,10 +270,16 @@ def gguf_sibling(cfg: dict, repo: str) -> str:
     return ""
 
 
-def download(cfg: dict, repo: str, path: str) -> Task:
-    endpoint = (cfg.get("hf_endpoint") or HF_BASE).rstrip("/")
-    url = f"{endpoint}/{repo}/resolve/main/{urllib.parse.quote(path)}"
-    dest = MODELS_DIR / Path(path).name
+def model_dest(path: str, folder: str = "") -> Path:
+    """Where a downloaded file lands: ./models, or an engine family's own
+    subfolder (models/qwen, models/gemma) when one is named."""
+    folder = re.sub(r"[^A-Za-z0-9._-]", "", folder or "")
+    base = MODELS_DIR / folder if folder else MODELS_DIR
+    return base / Path(path).name
+
+
+def download(cfg: dict, repo: str, path: str, folder: str = "") -> Task:
+    dest = model_dest(path, folder)
     if dest.exists():
         raise RuntimeError(f"{dest.name} is already here.")
     if any(t.meta.get("dest") == str(dest) for t in task_list()
@@ -275,35 +287,54 @@ def download(cfg: dict, repo: str, path: str) -> Task:
         raise RuntimeError(f"{dest.name} is already downloading.")
 
     def run(task: Task) -> None:
-        task.log(f"{repo}/{path}")
-        _stream(url, dest, hf_headers(cfg),
-                lambda got, total, speed, eta: task.set(
-                    pct=(got / total * 100) if total else 0,
-                    detail=f"{got/1e9:.1f} of {total/1e9:.1f} GB · "
-                           f"{speed/1e6:.0f} MB/s · "
-                           f"{int(eta//60)}m {int(eta%60)}s left"),
-                lambda: task.cancel)
-        if task.cancel:
-            task.set(state="cancelled",
-                     detail="Cancelled — what downloaded is kept and will be "
-                            "resumed.")
-            return
-        task.set(pct=100, detail=f"Saved — {dest.stat().st_size/1e9:.1f} GB")
+        download_sync(cfg, repo, path, folder, task)
 
     return spawn("download", dest.name, run,
                  {"dest": str(dest), "repo": repo, "name": dest.name})
 
 
+def download_sync(cfg: dict, repo: str, path: str, folder: str, task: Task,
+                  pct_from: float = 0, pct_to: float = 100,
+                  label: str = "") -> Path:
+    """One file, fetched inside an existing task, its progress mapped onto
+    [pct_from, pct_to] so multi-step tasks keep one honest bar."""
+    endpoint = (cfg.get("hf_endpoint") or HF_BASE).rstrip("/")
+    url = f"{endpoint}/{repo}/resolve/main/{urllib.parse.quote(path)}"
+    dest = model_dest(path, folder)
+    prefix = (label + ": ") if label else ""
+    if dest.exists():
+        task.log(f"{dest.name} is already here — skipping.")
+        task.set(pct=pct_to)
+        return dest
+    task.log(f"{repo}/{path} → {dest.relative_to(MODELS_DIR).parent}/")
+    span = pct_to - pct_from
+    _stream(url, dest, hf_headers(cfg),
+            lambda got, total, speed, eta: task.set(
+                pct=pct_from + ((got / total * span) if total else 0),
+                detail=f"{prefix}{got/1e9:.1f} of {total/1e9:.1f} GB · "
+                       f"{speed/1e6:.0f} MB/s · "
+                       f"{int(eta//60)}m {int(eta%60)}s left"),
+            lambda: task.cancel)
+    if task.cancel:
+        task.set(state="cancelled",
+                 detail="Cancelled — what downloaded is kept and will be "
+                        "resumed.")
+        return dest
+    task.set(pct=pct_to,
+             detail=f"{prefix}saved — {dest.stat().st_size/1e9:.1f} GB")
+    return dest
+
+
 def delete_model(name: str) -> None:
     if "/" in name or "\\" in name or ".." in name:
         raise RuntimeError("That path is not allowed.")
-    root = MODELS_DIR.resolve()
-    target = (root / name).resolve()
-    if not str(target).startswith(str(root)):
-        raise RuntimeError("That path is outside the models folder.")
-    if not target.exists():
+    # Look the file up rather than joining paths: models now live in per-
+    # engine subfolders, and local_models() only ever lists files inside
+    # MODELS_DIR, so anything it returns is safe to remove.
+    model = next((m for m in local_models() if m["name"] == name), None)
+    if not model:
         raise RuntimeError("That file is already gone.")
-    target.unlink()
+    Path(model["path"]).unlink()
 
 
 def _stream(url: str, dest: Path, headers: dict, on_progress, should_cancel):
@@ -409,10 +440,14 @@ class Server:
     def wait_ready(self, timeout: int = 600) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if self.ready():
-                return True
+            # Death first: if OUR process has exited, a healthy /health can
+            # only be an impostor already squatting on the port (say, an
+            # orphaned llama-server from a crashed session) — that is a
+            # failure to report, not a success to claim.
             if self.proc and self.proc.poll() is not None:
                 return False
+            if self.ready():
+                return True
             time.sleep(1)
         return False
 

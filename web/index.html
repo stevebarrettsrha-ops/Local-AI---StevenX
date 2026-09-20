@@ -80,6 +80,24 @@
   .pill.on{border-color:rgba(217,119,87,.55);background:rgba(217,119,87,.12);color:#eeb296}
   .pill svg{width:14px;height:14px}
   .tophat .grow{flex:1}
+  .segs{display:inline-flex;border:1px solid var(--line);border-radius:9px;
+        overflow:hidden;background:var(--panel)}
+  .seg{padding:5px 14px;font-size:12px;color:var(--muted);
+       border-right:1px solid var(--line)}
+  .seg:last-child{border-right:0}
+  .seg:hover{color:var(--text)}
+  .seg.on{background:rgba(217,119,87,.16);color:#eeb296}
+
+  /* ---------- first-run setup ---------- */
+  .setupbar{display:flex;align-items:center;gap:14px;padding:10px 20px;
+        border-bottom:1px solid var(--hair);background:var(--panel);
+        font-size:12.5px;flex-wrap:wrap}
+  .setupbar .n{display:flex;flex-direction:column;min-width:200px}
+  .setupbar .n b{font-size:12.5px}
+  .setupbar .n span{color:var(--muted);font-size:11.5px;max-width:52vw;
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .setupbar .bar{flex:1;min-width:120px;margin-top:0}
+  .sbtns{display:flex;gap:8px}
 
   /* ---------- chat + code panes ---------- */
   .chatpane{display:flex;flex-direction:column;flex:1;min-height:0}
@@ -246,6 +264,7 @@
       <button class="pill" id="modelPill">
         <svg viewBox="0 0 24 24"><path d="M12 3 3 8l9 5 9-5zM3 16l9 5 9-5"/></svg>
         <span id="modelLabel">No model loaded</span></button>
+      <div class="segs" id="engineSwitch" hidden></div>
       <span class="grow"></span>
       <button class="pill" id="btnParams">
         <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="18" r="2"/></svg>
@@ -254,6 +273,16 @@
         <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h10M4 17h7"/></svg>
         <span id="systemLabel">System prompt</span></button>
       <span class="pill" id="speedPill" hidden></span>
+    </div>
+
+    <div class="setupbar" id="setupBar" hidden>
+      <div class="n"><b>First-run setup</b>
+        <span id="setupDetail">Preparing…</span></div>
+      <div class="bar"><i id="setupBarFill" style="width:0%"></i></div>
+      <div class="sbtns">
+        <button class="btn thin" id="btnSetupRetry" hidden>Retry</button>
+        <button class="btn thin" id="btnSetupSkip">Set up later</button>
+      </div>
     </div>
 
     <!-- chat -->
@@ -417,7 +446,7 @@
 
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
-          cur: { chat: null, code: null } };
+          setupKicked: false, cur: { chat: null, code: null } };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -498,6 +527,66 @@ function renderBody(text) {
     }
   }
   return html;
+}
+
+/* ========================= engines + first run ========================= */
+function renderEngines() {
+  var box = $("engineSwitch");
+  var list = (S.status && S.status.engines) || [];
+  box.hidden = !list.length;
+  box.innerHTML = "";
+  list.forEach(function (e) {
+    var b = document.createElement("button");
+    b.className = "seg" + (e.loaded ? " on" : "");
+    b.textContent = e.family.charAt(0).toUpperCase() + e.family.slice(1);
+    b.title = e.model;
+    b.addEventListener("click", function () { switchEngine(e); });
+    box.appendChild(b);
+  });
+}
+async function switchEngine(e) {
+  if (e.loaded || S.streaming) return;
+  toast("Switching to " + e.model + " — the first load reads the whole "
+    + "file from disk.");
+  try {
+    var d = await api("/api/engine/switch", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ family: e.family }) });
+    await refresh();
+    toast(d.already ? d.model + " was already loaded."
+      : d.model + " loaded: " + d.gpu_layers + " of " + d.fit.layers +
+        " layers on the GPU.");
+  } catch (err) { toast(err.message, true); refresh(); }
+}
+async function startSetup() {
+  $("setupBar").hidden = false;
+  $("btnSetupRetry").hidden = true;
+  $("setupDetail").textContent = "Starting…";
+  try {
+    await api("/api/setup/firstrun", { method: "POST" });
+    pollTasks();
+  } catch (e) {
+    $("setupDetail").textContent = e.message;
+    $("btnSetupRetry").hidden = false;
+  }
+}
+function renderSetupTask(t) {
+  var bar = $("setupBar");
+  if (t.state === "running") {
+    bar.hidden = false;
+    $("setupDetail").textContent = t.detail || "Working…";
+    $("setupBarFill").style.width = Math.round(t.pct) + "%";
+    $("btnSetupRetry").hidden = true;
+  } else if (t.state === "error") {
+    bar.hidden = false;
+    $("setupDetail").textContent = t.detail || "Setup failed.";
+    $("btnSetupRetry").hidden = false;
+  } else if (t.state === "done" && !bar.hidden) {
+    $("setupBarFill").style.width = "100%";
+    $("setupDetail").textContent = t.detail || "Done.";
+    setTimeout(function () { bar.hidden = true; }, 4000);
+    refresh(); loadLocal();
+  }
 }
 
 /* ========================= views ========================= */
@@ -841,7 +930,8 @@ async function loadLocal() {
       var el = document.createElement("div");
       el.className = "fitem";
       var loaded = S.status && S.status.model === m.name;
-      el.innerHTML = '<div class="n"><b>' + esc(m.name) + "</b><span>" +
+      el.innerHTML = '<div class="n"><b>' +
+        (m.folder ? esc(m.folder) + "/" : "") + esc(m.name) + "</b><span>" +
         gb(m.size) + " · " + esc(m.quant || "?") +
         (m.partial ? " · unfinished" : "") + " · " + esc(m.why) +
         (m.fit.speed ? " · ~" + m.fit.speed + " tok/s" : "") +
@@ -908,6 +998,8 @@ async function pollTasks() {
     });
     if (dls.some(function (t) { return t.state === "done"; })) loadLocal();
   }
+  var setup = list.filter(function (t) { return t.kind === "setup"; })[0];
+  if (setup) renderSetupTask(setup);
   var inst = list.filter(function (t) { return t.kind === "install"; })[0];
   if (inst && $("engineState")) {
     var line = $("installLine");
@@ -1018,6 +1110,12 @@ async function refresh() {
   $("paramNote").textContent = st.model
     ? "Context and KV cache only take effect when the model is reloaded."
     : "No model loaded yet.";
+  renderEngines();
+  if (st.setup_complete === false && !S.setupKicked) {
+    // First run: fetch Qwen (primary) and Gemma into their own folders.
+    S.setupKicked = true;
+    startSetup();
+  }
   if (S.view === "engine") renderHardware();
 }
 
@@ -1102,6 +1200,14 @@ function wire() {
     $("systemText").value = ""; await saveParams(); toast("Cleared.");
   });
 
+  $("btnSetupRetry").addEventListener("click", startSetup);
+  $("btnSetupSkip").addEventListener("click", async function () {
+    await api("/api/config", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ setup_complete: true }) });
+    $("setupBar").hidden = true;
+    toast("Skipped. Models can be downloaded any time from the Models page.");
+  });
   $("btnInstall").addEventListener("click", async function () {
     try {
       await api("/api/engine/install", { method: "POST" });

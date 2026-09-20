@@ -57,6 +57,22 @@ Loading a model always uses the real hardware.
 Any GGUF repo can be checked by pasting `user/Model-GGUF` into the box on the
 Models page.
 
+### Two engines
+
+On first run the app downloads two models into their own folders and keeps
+them side by side:
+
+- **Qwen3 8B** → `models/qwen/` — the primary engine, loaded by default.
+- **Gemma 4 E4B Uncensored** (`HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive`)
+  → `models/gemma/` — the second engine.
+
+The quant is chosen by the fit calculation against the machine's real
+hardware (Q4_K_M when it fits, which it does on an 8 GB card). A
+**Qwen / Gemma** switcher in the top bar swaps the running engine with one
+click; `-ngl` is recomputed on every switch. The smaller Gemma 4 E2B build
+is in the catalogue for manual download. "Set up later" skips the whole
+thing.
+
 Parameters (context, temperature, top-p, reply limit, KV cache precision) are in
 the prompt bar. Context and KV precision only take effect on reload — the button
 does the reload for you. Setting KV cache to q8 halves that 1.1 GB, which is
