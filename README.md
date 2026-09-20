@@ -106,6 +106,21 @@ Pasting a safetensors repo by hand does the same thing — the app checks whethe
 a `-GGUF` sibling actually exists before suggesting it, so the suggestion is
 never a dead link.
 
+## Documents and files
+
+Everything the model writes can leave the chat as a real file, entirely in
+the browser — nothing is uploaded anywhere:
+
+- every code block has **Copy**, **Save** (named with the right extension —
+  .html, .py, .js, .md and so on) and, for HTML and SVG, **Preview**, which
+  opens the generated page rendered in a new tab;
+- every reply has **Copy reply**, **Save .md** (the raw text) and
+  **Save .html** (the reply wrapped as a clean, printable standalone
+  document).
+
+So "write me a status report page" ends as an .html file you can open,
+print, host or send.
+
 ## Notes
 
 - Conversations are stored in `data/chats.json`. The user's message is saved

@@ -116,9 +116,14 @@
   .cbhead{display:flex;align-items:center;justify-content:space-between;
           padding:6px 12px;background:#262522;border-bottom:1px solid var(--hair);
           font-family:var(--mono);font-size:11px;color:var(--muted)}
-  .cbhead .copy{font-size:11px;color:var(--muted);padding:2px 9px;border-radius:6px;
+  .cbb{display:flex;gap:6px}
+  .cbhead button{font-size:11px;color:var(--muted);padding:2px 9px;border-radius:6px;
           border:1px solid var(--line);font-family:inherit}
-  .cbhead .copy:hover{color:var(--text);border-color:#4c4a44}
+  .cbhead button:hover{color:var(--text);border-color:#4c4a44}
+  .acts{display:flex;gap:7px;margin-top:9px}
+  .miniBtn{font-size:11px;color:var(--dim);padding:3px 10px;border-radius:7px;
+          border:1px solid var(--line)}
+  .miniBtn:hover{color:var(--text);border-color:#4c4a44}
   .codeblock pre{margin:0;padding:12px 14px;overflow-x:auto;
           font-family:var(--mono);font-size:12.5px;line-height:1.6;color:#dcd9d0}
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
@@ -520,13 +525,54 @@ function renderBody(text) {
       var lang = nl === -1 ? "" : seg.slice(0, nl).trim();
       var codeTxt = nl === -1 ? seg : seg.slice(nl + 1);
       if (lang && /[^\w+#.-]/.test(lang)) { lang = ""; codeTxt = seg; }
+      var canPreview = lang === "html" || lang === "svg";
       html += '<div class="codeblock"><div class="cbhead"><span>' +
-        esc(lang || "code") +
-        '</span><button class="copy" type="button">Copy</button></div>' +
+        esc(lang || "code") + '</span><span class="cbb">' +
+        (canPreview ?
+          '<button class="prev" type="button">Preview</button>' : "") +
+        '<button class="dl" type="button">Save</button>' +
+        '<button class="copy" type="button">Copy</button></span></div>' +
         "<pre>" + esc(codeTxt.replace(/\n$/, "")) + "</pre></div>";
     }
   }
   return html;
+}
+
+/* ============== saving what the model wrote as real files ============== */
+var EXT = { html: "html", svg: "svg", css: "css", javascript: "js", js: "js",
+            typescript: "ts", ts: "ts", python: "py", py: "py", json: "json",
+            markdown: "md", md: "md", bash: "sh", sh: "sh", sql: "sql",
+            yaml: "yml", yml: "yml", xml: "xml", c: "c", cpp: "cpp",
+            java: "java", csharp: "cs", go: "go", rust: "rs" };
+function fileSlug() {
+  var t = $("viewTitle").textContent || "reply";
+  return (t.toLowerCase().replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "reply").slice(0, 48);
+}
+function saveBlob(name, text, mime) {
+  var url = URL.createObjectURL(new Blob([text], { type: mime }));
+  var a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+}
+// A reply wrapped as a standalone, printable HTML document.
+function docHtml(content) {
+  return "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">" +
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" +
+    "<title>" + esc(fileSlug()) + "</title><style>" +
+    "body{max-width:760px;margin:40px auto;padding:0 20px;color:#222;" +
+    "font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:1.7}" +
+    ".prose{white-space:pre-wrap}" +
+    "code{background:#f2f0ec;border-radius:4px;padding:1px 5px;" +
+    "font-family:Menlo,Consolas,monospace;font-size:13px}" +
+    ".codeblock{border:1px solid #ddd;border-radius:8px;margin:14px 0;" +
+    "overflow:hidden}.cbhead{padding:5px 12px;background:#f5f4f1;" +
+    "border-bottom:1px solid #ddd;font-family:Menlo,Consolas,monospace;" +
+    "font-size:11px;color:#777}.cbhead button{display:none}" +
+    "pre{margin:0;padding:12px 14px;overflow-x:auto;background:#faf9f7;" +
+    "font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.55}" +
+    "</style></head><body>" + renderBody(content) + "</body></html>";
 }
 
 /* ========================= engines + first run ========================= */
@@ -650,8 +696,25 @@ function renderThread(mode) {
     var el = document.createElement("div");
     el.className = "msg" + (m.role === "user" ? " me" : "");
     el.innerHTML = '<div class="body">' + renderBody(m.content) + "</div>" +
-      (m.tps ? '<div class="meta">' + m.tps + " tok/s · " + m.seconds +
-        " s" + (m.stopped ? " · stopped" : "") + "</div>" : "");
+      (m.tps || m.stopped ? '<div class="meta">' +
+        (m.tps ? m.tps + " tok/s · " + m.seconds + " s" : "") +
+        (m.stopped ? (m.tps ? " · " : "") + "stopped" : "") + "</div>" : "");
+    if (m.role !== "user" && (m.content || "").trim()) {
+      var acts = document.createElement("div");
+      acts.className = "acts";
+      acts.appendChild(mkBtn("Copy reply", function () {
+        if (navigator.clipboard && navigator.clipboard.writeText)
+          navigator.clipboard.writeText(m.content);
+        toast("Reply copied.");
+      }, "miniBtn"));
+      acts.appendChild(mkBtn("Save .md", function () {
+        saveBlob(fileSlug() + ".md", m.content, "text/markdown");
+      }, "miniBtn"));
+      acts.appendChild(mkBtn("Save .html", function () {
+        saveBlob(fileSlug() + ".html", docHtml(m.content), "text/html");
+      }, "miniBtn"));
+      el.appendChild(acts);
+    }
     box.appendChild(el);
   });
   $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
@@ -729,7 +792,7 @@ async function send(mode) {
 
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
-  var acc = "";
+  var acc = "", doneMeta = null;
   var payload = { chat: chat.id || "", message: text, mode: mode };
   if (mode === "code") {
     // Deterministic-ish output for code; the built-in prompt steps aside
@@ -769,21 +832,19 @@ async function send(mode) {
         if (d.error) { toast(d.error, true); }
         if (d.done) {
           body.innerHTML = renderBody(acc);
-          var meta = document.createElement("div");
-          meta.className = "meta";
-          meta.textContent = d.tps + " tok/s · " + d.seconds + " s";
-          el.appendChild(meta);
+          doneMeta = { tps: d.tps, seconds: d.seconds };
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
         }
       });
     }
-    chat.messages.push({ role: "assistant", content: acc });
+    chat.messages.push({ role: "assistant", content: acc,
+      tps: doneMeta && doneMeta.tps, seconds: doneMeta && doneMeta.seconds });
+    renderThread(mode);
   } catch (e) {
     if (e.name === "AbortError") {
-      body.innerHTML = renderBody(acc) +
-        ' <span style="color:var(--dim)">(stopped)</span>';
       chat.messages.push({ role: "assistant", content: acc, stopped: true });
+      renderThread(mode);
     } else {
       body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
     }
@@ -1141,17 +1202,35 @@ function wire() {
       if (S.abort) S.abort.abort(); });
   });
 
-  // Copy buttons on code blocks, wherever they render.
+  // Copy / Save / Preview buttons on code blocks, wherever they render.
   document.addEventListener("click", function (e) {
     var t = e.target;
-    if (!t.classList || !t.classList.contains("copy")) return;
-    var pre = t.closest(".codeblock").querySelector("pre");
-    var done = function () {
-      t.textContent = "Copied";
-      setTimeout(function () { t.textContent = "Copy"; }, 1400);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(pre.textContent).then(done, function () {});
+    if (!t.classList) return;
+    var block = t.closest ? t.closest(".codeblock") : null;
+    if (!block) return;
+    var pre = block.querySelector("pre");
+    var lang = (block.querySelector(".cbhead span") || {}).textContent || "";
+    if (t.classList.contains("copy")) {
+      var done = function () {
+        t.textContent = "Copied";
+        setTimeout(function () { t.textContent = "Copy"; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pre.textContent)
+          .then(done, function () {});
+      }
+    } else if (t.classList.contains("dl")) {
+      var ext = EXT[lang] || "txt";
+      saveBlob(fileSlug() + "." + ext, pre.textContent,
+        ext === "html" ? "text/html" : "text/plain");
+      t.textContent = "Saved";
+      setTimeout(function () { t.textContent = "Save"; }, 1400);
+    } else if (t.classList.contains("prev")) {
+      // The page the model wrote, rendered for real in a new tab.
+      var url = URL.createObjectURL(new Blob([pre.textContent],
+        { type: lang === "svg" ? "image/svg+xml" : "text/html" }));
+      window.open(url, "_blank");
+      setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
     }
   });
 
