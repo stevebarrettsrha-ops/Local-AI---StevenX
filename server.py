@@ -118,10 +118,13 @@ def api_status():
         "running": server.alive(), "ready": server.ready(),
         "model": Path(server.model).name if server.model else "",
         "models": engine.local_models(),
+        "models_dir": str(engine.MODELS_DIR),
+        "engines": engines_list(),
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
-                    "kv_bits", "auto_start", "last_model")},
+                    "kv_bits", "auto_start", "last_model", "plan_for")},
         "catalogue": fit.CATALOGUE,
+        "presets": fit.presets(),
         "setup_complete": bool(cfg.get("setup_complete")),
         "tail": server.tail(12),
     })
@@ -132,11 +135,162 @@ def api_config():
     b = request.get_json(silent=True) or {}
     for key in ("ctx", "temperature", "top_p", "max_tokens", "system",
                 "kv_bits", "auto_start", "hf_token", "hf_endpoint",
-                "plan_for"):
+                "plan_for", "setup_complete"):
         if key in b:
             cfg[key] = b[key]
     save_config(cfg)
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# engines (switchable model families in their own folders under ./models)
+# --------------------------------------------------------------------------- #
+ENGINE_ORDER = ["qwen", "gemma"]          # qwen listed first: the primary
+SETUP_PLAN = [("qwen3-8b", "qwen"),       # (catalogue id, folder)
+              ("gemma-4-e4b-unc", "gemma")]
+
+
+def engines_list() -> list[dict]:
+    """One entry per engine family folder that holds a finished model."""
+    groups: dict[str, list[dict]] = {}
+    for m in engine.local_models():
+        if m["folder"] and not m["partial"]:
+            groups.setdefault(m["folder"], []).append(m)
+    loaded_name = Path(server.model).name if server.model else ""
+    out = []
+    for fam in sorted(groups, key=lambda f: (ENGINE_ORDER.index(f)
+                                             if f in ENGINE_ORDER else 99, f)):
+        models = groups[fam]
+        pick = next((m for m in models if m["name"] == loaded_name), None) \
+            or next((m for m in models
+                     if m["name"] == cfg.get("last_model")), None) \
+            or models[0]
+        out.append({"family": fam, "model": pick["name"],
+                    "loaded": server.alive() and pick["name"] == loaded_name})
+    return out
+
+
+def load_model_by_name(name: str, ctx: int | None = None,
+                       gpu_layers: int | None = None) -> dict:
+    """Start llama-server on a local file, -ngl from the fit calculation."""
+    model = next((m for m in engine.local_models() if m["name"] == name), None)
+    if not model:
+        raise RuntimeError("That model is not on disk.")
+    if model["partial"]:
+        raise RuntimeError("That download has not finished.")
+    ctx = int(ctx or cfg.get("ctx") or 8192)
+    hw = fit.hardware(cfg)
+    entry = fit.catalogue_match(name)
+    conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
+        if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
+                       "head_dim": 128, "exact": False}
+    a = fit.assess(model["size"], conf, hw, ctx, int(cfg.get("kv_bits", 16)))
+    gl = a["gpu_layers"] if gpu_layers is None else int(gpu_layers)
+    extra = []
+    if int(cfg.get("kv_bits", 16)) == 8:
+        extra += ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+    server.start(model["path"], gl, ctx, extra)
+    cfg["last_model"] = name
+    cfg["ctx"] = ctx
+    save_config(cfg)
+    if not server.wait_ready(600):
+        raise RuntimeError("llama-server did not come up.")
+    return {"model": name, "gpu_layers": gl, "ctx": ctx, "fit": a,
+            "why": fit.verdict_text(a, hw)}
+
+
+def pick_quant(files: list[dict], conf: dict, hw: dict, ctx: int,
+               kv_bits: int) -> dict | None:
+    """The build first-run setup downloads: Q4_K_M when it runs here (the
+    sane default quant), else the largest that fits VRAM, else the largest
+    that at least fits RAM, else the smallest. Judged, never guessed."""
+    cand = [f for f in files
+            if not f["split"] and not f["companion"] and f["size"]]
+    if not cand:
+        return None
+    scored = [(f, fit.assess(f["size"], conf, hw, ctx, kv_bits))
+              for f in cand]
+    q4 = next(((f, a) for f, a in scored if f["quant"] == "Q4_K_M"), None)
+    if q4 and (q4[1]["verdict"] == "fits" or
+               (not hw.get("vram") and q4[1]["fits_ram"])):
+        return q4[0]
+    fits = [f for f, a in scored if a["verdict"] == "fits"]
+    if fits:
+        return fits[-1]
+    ram_ok = [f for f, a in scored if a["fits_ram"]]
+    return ram_ok[-1] if ram_ok else cand[0]
+
+
+@app.post("/api/engine/switch")
+def api_engine_switch():
+    fam = ((request.get_json(silent=True) or {}).get("family") or "").strip()
+    eng = next((e for e in engines_list() if e["family"] == fam), None)
+    if not eng:
+        return jsonify({"error": f"No downloaded model for '{fam}' yet."}), 404
+    if eng["loaded"]:
+        return jsonify({"ok": True, "model": eng["model"], "already": True})
+    try:
+        out = load_model_by_name(eng["model"])
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc), "tail": server.tail(25)}), 500
+    return jsonify({"ok": True, **out})
+
+
+@app.post("/api/setup/firstrun")
+def api_setup_firstrun():
+    """Install llama.cpp if needed, download Qwen and Gemma into their own
+    folders, then load Qwen as the primary engine."""
+    running = next((t for t in engine.task_list()
+                    if t.kind == "setup" and t.state == "running"), None)
+    if running:
+        return jsonify({"ok": True, "task": running.view()})
+
+    def run(task):
+        # First run judges against the machine actually here, never a
+        # planned card.
+        hw = fit.hardware({})
+        if not engine.server_binary():
+            task.set(detail="Installing llama.cpp…")
+            engine.install_sync(task, hw)
+        primary_file = ""
+        spans = [(5, 50), (50, 95)]
+        for (model_id, folder), (p0, p1) in zip(SETUP_PLAN, spans):
+            if task.cancel:
+                task.set(state="cancelled", detail="Cancelled — partial "
+                         "downloads resume next time.")
+                return
+            entry = next(c for c in fit.CATALOGUE if c["id"] == model_id)
+            task.set(pct=p0, detail=f"Choosing a {entry['name']} build…")
+            files = engine.hf_files(cfg, entry["repo"])
+            conf = fit.model_config(cfg, entry.get("config_repo")
+                                    or entry["repo"])
+            pick = pick_quant(files, conf, hw, int(cfg.get("ctx") or 8192),
+                              int(cfg.get("kv_bits", 16)))
+            if not pick:
+                raise RuntimeError(f"No usable GGUF in {entry['repo']}.")
+            task.log(f"{entry['name']}: {pick['name']} "
+                     f"({pick['size']/1e9:.1f} GB) → models/{folder}/")
+            dest = engine.download_sync(cfg, entry["repo"], pick["path"],
+                                        folder, task, p0, p1,
+                                        label=entry["name"])
+            if task.cancel:
+                return
+            if model_id == SETUP_PLAN[0][0]:
+                primary_file = dest.name
+        task.set(pct=96, detail="Loading Qwen as the primary engine…")
+        try:
+            load_model_by_name(primary_file)
+            task.log(f"Loaded {primary_file}.")
+        except Exception as exc:  # noqa: BLE001
+            task.log(f"Downloaded, but could not load the primary engine "
+                     f"yet: {exc}")
+        cfg["setup_complete"] = True
+        save_config(cfg)
+        task.set(pct=100, detail="Ready — Qwen is the primary engine; Gemma "
+                                 "is one click away on the switcher.")
+
+    task = engine.spawn("setup", "First-run setup", run)
+    return jsonify({"ok": True, "task": task.view()})
 
 
 # --------------------------------------------------------------------------- #
@@ -190,8 +344,7 @@ def api_fit_local():
     ctx = int(request.args.get("ctx") or cfg.get("ctx") or 8192)
     out = []
     for m in engine.local_models():
-        entry = next((c for c in fit.CATALOGUE
-                      if c["name"].lower().split()[0] in m["name"].lower()), None)
+        entry = fit.catalogue_match(m["name"])
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
             if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
                            "exact": False}
@@ -216,37 +369,18 @@ def api_engine_install():
 def api_engine_load():
     b = request.get_json(silent=True) or {}
     name = (b.get("model") or "").strip()
-    model = next((m for m in engine.local_models() if m["name"] == name), None)
-    if not model:
-        return jsonify({"error": "That model is not on disk."}), 404
-    if model["partial"]:
-        return jsonify({"error": "That download has not finished."}), 400
-
-    ctx = int(b.get("ctx") or cfg.get("ctx") or 8192)
-    hw = fit.hardware(cfg)
-    entry = next((c for c in fit.CATALOGUE
-                  if c["name"].lower().split()[0] in name.lower()), None)
-    conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) if entry \
-        else {"layers": 32, "kv_heads": 8, "head_dim": 128, "exact": False}
-    a = fit.assess(model["size"], conf, hw, ctx, int(cfg.get("kv_bits", 16)))
-    gpu_layers = int(b.get("gpu_layers")) if b.get("gpu_layers") is not None \
-        else a["gpu_layers"]
-    extra = []
-    if int(cfg.get("kv_bits", 16)) == 8:
-        extra += ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
     try:
-        server.start(model["path"], gpu_layers, ctx, extra)
+        out = load_model_by_name(
+            name, b.get("ctx"),
+            b.get("gpu_layers") if b.get("gpu_layers") is not None else None)
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": str(exc)}), 400
-    cfg["last_model"] = name
-    cfg["ctx"] = ctx
-    save_config(cfg)
-    ok = server.wait_ready(600)
-    if not ok:
-        return jsonify({"error": "llama-server did not come up.",
-                        "tail": server.tail(25)}), 500
-    return jsonify({"ok": True, "model": name, "gpu_layers": gpu_layers,
-                    "ctx": ctx, "fit": a, "why": fit.verdict_text(a, hw)})
+        msg = str(exc)
+        if "not on disk" in msg:
+            return jsonify({"error": msg}), 404
+        if "did not come up" in msg:
+            return jsonify({"error": msg, "tail": server.tail(25)}), 500
+        return jsonify({"error": msg}), 400
+    return jsonify({"ok": True, **out})
 
 
 @app.post("/api/engine/stop")
@@ -274,7 +408,13 @@ def api_models():
 def api_models_download():
     b = request.get_json(silent=True) or {}
     try:
-        task = engine.download(cfg, b.get("repo", ""), b.get("path", ""))
+        # Catalogue models with an engine family land in that family's own
+        # folder, so the switcher finds them; anything else stays flat.
+        entry = next((c for c in fit.CATALOGUE
+                      if c["repo"] == b.get("repo")), None)
+        folder = (entry or {}).get("family", "")
+        task = engine.download(cfg, b.get("repo", ""), b.get("path", ""),
+                               folder)
         return jsonify({"ok": True, "task": task.view()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
@@ -352,6 +492,10 @@ def api_chat_send():
         chat = {"id": uuid.uuid4().hex[:12],
                 "title": " ".join(text.split()[:7])[:60] or "New chat",
                 "created": time.time(), "model": Path(server.model).name,
+                # which workspace this conversation belongs to: the plain
+                # chat page or the coding page. Old chats have no mode and
+                # are treated as plain chat.
+                "mode": "code" if b.get("mode") == "code" else "chat",
                 "messages": []}
     chat["messages"].append({"role": "user", "content": text,
                              "at": time.time()})

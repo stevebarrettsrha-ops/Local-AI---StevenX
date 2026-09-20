@@ -33,10 +33,10 @@ import requests
 # Repos that publish GGUF quants directly. Sizes are deliberately NOT stored:
 # they are read from the HuggingFace API so they cannot drift out of date.
 CATALOGUE = [
-    {"id": "qwen3-8b", "name": "Qwen3 8B", "params": 8.2,
+    {"id": "qwen3-8b", "name": "Qwen3 8B", "params": 8.2, "family": "qwen",
      "repo": "Qwen/Qwen3-8B-GGUF", "config_repo": "Qwen/Qwen3-8B",
      "note": "Strong general model with a thinking mode. The default pick on "
-             "an 8 GB card."},
+             "an 8 GB card, and the primary engine here."},
     {"id": "qwen3-4b", "name": "Qwen3 4B", "params": 4.0,
      "repo": "Qwen/Qwen3-4B-GGUF", "config_repo": "Qwen/Qwen3-4B",
      "note": "Half the size, most of the manners. Leaves room for long "
@@ -56,6 +56,19 @@ CATALOGUE = [
      "repo": "bartowski/google_gemma-3-12b-it-GGUF",
      "config_repo": "google/gemma-3-12b-it",
      "note": "Good writing. Tight on 8 GB even at Q4."},
+    {"id": "gemma-4-e4b-unc", "name": "Gemma 4 E4B Uncensored", "params": 4.0,
+     "family": "gemma",
+     "repo": "HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive",
+     "config_repo": "HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive",
+     "note": "Community abliterated build, ~4B effective parameters. The "
+             "second engine: downloaded on first run beside Qwen and a click "
+             "away on the switcher. Comfortable on an 8 GB card at Q4."},
+    {"id": "gemma-4-e2b-unc", "name": "Gemma 4 E2B Uncensored", "params": 2.0,
+     "family": "gemma",
+     "repo": "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive",
+     "config_repo": "HauhauCS/Gemma-4-E2B-Uncensored-HauhauCS-Aggressive",
+     "note": "The small sibling of the E4B build — half the memory, quicker "
+             "replies, for when the big one is busy or VRAM is short."},
     {"id": "mistral-7b", "name": "Mistral 7B Instruct v0.3", "params": 7.2,
      "repo": "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
      "config_repo": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -100,6 +113,27 @@ QUANT_RE = re.compile(r"(IQ\d[A-Z_]*|Q\d_[KS0-9_A-Z]*|BF16|F16|F32)", re.I)
 def quant_of(filename: str) -> str:
     m = QUANT_RE.search(Path(filename).stem)
     return m.group(1).upper() if m else ""
+
+
+def catalogue_match(filename: str) -> dict | None:
+    """The catalogue entry a file on disk most likely came from.
+
+    Scores each entry by how much of its name, token by token from the
+    left, appears in the filename, and stops at the first missing token —
+    so "Gemma-4-E4B-…" lands on Gemma 4 E4B rather than Gemma 3, and a
+    file no entry describes matches nothing rather than something."""
+    low = re.sub(r"[^a-z0-9.]+", "-", filename.lower())
+    best, best_score = None, 0
+    for entry in CATALOGUE:
+        score = 0
+        for tok in re.sub(r"[^a-z0-9.]+", " ", entry["name"].lower()).split():
+            if tok in low:
+                score += len(tok)
+            else:
+                break
+        if score > best_score:
+            best, best_score = entry, score
+    return best
 
 
 # --------------------------------------------------------------------------- #
