@@ -354,6 +354,10 @@ def api_chat_send():
         chat = {"id": uuid.uuid4().hex[:12],
                 "title": " ".join(text.split()[:7])[:60] or "New chat",
                 "created": time.time(), "model": Path(server.model).name,
+                # which workspace this conversation belongs to: the plain
+                # chat page or the coding page. Old chats have no mode and
+                # are treated as plain chat.
+                "mode": "code" if b.get("mode") == "code" else "chat",
                 "messages": []}
     chat["messages"].append({"role": "user", "content": text,
                              "at": time.time()})
