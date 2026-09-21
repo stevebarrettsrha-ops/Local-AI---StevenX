@@ -78,6 +78,30 @@ the prompt bar. Context and KV precision only take effect on reload — the butt
 does the reload for you. Setting KV cache to q8 halves that 1.1 GB, which is
 often what moves a model from *tight* to *fits*.
 
+### Replies that finish
+
+A long answer — a whole program, a full set of lyrics — used to stop in the
+middle of a line with nothing said about why. Three things now prevent that:
+
+- **The reply limit defaults to Auto**, meaning every token the context has
+  left once the prompt is counted, instead of a fixed 1024 that a long file
+  runs straight past. A number you pick yourself is kept.
+- **The model is asked why it stopped** and the answer is shown: *stopped at
+  the reply limit*, *you pressed Stop*, or nothing at all when it simply
+  finished. A reply that ends inside an unclosed code block is flagged as
+  unfinished whatever the model claimed.
+- **A cut-off reply is carried on**, up to four times, appending to the same
+  message so you end with one whole answer rather than several stumps —
+  and every reply that stopped short gets a **Continue** button for doing it
+  by hand. Both are in Parameters.
+
+The context pill stops reading `8k ctx` and starts reading `8k ctx · 1015
+used`: the prompt counted by the model's own tokenizer, not a guess. When a
+conversation outgrows the window, the oldest messages are dropped here,
+deliberately, and it says how many — llama.cpp left to itself slides its
+window along and quietly drops the system prompt with them, which is what
+"it forgot everything halfway through" actually was.
+
 ---
 
 ## Big models on a small card

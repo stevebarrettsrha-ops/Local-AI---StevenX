@@ -573,6 +573,8 @@ class Server:
         self.model: str = ""
         self.flags: list[str] = []
         self.lines: list[str] = []
+        self.ctx: int = 0
+        self._n_ctx: int = 0
         self._lock = threading.Lock()
 
     @property
@@ -603,6 +605,8 @@ class Server:
                "-ngl", str(max(0, gpu_layers)), "--no-webui"]
         if extra:
             cmd += extra
+        self.ctx = int(ctx)
+        self._n_ctx = 0
         self._spawn(cmd, model_path)
 
     def _spawn(self, cmd: list[str], model_path: str) -> None:
@@ -658,10 +662,53 @@ class Server:
                     pass
         self.proc = None
         self.model = ""
+        self.ctx = 0
+        self._n_ctx = 0
+
+    # ------------------------------------------------------------ context --- #
+    def n_ctx(self) -> int:
+        """The context window the running server actually has, asked of the
+        server rather than assumed from what we passed on the command line —
+        llama.cpp can round it down to the model's own trained maximum.
+        Asked once per loaded model, not once per message."""
+        if self._n_ctx:
+            return self._n_ctx
+        p = self.props()
+        gen = p.get("default_generation_settings") or {}
+        for value in (gen.get("n_ctx"), p.get("n_ctx")):
+            try:
+                if int(value) > 0:
+                    self._n_ctx = int(value)
+                    return self._n_ctx
+            except (TypeError, ValueError):
+                continue
+        return self.ctx
+
+    def count_tokens(self, text: str) -> int:
+        """Real token count from the model's own tokenizer. Falls back to the
+        four-characters-a-token rule of thumb only when /tokenize is not
+        there, and says so by returning the estimate rather than raising."""
+        if not text:
+            return 0
+        try:
+            r = requests.post(f"{self.url}/tokenize", json={"content": text},
+                              timeout=20)
+            if r.status_code < 400:
+                toks = r.json().get("tokens")
+                if isinstance(toks, list):
+                    return len(toks)
+        except Exception:
+            pass
+        return max(1, len(text) // 4)
 
     # -------------------------------------------------------------- chat --- #
     def chat_stream(self, messages: list[dict], params: dict):
-        """Yields text deltas from llama-server's OpenAI-compatible endpoint."""
+        """Yields events from llama-server's OpenAI-compatible endpoint:
+        {"delta": text} for each piece, then one {"stop": reason} — "length"
+        when the reply hit the token limit, "stop" when the model finished of
+        its own accord. Without that last event a cut-off reply is
+        indistinguishable from a finished one, which is exactly how a
+        truncated answer used to pass for a complete one."""
         body = {"messages": messages, "stream": True,
                 "temperature": float(params.get("temperature", 0.7)),
                 "top_p": float(params.get("top_p", 0.95)),
@@ -671,6 +718,7 @@ class Server:
         if sys_full:
             body["messages"] = [{"role": "system",
                                  "content": sys_full}] + messages
+        reason = ""
         with requests.post(f"{self.url}/v1/chat/completions", json=body,
                            stream=True, timeout=600) as r:
             if r.status_code >= 400:
@@ -680,15 +728,18 @@ class Server:
                     continue
                 payload = raw[5:].strip()
                 if payload == "[DONE]":
-                    return
+                    break
                 try:
                     chunk = json.loads(payload)
                 except ValueError:
                     continue
                 for choice in chunk.get("choices", []):
+                    if choice.get("finish_reason"):
+                        reason = str(choice["finish_reason"])
                     delta = (choice.get("delta") or {}).get("content")
                     if delta:
-                        yield delta
+                        yield {"delta": delta}
+        yield {"stop": reason or "stop"}
 
     def props(self) -> dict:
         try:
