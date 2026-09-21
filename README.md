@@ -5,6 +5,16 @@ actually hold, downloads the right GGUF, runs `llama-server`, and talks to it.
 
 Port 7806. `run.bat` on Windows, `./run.sh` elsewhere.
 
+Fresh installs default to an 8k context and an 8-bit KV cache. This is the
+balanced profile for an RTX 4060 8 GB / 32 GB RAM machine: Qwen3 8B Q4_K_M
+stays fully GPU-resident while retaining useful context headroom. Select 16-bit
+KV under Parameters only when maximum cache precision matters more than VRAM.
+The selected cache precision is passed directly to `llama-server` for both
+manual loads and automatic startup; fit calculations and runtime flags therefore
+describe the same memory profile. The measured model architecture is persisted
+after a successful load, so automatic startup also restores the correct layer
+count instead of treating every model as a generic 32-layer network.
+
 ---
 
 ## The fit check
@@ -280,3 +290,15 @@ web/index.html  The interface — one file, no build step
 ```
 
 Port: `LLAMA_STUDIO_PORT`. `LLAMA_STUDIO_NO_BROWSER=1` stops it opening a tab.
+
+### Production checks
+
+The desktop service binds only to loopback. It validates persisted generation
+settings, caps request bodies, writes configuration and chats atomically, and
+adds browser hardening/no-cache headers to API responses. Run the regression
+suite before packaging:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile server.py engine.py fit.py
+```

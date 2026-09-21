@@ -10,6 +10,7 @@ import csv
 import html as html_mod
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -36,17 +37,26 @@ WEB_DIR = APP_DIR / "web"
 PORT = int(os.environ.get("LLAMA_STUDIO_PORT", "7806"))
 
 app = Flask(__name__, static_folder=None)
+# Keep accidental oversized prompts/uploads from exhausting the local process,
+# while leaving enough headroom for browser-recorded voice clips.
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 server = engine.Server()
-chats_lock = threading.Lock()
+chats_lock = threading.RLock()
+config_lock = threading.RLock()
+engine_lock = threading.Lock()
+memory_lock = threading.RLock()
 
 DEFAULTS = {
     "hf_token": "", "hf_endpoint": "https://huggingface.co",
     # max_tokens 0 means "as much of the context as is left after the
     # prompt" — a fixed small number is what cuts long answers in half.
     "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 0,
-    "system": "", "kv_bits": 16, "auto_start": True, "plan_for": "",
+    # q8 KV is the best default on an 8 GB card: it roughly halves cache use
+    # while preserving substantially more room for context and GPU layers.
+    "system": "", "kv_bits": 8, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
-    "run_command": "", "recall": True, "reply_limit_migrated": False,
+    "last_model_config": {}, "run_command": "", "recall": True,
+    "reply_limit_migrated": False,
 }
 
 
@@ -69,9 +79,26 @@ def load_config() -> dict:
     return cfg
 
 
-def save_config(cfg: dict) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+def _atomic_json(path: Path, value) -> None:
+    """Durably replace a JSON file instead of exposing a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def save_config(value: dict) -> None:
+    with config_lock:
+        _atomic_json(CONFIG_PATH, value)
 
 
 cfg = load_config()
@@ -92,8 +119,7 @@ def read_chats() -> list[dict]:
 
 def write_chats(items: list[dict]) -> None:
     with chats_lock:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        CHATS_PATH.write_text(json.dumps(items, indent=2), encoding="utf-8")
+        _atomic_json(CHATS_PATH, items)
 
 
 def get_chat(chat_id: str) -> dict | None:
@@ -101,14 +127,17 @@ def get_chat(chat_id: str) -> dict | None:
 
 
 def put_chat(chat: dict) -> None:
-    items = read_chats()
-    for i, c in enumerate(items):
-        if c["id"] == chat["id"]:
-            items[i] = chat
-            break
-    else:
-        items.insert(0, chat)
-    write_chats(items)
+    # Hold one re-entrant lock across the entire read/modify/write operation.
+    # Separate locks let simultaneous streams overwrite one another's chats.
+    with chats_lock:
+        items = read_chats()
+        for i, c in enumerate(items):
+            if c["id"] == chat["id"]:
+                items[i] = chat
+                break
+        else:
+            items.insert(0, chat)
+        write_chats(items)
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +151,19 @@ def index():
 @app.get("/web/<path:name>")
 def web_asset(name: str):
     return send_from_directory(WEB_DIR, name)
+
+
+@app.after_request
+def security_headers(response):
+    """Safe browser defaults for the loopback UI and its JSON API."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), geolocation=()")
+    if request.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # --------------------------------------------------------------------------- #
@@ -164,12 +206,49 @@ def api_status():
 @app.post("/api/config")
 def api_config():
     b = request.get_json(silent=True) or {}
-    for key in ("ctx", "temperature", "top_p", "max_tokens", "system",
-                "kv_bits", "auto_start", "hf_token", "hf_endpoint",
-                "plan_for", "setup_complete", "recall"):
-        if key in b:
-            cfg[key] = b[key]
-    save_config(cfg)
+    if not isinstance(b, dict):
+        return jsonify({"error": "Configuration must be a JSON object."}), 400
+    try:
+        clean = {}
+        if "ctx" in b:
+            clean["ctx"] = int(b["ctx"])
+            if not 512 <= clean["ctx"] <= 262_144:
+                raise ValueError("Context must be between 512 and 262144.")
+        for key in ("temperature", "top_p"):
+            if key in b:
+                clean[key] = float(b[key])
+                if not math.isfinite(clean[key]):
+                    raise ValueError(f"{key} must be a finite number.")
+        if "temperature" in clean and not 0 <= clean["temperature"] <= 2:
+            raise ValueError("Temperature must be between 0 and 2.")
+        if "top_p" in clean and not 0 < clean["top_p"] <= 1:
+            raise ValueError("Top-p must be greater than 0 and at most 1.")
+        if "max_tokens" in b:
+            clean["max_tokens"] = int(b["max_tokens"])
+            if not 0 <= clean["max_tokens"] <= 262_144:
+                raise ValueError("Reply limit must be between 0 and 262144.")
+        if "kv_bits" in b:
+            clean["kv_bits"] = int(b["kv_bits"])
+            if clean["kv_bits"] not in (8, 16):
+                raise ValueError("KV precision must be 8 or 16 bits.")
+        for key in ("auto_start", "setup_complete", "recall"):
+            if key in b:
+                if not isinstance(b[key], bool):
+                    raise ValueError(f"{key} must be true or false.")
+                clean[key] = b[key]
+        for key, limit in (("system", 64_000), ("hf_token", 4_096),
+                           ("hf_endpoint", 2_048), ("plan_for", 200)):
+            if key in b:
+                if not isinstance(b[key], str) or len(b[key]) > limit:
+                    raise ValueError(f"{key} is not a valid string.")
+                clean[key] = b[key]
+        if clean.get("plan_for") and clean["plan_for"] not in fit.GPUS:
+            raise ValueError("Unknown planned GPU.")
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    with config_lock:
+        cfg.update(clean)
+        save_config(cfg)
     return jsonify({"ok": True})
 
 
@@ -181,16 +260,23 @@ MEMORY_INJECT = 4_000      # characters of it sent with each request
 
 
 def read_memory() -> str:
-    try:
-        return MEMORY_PATH.read_text(encoding="utf-8") \
-            if MEMORY_PATH.exists() else ""
-    except OSError:
-        return ""
+    with memory_lock:
+        try:
+            return MEMORY_PATH.read_text(encoding="utf-8") \
+                if MEMORY_PATH.exists() else ""
+        except OSError:
+            return ""
 
 
 def write_memory(text: str) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MEMORY_PATH.write_text(text[:MEMORY_CAP], encoding="utf-8")
+    with memory_lock:
+        MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = MEMORY_PATH.with_name(MEMORY_PATH.name + ".tmp")
+        try:
+            tmp.write_text(text[:MEMORY_CAP], encoding="utf-8")
+            os.replace(tmp, MEMORY_PATH)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def remember_lines(reply: str) -> int:
@@ -201,13 +287,14 @@ def remember_lines(reply: str) -> int:
     new = [n for n in new if n]
     if not new:
         return 0
-    mem = read_memory()
-    have = {ln.lstrip("- ").strip().lower() for ln in mem.splitlines()}
-    added = [n for n in new if n.lower() not in have]
-    if added:
-        write_memory((mem.rstrip() + "\n" if mem.strip() else "") +
-                     "\n".join("- " + n for n in added) + "\n")
-    return len(added)
+    with memory_lock:
+        mem = read_memory()
+        have = {ln.lstrip("- ").strip().lower() for ln in mem.splitlines()}
+        added = [n for n in new if n.lower() not in have]
+        if added:
+            write_memory((mem.rstrip() + "\n" if mem.strip() else "") +
+                         "\n".join("- " + n for n in added) + "\n")
+        return len(added)
 
 
 # ---- semantic recall: a small embedding model beside the chat model ---- #
@@ -244,7 +331,7 @@ def emb_index() -> dict:
 
 def emb_save() -> None:
     with _emb_lock:
-        EMB_PATH.write_text(json.dumps(_emb_index), encoding="utf-8")
+        _atomic_json(EMB_PATH, _emb_index or {})
 
 
 def ensure_embedder(wait: int = 15) -> bool:
@@ -1044,33 +1131,77 @@ def engines_list() -> list[dict]:
     return out
 
 
+def model_runtime_args(kv_bits: int) -> list[str]:
+    """llama-server flags corresponding to the memory profile we assess."""
+    if int(kv_bits) == 8:
+        return ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+    return []
+
+
+def saved_model_config(name: str) -> dict | None:
+    """Return a usable persisted architecture, tolerating edited old config."""
+    saved = cfg.get("last_model_config") or {}
+    try:
+        if saved.get("model") != name or not all(
+                int(saved.get(key) or 0) > 0
+                for key in ("layers", "kv_heads", "head_dim")):
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return {"layers": int(saved["layers"]),
+            "kv_layers": int(saved.get("kv_layers") or saved["layers"]),
+            "kv_heads": int(saved["kv_heads"]),
+            "head_dim": int(saved["head_dim"]),
+            "exact": bool(saved.get("exact")),
+            "hybrid": bool(saved.get("hybrid")),
+            "moe": bool(saved.get("moe"))}
+
+
 def load_model_by_name(name: str, ctx: int | None = None,
                        gpu_layers: int | None = None) -> dict:
-    """Start llama-server on a local file, -ngl from the fit calculation."""
-    model = next((m for m in engine.local_models() if m["name"] == name), None)
-    if not model:
-        raise RuntimeError("That model is not on disk.")
-    if model["partial"]:
-        raise RuntimeError("That download has not finished.")
-    ctx = int(ctx or cfg.get("ctx") or 8192)
-    hw = fit.hardware(cfg)
-    entry = fit.catalogue_match(name)
-    conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
-        if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
-                       "head_dim": 128, "exact": False}
-    a = fit.assess(model["size"], conf, hw, ctx, int(cfg.get("kv_bits", 16)))
-    gl = a["gpu_layers"] if gpu_layers is None else int(gpu_layers)
-    extra = []
-    if int(cfg.get("kv_bits", 16)) == 8:
-        extra += ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
-    server.start(model["path"], gl, ctx, extra)
-    cfg["last_model"] = name
-    cfg["ctx"] = ctx
-    save_config(cfg)
-    if not server.wait_ready(600):
-        raise RuntimeError("llama-server did not come up.")
-    return {"model": name, "gpu_layers": gl, "ctx": ctx, "fit": a,
-            "why": fit.verdict_text(a, hw)}
+    """Start llama-server using only measured hardware, never a plan card."""
+    with engine_lock:
+        model = next((m for m in engine.local_models()
+                      if m["name"] == name), None)
+        if not model:
+            raise RuntimeError("That model is not on disk.")
+        if model["partial"]:
+            raise RuntimeError("That download has not finished.")
+        ctx = int(ctx or cfg.get("ctx") or 8192)
+        if not 512 <= ctx <= 262_144:
+            raise RuntimeError("Context must be between 512 and 262144.")
+        # plan_for is a catalogue comparison only. Using it here can select
+        # too many layers, or even install flags for a GPU not in this PC.
+        hw = fit.hardware({})
+        entry = fit.catalogue_match(name)
+        conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
+            if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
+                           "head_dim": 128, "exact": False}
+        bits = int(cfg.get("kv_bits", 8))
+        a = fit.assess(model["size"], conf, hw, ctx, bits)
+        requested = a["gpu_layers"] if gpu_layers is None else int(gpu_layers)
+        # A caller may deliberately offload fewer layers, but never exceed the
+        # measured safe fit or the model's real layer count.
+        gl = max(0, min(requested, a["gpu_layers"], a["layers"]))
+        server.start(model["path"], gl, ctx, model_runtime_args(bits))
+        if not server.wait_ready(600):
+            server.stop()
+            raise RuntimeError("llama-server did not come up.")
+        with config_lock:
+            cfg["last_model"] = name
+            # Preserve the measured architecture so automatic startup uses
+            # the same layer/KV calculation instead of a generic 32-layer
+            # fallback (Qwen3 8B has 36 layers).
+            cfg["last_model_config"] = {
+                "model": name,
+                **{key: conf.get(key) for key in
+                   ("layers", "kv_layers", "kv_heads", "head_dim", "exact",
+                    "hybrid", "moe")},
+            }
+            cfg["ctx"] = ctx
+            save_config(cfg)
+        return {"model": name, "gpu_layers": gl, "ctx": ctx, "fit": a,
+                "why": fit.verdict_text(a, hw)}
 
 
 def pick_quant(files: list[dict], conf: dict, hw: dict, ctx: int,
@@ -1250,7 +1381,7 @@ def api_fit_local():
 def api_engine_install():
     try:
         return jsonify({"ok": True,
-                        "task": engine.install(fit.hardware(cfg)).view()})
+                        "task": engine.install(fit.hardware({})).view()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -1775,14 +1906,18 @@ def main() -> None:
                       if m["name"] == cfg["last_model"] and not m["partial"]),
                      None)
         if model and engine.server_binary():
-            hw = fit.hardware(cfg)
-            conf = {"layers": 32, "kv_heads": 8, "head_dim": 128,
-                    "exact": False}
+            # Planning mode must never affect what is launched on this PC.
+            hw = fit.hardware({})
+            conf = saved_model_config(model["name"]) or {
+                "layers": 32, "kv_layers": 32, "kv_heads": 8,
+                "head_dim": 128, "exact": False,
+            }
             a = fit.assess(model["size"], conf, hw, int(cfg.get("ctx", 8192)),
-                           int(cfg.get("kv_bits", 16)))
+                           int(cfg.get("kv_bits", 8)))
             try:
                 server.start(model["path"], a["gpu_layers"],
-                             int(cfg.get("ctx", 8192)))
+                             int(cfg.get("ctx", 8192)),
+                             model_runtime_args(int(cfg.get("kv_bits", 8))))
                 print(f"  loading {model['name']}…")
             except Exception as exc:  # noqa: BLE001
                 print(f"  could not reload {model['name']}: {exc}")
@@ -1791,6 +1926,8 @@ def main() -> None:
     if os.environ.get("LLAMA_STUDIO_NO_BROWSER") != "1":
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
     try:
+        # This is a loopback-only desktop service, not an internet-facing web
+        # deployment. Flask's threaded server also preserves streaming SSE.
         app.run(host="127.0.0.1", port=PORT, threaded=True, debug=False)
     finally:
         server.stop()
