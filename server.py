@@ -41,10 +41,12 @@ chats_lock = threading.Lock()
 
 DEFAULTS = {
     "hf_token": "", "hf_endpoint": "https://huggingface.co",
-    "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 1024,
+    # max_tokens 0 means "as much of the context as is left after the
+    # prompt" — a fixed small number is what cuts long answers in half.
+    "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 0,
     "system": "", "kv_bits": 16, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
-    "run_command": "", "recall": True,
+    "run_command": "", "recall": True, "reply_limit_migrated": False,
 }
 
 
@@ -56,6 +58,14 @@ def load_config() -> dict:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
             pass
+    if not cfg.get("reply_limit_migrated"):
+        # The old 1024-token reply limit was a default nobody chose, and it
+        # ended long answers mid-sentence with no explanation. Move that one
+        # value to automatic; a number the person picked themselves stands.
+        if int(cfg.get("max_tokens") or 0) == 1024:
+            cfg["max_tokens"] = 0
+        cfg["reply_limit_migrated"] = True
+        save_config(cfg)
     return cfg
 
 
@@ -1546,12 +1556,80 @@ def api_chat_delete(chat_id: str):
     return jsonify({"ok": True})
 
 
+# Scaffolding the chat template wraps round the conversation, and the
+# smallest reply worth leaving room for. Both are slack, not guesses at
+# anything measurable: the prompt itself is counted by the tokenizer.
+CTX_MARGIN = 160
+PER_MSG = 6
+REPLY_FLOOR = 512
+
+CONTINUE_NUDGE = (
+    "Your previous message was cut off before it finished. Carry straight "
+    "on from the exact character it stopped at. Do not repeat any of it, do "
+    "not start again, do not add a preamble or an apology — continue the "
+    "text, and if it stopped inside a code block, continue the code and "
+    "close the block properly."
+)
+
+
+def budget(system_text: str, history: list[dict], want: int) -> dict:
+    """Fit prompt and reply inside the context window the server really has.
+
+    Handed more prompt than it can hold, llama.cpp either refuses the request
+    or slides its window along and drops the system prompt and the oldest
+    turns without saying so — which from the outside looks exactly like the
+    app forgetting the conversation mid-answer. So the trimming happens here
+    instead: deliberate, counted with the model's own tokenizer, and
+    reported back to the page.
+    """
+    n_ctx = server.n_ctx() or int(cfg.get("ctx") or 8192)
+    want = max(0, int(want or 0))
+    msgs = list(history)
+    sys_t = server.count_tokens(system_text)
+    fixed = sys_t + CTX_MARGIN + PER_MSG
+    prompt = fixed + server.count_tokens(
+        "\n".join(m["content"] for m in msgs)) + PER_MSG * len(msgs)
+    dropped = 0
+    if prompt > n_ctx - REPLY_FLOOR and len(msgs) > 1:
+        # Only the path that needs per-message counts pays for them.
+        counts = [server.count_tokens(m["content"]) + PER_MSG for m in msgs]
+        # The newest turn is never dropped — it is the question being asked.
+        while len(msgs) > 1 and fixed + sum(counts) > n_ctx - REPLY_FLOOR:
+            msgs.pop(0)
+            counts.pop(0)
+            dropped += 1
+        prompt = fixed + sum(counts)
+    free = n_ctx - prompt
+    cap = min(want, free) if want else free
+    return {"history": msgs, "max_tokens": max(16, cap), "dropped": dropped,
+            "n_ctx": n_ctx, "prompt_tokens": prompt, "free": free,
+            "capped": bool(want and want < free), "overflow": free < 64}
+
+
+def looks_unfinished(text: str, reason: str) -> bool:
+    """Whether a reply stopped short of a whole answer. A token limit says so
+    outright; an odd number of code fences says it just as plainly, since a
+    block that was opened and never closed is a file that got cut in half."""
+    if reason == "length":
+        return True
+    body = text.rstrip()
+    if not body:
+        return False
+    return body.count("```") % 2 == 1
+
+
 @app.post("/api/chat")
 def api_chat_send():
-    """Streams the reply back as it is generated, then stores the exchange."""
+    """Streams the reply back as it is generated, then stores the exchange.
+
+    With `continue: true` it resumes the last reply instead of starting a new
+    one: the new text is appended to that same message, so a cut-off answer
+    is finished in place rather than replaced by a second partial one.
+    """
     b = request.get_json(silent=True) or {}
     text = (b.get("message") or "").strip()
-    if not text:
+    resume = bool(b.get("continue"))
+    if not text and not resume:
         return jsonify({"error": "Nothing to send."}), 400
     if not server.ready():
         return jsonify({"error": "No model is loaded. Pick one on the Models "
@@ -1559,60 +1637,120 @@ def api_chat_send():
 
     chat_id = b.get("chat") or ""
     chat = get_chat(chat_id) if chat_id else None
-    if not chat:
-        chat = {"id": uuid.uuid4().hex[:12],
-                "title": " ".join(text.split()[:7])[:60] or "New chat",
-                "created": time.time(), "model": Path(server.model).name,
-                # which workspace this conversation belongs to: the plain
-                # chat page or the coding page. Old chats have no mode and
-                # are treated as plain chat.
-                "mode": "code" if b.get("mode") == "code" else "chat",
-                "messages": []}
-    chat["messages"].append({"role": "user", "content": text,
-                             "at": time.time()})
-    # Stored before a single token comes back: if the person presses Stop or
-    # closes the tab mid-reply, their own message is not lost with it.
-    put_chat(chat)
-    history = [{"role": m["role"], "content": m["content"]}
-               for m in chat["messages"]]
+    if resume:
+        if not chat or not chat.get("messages") or \
+                chat["messages"][-1].get("role") != "assistant" or \
+                not (chat["messages"][-1].get("content") or "").strip():
+            return jsonify({"error": "There is no cut-off reply to "
+                                     "continue."}), 400
+        history = [{"role": m["role"], "content": m["content"]}
+                   for m in chat["messages"]]
+        history.append({"role": "user", "content": CONTINUE_NUDGE})
+        query = next((m["content"] for m in reversed(chat["messages"])
+                      if m["role"] == "user"), "")
+        # What is already written. Whether the answer is whole has to be
+        # judged on the two halves joined — the closing fence arriving on
+        # its own in the last round is a finished reply, not a new stump.
+        prior = chat["messages"][-1]["content"]
+    else:
+        if not chat:
+            chat = {"id": uuid.uuid4().hex[:12],
+                    "title": " ".join(text.split()[:7])[:60] or "New chat",
+                    "created": time.time(), "model": Path(server.model).name,
+                    # which workspace this conversation belongs to: the plain
+                    # chat page or the coding page. Old chats have no mode and
+                    # are treated as plain chat.
+                    "mode": "code" if b.get("mode") == "code" else "chat",
+                    "messages": []}
+        prior = ""
+        chat["messages"].append({"role": "user", "content": text,
+                                 "at": time.time()})
+        # Stored before a single token comes back: if the person presses Stop
+        # or closes the tab mid-reply, their own message is not lost with it.
+        put_chat(chat)
+        history = [{"role": m["role"], "content": m["content"]}
+                   for m in chat["messages"]]
+        query = text
+
+    system_text = ((b.get("system", cfg.get("system")) or "") +
+                   context_extra(query, chat["id"]) + doc_howto()).strip()
+    plan = budget(system_text, history,
+                  b.get("max_tokens", cfg.get("max_tokens")))
     params = {"temperature": b.get("temperature", cfg.get("temperature")),
               "top_p": b.get("top_p", cfg.get("top_p")),
-              "max_tokens": b.get("max_tokens", cfg.get("max_tokens")),
-              "system": b.get("system", cfg.get("system")),
-              # persistent memory, past-conversation excerpts, and the
-              # Office-document block convention (with live template list)
-              "system_extra": context_extra(text, chat["id"]) + doc_howto()}
+              "max_tokens": plan["max_tokens"], "system": system_text}
 
     def stream():
         started = time.time()
         pieces: list[str] = []
         finished = False
+        reason = ""
         try:
-            yield "data: " + json.dumps({"chat": chat["id"],
-                                         "title": chat["title"]}) + "\n\n"
-            try:
-                for delta in server.chat_stream(history, params):
-                    pieces.append(delta)
-                    yield "data: " + json.dumps({"delta": delta}) + "\n\n"
-            except Exception as exc:  # noqa: BLE001
-                yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+            yield "data: " + json.dumps(
+                {"chat": chat["id"], "title": chat["title"],
+                 "ctx": {"n_ctx": plan["n_ctx"],
+                         "prompt": plan["prompt_tokens"],
+                         "reply_room": plan["max_tokens"],
+                         "dropped": plan["dropped"],
+                         "capped": plan["capped"]}}) + "\n\n"
+            if plan["overflow"]:
+                yield "data: " + json.dumps(
+                    {"error": "This conversation no longer fits in the "
+                              "context window, even after trimming. Raise "
+                              "the context size or start a new chat."}) \
+                    + "\n\n"
+            else:
+                try:
+                    for ev in server.chat_stream(plan["history"], params):
+                        if "delta" in ev:
+                            pieces.append(ev["delta"])
+                            yield "data: " + json.dumps(
+                                {"delta": ev["delta"]}) + "\n\n"
+                        elif "stop" in ev:
+                            reason = ev["stop"]
+                except Exception as exc:  # noqa: BLE001
+                    yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
             finished = True
             elapsed = max(time.time() - started, 0.001)
-            tps = round((len("".join(pieces)) / 4) / elapsed, 1)
-            yield "data: " + json.dumps({"done": True, "tps": tps,
-                                         "seconds": round(elapsed, 1)}) + "\n\n"
+            reply = "".join(pieces)
+            tps = round((len(reply) / 4) / elapsed, 1)
+            yield "data: " + json.dumps(
+                {"done": True, "tps": tps, "seconds": round(elapsed, 1),
+                 "stop": reason,
+                 "unfinished": looks_unfinished(prior + reply,
+                                                reason)}) + "\n\n"
         finally:
             # Runs on a clean finish AND on GeneratorExit when the client goes
             # away, so a half-written reply is kept rather than thrown out.
             reply = "".join(pieces)
             if reply:
                 elapsed = max(time.time() - started, 0.001)
-                chat["messages"].append({
-                    "role": "assistant", "content": reply, "at": time.time(),
-                    # ~4 characters a token: rough, but measured, not predicted.
-                    "tps": round((len(reply) / 4) / elapsed, 1),
-                    "seconds": round(elapsed, 1),
-                    "stopped": not finished})
+                stop = reason if finished else "aborted"
+                if resume:
+                    # The continuation belongs to the message it continues,
+                    # not beside it: one whole answer, not two halves.
+                    last = chat["messages"][-1]
+                    last["content"] = last["content"] + reply
+                    last["seconds"] = round(
+                        float(last.get("seconds") or 0) + elapsed, 1)
+                    last["tps"] = round(
+                        (len(last["content"]) / 4) / max(
+                            float(last["seconds"]), 0.001), 1)
+                    last["stop"] = stop
+                    last["stopped"] = not finished
+                    last["unfinished"] = looks_unfinished(
+                        last["content"], stop)
+                    last["continued"] = int(last.get("continued") or 0) + 1
+                else:
+                    chat["messages"].append({
+                        "role": "assistant", "content": reply,
+                        "at": time.time(),
+                        # ~4 characters a token: rough, but measured rather
+                        # than predicted.
+                        "tps": round((len(reply) / 4) / elapsed, 1),
+                        "seconds": round(elapsed, 1),
+                        "stopped": not finished, "stop": stop,
+                        "unfinished": looks_unfinished(reply, stop)})
                 chat["model"] = Path(server.model).name if server.model \
                     else chat.get("model")
                 put_chat(chat)

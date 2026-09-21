@@ -38,6 +38,17 @@
    what it needs. Never pretend such a build is loadable.
 12. **Non-GGUF repos fail with a named reason** (FP8/NVFP4/INT8/MLX are other
    runtimes), not an empty list.
+13. **A reply always says why it ended.** `chat_stream` yields a final
+   `{"stop": reason}` carrying llama.cpp's `finish_reason`; the done event
+   and the stored message keep it. Never let a length-capped reply look like
+   a finished one — that is what made truncated answers pass for whole ones.
+14. **The reply limit defaults to automatic** (`max_tokens: 0` = whatever the
+   context has left after the prompt). Never reintroduce a fixed cap as the
+   default.
+15. **The prompt is budgeted before it is sent**, counted with the model's own
+   `/tokenize`, and old messages are dropped here with the count reported.
+   Never leave llama.cpp to context-shift silently — it drops the system
+   prompt first.
 
 ## Validation gate
 

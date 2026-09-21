@@ -150,6 +150,12 @@
   .miniBtn{font-size:11px;color:var(--dim);padding:3px 10px;border-radius:7px;
           border:1px solid var(--line)}
   .miniBtn:hover{color:var(--text);border-color:#4c4a44}
+  .accentBtn{color:var(--accent);border-color:var(--accent)}
+  .accentBtn:hover{color:#fff;background:var(--accent);border-color:var(--accent)}
+  .msg .meta.warn{color:var(--accent)}
+  .cont-note{display:inline-block;margin:0 6px 0 2px;font-size:11.5px;
+          color:var(--accent);opacity:.85}
+  .pill.warn{color:var(--accent);border-color:var(--accent)}
   .codeblock pre{margin:0;padding:12px 14px;overflow-x:auto;
           font-family:var(--mono);font-size:12.5px;line-height:1.6;color:#dcd9d0}
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
@@ -552,7 +558,19 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
     <input type="range" id="toppSl" min="0.1" max="1" step="0.05" value="0.95">
     <span class="v" id="toppVal">0.95</span></div></div></div>
   <div class="orow"><span class="lab">Reply limit</span><div class="ctl">
-    <input type="number" id="maxTok" min="64" max="8192" step="64" value="1024"></div></div>
+    <select id="maxTokSel">
+      <option value="0" selected>Auto — as much as the context allows</option>
+      <option value="512">512 tokens</option>
+      <option value="1024">1024 tokens</option>
+      <option value="2048">2048 tokens</option>
+      <option value="4096">4096 tokens</option>
+      <option value="8192">8192 tokens</option>
+    </select></div></div>
+  <div class="orow"><span class="lab">Finish cut-off replies</span>
+    <div class="ctl"><input type="checkbox" id="autoCont" checked
+      style="width:auto"></div></div>
+  <p class="note">A reply that stops at the token limit, or in the middle of a
+    code block, is continued in place rather than left half-written.</p>
   <div class="orow"><span class="lab">KV cache</span><div class="ctl">
     <select id="kvSel"><option value="16">f16 — exact</option>
       <option value="8">q8 — half the memory</option></select></div></div>
@@ -622,7 +640,7 @@ The model adds lines here itself when a reply contains remember: …"></textarea
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
           setupKicked: false, cur: { chat: null, code: null }, webOn: false,
-          ws: { path: "", attached: [], lastFile: "" } };
+          ws: { path: "", attached: [], lastFile: "" }, ctxUse: null };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -638,7 +656,12 @@ var CODE_SYSTEM = "You are a precise coding assistant. Lead with working " +
   "given to you as multiple files, output every file you create or modify " +
   "as its own complete fenced block whose info line is the language " +
   "followed by path=<relative path>, for example: ```python " +
-  "path=src/utils.py — always the whole file, never a fragment.";
+  "path=src/utils.py — always the whole file, never a fragment. Write the " +
+  "complete, runnable program: no placeholder comments standing in for " +
+  "logic, no \"rest of the code here\", no abbreviating a long file.";
+/* How many times a cut-off reply is asked to carry on before we stop and
+   hand the reader a Continue button instead of looping for ever. */
+var MAX_CONTINUE = 4;
 var CODE_CHIPS = [
   "Write a Python function that checks whether a string is a palindrome.",
   "Explain this error and how to fix it: TypeError: 'NoneType' object is not iterable",
@@ -1343,11 +1366,17 @@ function renderThread(mode) {
   chat.messages.forEach(function (m) {
     var el = document.createElement("div");
     el.className = "msg" + (m.role === "user" ? " me" : "");
+    var bits = [];
+    if (m.tps) bits.push(m.tps + " tok/s · " + m.seconds + " s");
+    if (m.continued)
+      bits.push("carried on " + m.continued +
+        (m.continued > 1 ? " times" : " time"));
+    var why = stopReason(m);
+    if (why) bits.push(why);
     el.innerHTML = '<div class="body">' +
       renderBody(m.content, m.role !== "user") + "</div>" +
-      (m.tps || m.stopped ? '<div class="meta">' +
-        (m.tps ? m.tps + " tok/s · " + m.seconds + " s" : "") +
-        (m.stopped ? (m.tps ? " · " : "") + "stopped" : "") + "</div>" : "");
+      (bits.length ? '<div class="meta' + (m.unfinished ? " warn" : "") +
+        '">' + esc(bits.join(" · ")) + "</div>" : "");
     if (m.role !== "user" && (m.content || "").trim()) {
       var acts = document.createElement("div");
       acts.className = "acts";
@@ -1369,6 +1398,15 @@ function renderThread(mode) {
       }
       acts.appendChild(mkBtn("Speak", function () { speak(m.content); },
         "miniBtn"));
+      // Only the newest reply can be carried on: a continuation appends to
+      // the end of the conversation, so an older one cannot be resumed
+      // without rewriting everything after it.
+      if ((m.unfinished || m.stopped) &&
+          m === chat.messages[chat.messages.length - 1]) {
+        acts.appendChild(mkBtn("Continue", function () {
+          continueReply(mode);
+        }, "miniBtn accentBtn"));
+      }
       el.appendChild(acts);
     }
     box.appendChild(el);
@@ -1495,18 +1533,117 @@ async function sendMessage(mode, text) {
     payload.system = ($("systemText").value || "").trim() || CODE_SYSTEM;
   }
   try {
-    var ctrl = new AbortController();
-    S.abort = ctrl;
-    var res = await fetch("/api/chat", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      signal: ctrl.signal,
-      body: JSON.stringify(payload)
-    });
-    if (!res.ok) {
-      var err = await res.json().catch(function () { return {}; });
-      throw new Error(err.error || ("Request failed: " + res.status));
+    var res = await streamInto(payload, chat, body, ui, function (t) {
+      acc = t;
+    }, "");
+    // A reply that stopped at the token limit, or in the middle of a code
+    // block, is not an answer — it is half of one. Ask for the rest, and
+    // keep asking, rather than handing over a file that stops mid-function.
+    var rounds = 0;
+    while (res.unfinished && !res.aborted && !res.error &&
+           $("autoCont").checked && rounds < MAX_CONTINUE) {
+      rounds++;
+      res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
+        ui, function (t) { acc = t; }, acc,
+        "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…");
     }
-    var reader = res.body.getReader(), dec = new TextDecoder(), buf = "";
+    doneMeta = res;
+    chat.messages.push({ role: "assistant", content: acc,
+      tps: res.tps, seconds: res.seconds, stop: res.stop,
+      stopped: res.aborted, unfinished: res.unfinished,
+      continued: rounds });
+    renderThread(mode);
+    // The server merged any continuations into one stored message; take its
+    // copy so the page and the file on disk say the same thing.
+    if (rounds) await syncChat(mode);
+    if (S.speakOn) speak(acc);
+  } catch (e) {
+    if (e.name === "AbortError") {
+      chat.messages.push({ role: "assistant", content: acc, stopped: true,
+        stop: "aborted" });
+      renderThread(mode);
+    } else {
+      body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
+    }
+  } finally {
+    S.streaming = false; S.abort = null;
+    $(ui.send).hidden = false; $(ui.stop).hidden = true;
+    loadChats();
+  }
+}
+/* Why a reply ended, in the words the reader needs — the difference between
+   "the model finished" and "it ran out of room" used to be invisible. */
+function stopReason(m) {
+  if (m.stop === "aborted" || (m.stopped && !m.stop)) return "you pressed Stop";
+  if (m.stop === "length") return "stopped at the reply limit";
+  if (m.unfinished) return "cut off mid-block — unfinished";
+  return "";
+}
+/* Finish the last reply in place, appending to it rather than starting a
+   second one. Used by the Continue button and by the automatic rounds. */
+async function continueReply(mode) {
+  var ui = PANES[mode], chat = S.cur[mode];
+  if (!chat || !chat.id || S.streaming) return;
+  var last = chat.messages[chat.messages.length - 1];
+  if (!last || last.role !== "assistant") return;
+  var els = $(ui.inner).querySelectorAll(".msg");
+  var el = els[els.length - 1], body = el && el.querySelector(".body");
+  if (!body) return;
+  S.streaming = true;
+  $(ui.send).hidden = true; $(ui.stop).hidden = false;
+  var acc = last.content, rounds = 0;
+  try {
+    var res = { unfinished: true, aborted: false, error: "" };
+    do {
+      rounds++;
+      res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
+        ui, function (t) { acc = t; }, acc,
+        rounds > 1 ? "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…"
+          : "carrying on…");
+    } while (res.unfinished && !res.aborted && !res.error &&
+             $("autoCont").checked && rounds < MAX_CONTINUE);
+  } catch (e) {
+    if (e.name !== "AbortError") toast(e.message, true);
+  } finally {
+    S.streaming = false; S.abort = null;
+    $(ui.send).hidden = false; $(ui.stop).hidden = true;
+    // The server merged the continuation into the stored message, so its
+    // copy is the true one — take it back rather than keep a second tally.
+    await syncChat(mode);
+  }
+}
+/* Replace the open conversation with what is actually on disk. */
+async function syncChat(mode) {
+  var chat = S.cur[mode];
+  if (!chat || !chat.id) return;
+  try {
+    var fresh = await api("/api/chats/" + chat.id);
+    if (fresh && fresh.messages) S.cur[mode] = fresh;
+  } catch (e) { return; }
+  renderThread(mode);
+  loadChats();
+}
+/* One request, streamed into `body`. `seed` is the text already on screen —
+   a continuation writes on to the end of it rather than replacing it, so the
+   reader sees one growing answer instead of two stumps. */
+async function streamInto(payload, chat, body, ui, onText, seed, note) {
+  var acc = seed || "";
+  var out = { tps: 0, seconds: 0, stop: "", unfinished: false,
+    aborted: false, error: "", ctx: null };
+  var tail = note ? '<span class="cont-note">' + esc(note) + "</span>" : "";
+  body.innerHTML = renderBody(acc, true) + tail + '<span class="caret"></span>';
+  var ctrl = new AbortController();
+  S.abort = ctrl;
+  var res = await fetch("/api/chat", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    signal: ctrl.signal, body: JSON.stringify(payload)
+  });
+  if (!res.ok) {
+    var err = await res.json().catch(function () { return {}; });
+    throw new Error(err.error || ("Request failed: " + res.status));
+  }
+  var reader = res.body.getReader(), dec = new TextDecoder(), buf = "";
+  try {
     while (true) {
       var r = await reader.read();
       if (r.done) break;
@@ -1518,37 +1655,51 @@ async function sendMessage(mode, text) {
         var d;
         try { d = JSON.parse(p.slice(5).trim()); } catch (e) { return; }
         if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
+        if (d.ctx) { out.ctx = d.ctx; showCtx(d.ctx); }
         if (d.delta) {
           acc += d.delta;
-          body.innerHTML = renderBody(acc, true) +
+          onText(acc);
+          body.innerHTML = renderBody(acc, true) + tail +
             '<span class="caret"></span>';
           $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
-        if (d.error) { toast(d.error, true); }
+        if (d.error) { out.error = d.error; toast(d.error, true); }
         if (d.done) {
           body.innerHTML = renderBody(acc, true);
-          doneMeta = { tps: d.tps, seconds: d.seconds };
+          out.tps = d.tps; out.seconds = d.seconds;
+          out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
         }
       });
     }
-    chat.messages.push({ role: "assistant", content: acc,
-      tps: doneMeta && doneMeta.tps, seconds: doneMeta && doneMeta.seconds });
-    renderThread(mode);
-    if (S.speakOn) speak(acc);
   } catch (e) {
-    if (e.name === "AbortError") {
-      chat.messages.push({ role: "assistant", content: acc, stopped: true });
-      renderThread(mode);
-    } else {
-      body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
-    }
-  } finally {
-    S.streaming = false; S.abort = null;
-    $(ui.send).hidden = false; $(ui.stop).hidden = true;
-    loadChats();
+    if (e.name !== "AbortError") throw e;
+    out.aborted = true; out.stop = "aborted";
+    body.innerHTML = renderBody(acc, true);
   }
+  onText(acc);
+  return out;
+}
+/* Context use, measured by the model's own tokenizer, in the ctx pills. */
+function showCtx(c) {
+  if (!c || !c.n_ctx) return;
+  S.ctxUse = c;
+  var label = Math.round(c.n_ctx / 1024) + "k ctx · " + c.prompt + " used";
+  var tip = c.prompt + " of " + c.n_ctx + " tokens are prompt, leaving " +
+    c.reply_room + " for the reply" +
+    (c.dropped ? " — " + c.dropped + " of the oldest messages were dropped "
+      + "to make room" : "") + ".";
+  ["ctxPill", "ctxPillCode"].forEach(function (id) {
+    var pill = $(id);
+    if (!pill) return;
+    pill.textContent = label;
+    pill.title = tip;
+    pill.classList.toggle("warn", c.prompt > c.n_ctx * 0.75 || !!c.dropped);
+  });
+  if (c.dropped)
+    toast(c.dropped + " older message" + (c.dropped > 1 ? "s" : "") +
+      " dropped — the conversation no longer fits the context window.", true);
 }
 
 /* ========================= models ========================= */
@@ -1876,13 +2027,28 @@ async function refresh() {
   $("engineTag").hidden = !!st.llama_installed;
   var c = st.config || {};
   $("ctxSel").value = String(c.ctx || 8192);
-  $("ctxPill").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
-  $("ctxPillCode").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
+  // The last measured use outlives the five-second status poll: once the
+  // real number is known, showing the nominal size again would be a step
+  // backwards into guessing.
+  if (S.ctxUse) showCtx(S.ctxUse);
+  else {
+    $("ctxPill").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
+    $("ctxPillCode").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
+  }
   $("tempSl").value = c.temperature; $("tempVal").textContent =
     Number(c.temperature).toFixed(2);
   $("toppSl").value = c.top_p; $("toppVal").textContent =
     Number(c.top_p).toFixed(2);
-  $("maxTok").value = c.max_tokens;
+  var mt = String(c.max_tokens || 0), sel = $("maxTokSel");
+  // A limit set elsewhere (the config file, an older version) is kept as
+  // its own entry rather than quietly snapping to the nearest preset.
+  if (!Array.prototype.some.call(sel.options,
+      function (o) { return o.value === mt; })) {
+    var opt = document.createElement("option");
+    opt.value = mt; opt.textContent = mt + " tokens";
+    sel.appendChild(opt);
+  }
+  sel.value = mt;
   $("kvSel").value = String(c.kv_bits || 16);
   $("systemText").value = c.system || "";
   $("systemLabel").textContent = (c.system || "").trim()
@@ -2042,8 +2208,15 @@ function wire() {
         saveParams();
       });
     });
-  $("maxTok").addEventListener("change", saveParams);
+  $("maxTokSel").addEventListener("change", saveParams);
+  $("autoCont").addEventListener("change", saveParams);
+  try {
+    $("autoCont").checked =
+      localStorage.getItem("ls.autoContinue") !== "0";
+  } catch (e) { /* private browsing: leave it on */ }
   $("ctxSel").addEventListener("change", function () {
+    // A new context size makes the old measurement meaningless.
+    S.ctxUse = null;
     $("ctxPill").textContent = ($("ctxSel").value / 1024) + "k ctx";
     $("ctxPillCode").textContent = ($("ctxSel").value / 1024) + "k ctx";
     saveParams();
@@ -2182,8 +2355,13 @@ async function saveParams() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       ctx: Number($("ctxSel").value), temperature: Number($("tempSl").value),
-      top_p: Number($("toppSl").value), max_tokens: Number($("maxTok").value),
+      top_p: Number($("toppSl").value),
+      max_tokens: Number($("maxTokSel").value),
       kv_bits: Number($("kvSel").value), system: $("systemText").value })});
+  try {
+    localStorage.setItem("ls.autoContinue",
+      $("autoCont").checked ? "1" : "0");
+  } catch (e) { /* private browsing: the default stands */ }
   refresh();
 }
 
