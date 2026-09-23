@@ -5,9 +5,15 @@ actually hold, downloads the right GGUF, runs `llama-server`, and talks to it.
 
 Port 7806. `run.bat` on Windows, `./run.sh` elsewhere.
 
-Fresh installs default to an 8k context and an 8-bit KV cache. This is the
-balanced profile for an RTX 4060 8 GB / 32 GB RAM machine: Qwen3 8B Q4_K_M
-stays fully GPU-resident while retaining useful context headroom. Select 16-bit
+Fresh installs default to an **Auto** context and an 8-bit KV cache. Auto
+takes the longest window — 8k, 16k or 32k — that keeps every layer the model
+had on the GPU, judged against the VRAM that is actually free when it loads
+(the desktop and the browser use some) and never past the window the model
+was trained on. On an RTX 4060 8 GB / 32 GB RAM machine that gives Qwen3 8B
+Q4_K_M 16k, fully GPU-resident, where it used to get 8k; 32k needs the card
+otherwise idle. A model that already spills to RAM stays at 8k rather than
+being pushed further off the card. Pick a size by hand under Parameters to
+override it. Select 16-bit
 KV under Parameters only when maximum cache precision matters more than VRAM.
 The selected cache precision is passed directly to `llama-server` for both
 manual loads and automatic startup; fit calculations and runtime flags therefore
@@ -83,10 +89,55 @@ click; `-ngl` is recomputed on every switch. The smaller Gemma 4 E2B build
 is in the catalogue for manual download. "Set up later" skips the whole
 thing.
 
-Parameters (context, temperature, top-p, reply limit, KV cache precision) are in
-the prompt bar. Context and KV precision only take effect on reload — the button
-does the reload for you. Setting KV cache to q8 halves that 1.1 GB, which is
-often what moves a model from *tight* to *fits*.
+Parameters (context, sampling, temperature, top-p, reply limit, KV cache
+precision) are in the prompt bar. Context and KV precision only take effect on
+reload — the button does the reload for you. Setting KV cache to q8 halves that
+1.1 GB, which is often what moves a model from *tight* to *fits*.
+
+### Getting the model's full strength
+
+The models in the catalogue are tuned to be run a particular way, and running
+them any other way costs more quality than the quant does. Four things used to
+hold them back here, most of all on coding:
+
+- **Sampling comes from the model itself.** Each model's repo publishes the
+  temperature, top-k and top-p its authors tuned it for, in
+  `generation_config.json`. The app reads that file the way it reads
+  `config.json` and samples with it — Qwen3 8B at temperature 0.6, top-k 20,
+  top-p 0.95, min-p 0; Qwen3 Coder at 0.7 / 20 / 0.8 with a 1.05 repeat
+  penalty. The Code page used to force temperature 0.2, which is nearly
+  greedy decoding. Qwen's model card warns that greedy decoding "can lead to
+  performance degradation and endless repetitions" in thinking mode. That
+  override is gone. Parameters shows which numbers are in use and where they
+  came from; **Manual** hands control back to the sliders, and a model that
+  publishes nothing uses the sliders anyway.
+- **Thinking is visible and has room.** Qwen3 and GLM reason before they
+  answer, and llama.cpp returns that reasoning separately. The app used to
+  throw it away, so the page sat blank. In an 8k window the reasoning could
+  use all the room, and the code was never written. Now the reasoning streams
+  into a folded panel above the answer, and Auto context gives it room. The
+  reasoning is never sent back to the model (history is the answers only, as
+  these models ask). If the window still runs out mid-thought, **Continue**
+  asks for the answer directly. Every continuation runs with thinking
+  switched off, so it carries on from where the text stopped instead of
+  working the whole task out again.
+- **The system prompt carries only what applies.** The Excel / Word /
+  PowerPoint convention (~400 tokens about CSV sheets and slide templates)
+  used to ride with every request, coding questions included. Now it is sent
+  only when the conversation is about an Office file. Recalled excerpts from
+  earlier chats are marked as background to use only when relevant, so a
+  small model no longer copies an old answer that merely shares a few words
+  with the new question. On the Code page your own system prompt no longer
+  replaces the coding conventions (whole files, `path=` blocks); they are
+  added after it.
+- **The model's own chat template.** `llama-server` is started with
+  `--jinja`. Current builds do this by default, but an older build from the
+  Engine page does not, and without it a thinking model's template never
+  runs.
+
+Tokens per second is now llama.cpp's own measurement, and it counts the
+reasoning. It used to estimate from the visible answer over the whole wall
+clock, which made a thinking model look several times slower than it was.
 
 ### Replies that finish
 

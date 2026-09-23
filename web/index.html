@@ -156,6 +156,13 @@
   .cont-note{display:inline-block;margin:0 6px 0 2px;font-size:11.5px;
           color:var(--accent);opacity:.85}
   .pill.warn{color:var(--accent);border-color:var(--accent)}
+  .think{margin:0 0 10px;border-left:2px solid var(--line);padding:2px 0 2px 12px}
+  .think summary{cursor:pointer;font-size:12px;color:var(--dim);list-style:none}
+  .think summary::-webkit-details-marker{display:none}
+  .think summary:hover{color:var(--muted)}
+  .think .thinktext{white-space:pre-wrap;word-wrap:break-word;font-size:12.5px;
+          line-height:1.55;color:var(--dim);max-height:220px;overflow-y:auto;
+          margin-top:6px}
   .codeblock pre{margin:0;padding:12px 14px;overflow-x:auto;
           font-family:var(--mono);font-size:12.5px;line-height:1.6;color:#dcd9d0}
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
@@ -269,6 +276,7 @@
         font-size:12px;background:#262522}
   .slider{display:flex;align-items:center;gap:9px;min-width:170px}
   .slider input[type=range]{flex:1;accent-color:var(--accent)}
+  .slider input[type=range]:disabled{opacity:.45;cursor:not-allowed}
   .slider .v{font-size:12px;color:#cfccc3;width:54px;text-align:right;
         font-variant-numeric:tabular-nums}
   .rowbtn{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
@@ -547,10 +555,20 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
   <h3>Parameters</h3>
   <div class="orow"><span class="lab">Context</span><div class="ctl">
     <select id="ctxSel">
+      <option value="0" selected>Auto — longest that fits</option>
       <option value="2048">2k</option><option value="4096">4k</option>
-      <option value="8192" selected>8k</option><option value="16384">16k</option>
+      <option value="8192">8k</option><option value="16384">16k</option>
       <option value="32768">32k</option><option value="65536">64k</option>
     </select></div></div>
+  <p class="note">Auto picks the longest window (8k–32k) that costs no GPU
+    layer on this card. Thinking models need the room: they reason before
+    they answer, and in a short window the reasoning uses it all up.</p>
+  <div class="orow"><span class="lab">Sampling</span><div class="ctl">
+    <select id="sampSel">
+      <option value="model" selected>The model's own settings</option>
+      <option value="manual">Manual — the sliders below</option>
+    </select></div></div>
+  <p class="note" id="sampNote"></p>
   <div class="orow"><span class="lab">Temperature</span><div class="ctl"><div class="slider">
     <input type="range" id="tempSl" min="0" max="1.5" step="0.05" value="0.7">
     <span class="v" id="tempVal">0.70</span></div></div></div>
@@ -582,8 +600,6 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
     binaries, your audio never leaves this machine. Spoken replies use the
     voices built into your operating system.</p>
   <p class="note" id="paramNote"></p>
-  <p class="note">The Code page always answers at temperature 0.2 for
-    reproducible code; the slider applies to the Chat page.</p>
   <div class="rowbtn">
     <button class="btn thin" id="btnApplyCtx">Apply and reload model</button>
     <button class="btn thin" id="btnCloseParams">Done</button>
@@ -595,8 +611,8 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
   <h3>System prompt</h3>
   <textarea id="systemText" rows="7"
     placeholder="You are a careful assistant. Keep answers short unless asked."></textarea>
-  <p class="note">Sent ahead of every message in this and future chats. When
-    empty, the Code page uses its own built-in coding prompt.</p>
+  <p class="note">Sent ahead of every message in this and future chats. The
+    Code page adds its own coding conventions after it.</p>
   <div class="rowbtn">
     <button class="btn thin go" id="btnSaveSystem">Save</button>
     <button class="btn thin" id="btnClearSystem">Clear</button>
@@ -1338,8 +1354,8 @@ function renderThread(mode) {
     var head, sub;
     if (mode === "code") {
       head = ready ? "Write code with a local model" : "No model loaded";
-      sub = ready ? "Answers lead with fenced, copyable code. Runs at "
-                    + "temperature 0.2 for reproducible output."
+      sub = ready ? "Answers lead with fenced, copyable code, sampled the "
+                    + "way the model's authors tuned it."
                   : "Pick one on the Models page — the fit check tells you "
                     + "which quant your card can hold.";
     } else {
@@ -1373,31 +1389,35 @@ function renderThread(mode) {
         (m.continued > 1 ? " times" : " time"));
     var why = stopReason(m);
     if (why) bits.push(why);
+    var hasText = !!(m.content || "").trim();
     el.innerHTML = '<div class="body">' +
+      (m.role !== "user" ? thinkBlock(m.reasoning, false) : "") +
       renderBody(m.content, m.role !== "user") + "</div>" +
       (bits.length ? '<div class="meta' + (m.unfinished ? " warn" : "") +
         '">' + esc(bits.join(" · ")) + "</div>" : "");
-    if (m.role !== "user" && (m.content || "").trim()) {
+    if (m.role !== "user" && (hasText || m.reasoning)) {
       var acts = document.createElement("div");
       acts.className = "acts";
-      acts.appendChild(mkBtn("Copy reply", function () {
-        if (navigator.clipboard && navigator.clipboard.writeText)
-          navigator.clipboard.writeText(m.content);
-        toast("Reply copied.");
-      }, "miniBtn"));
-      acts.appendChild(mkBtn("Save .md", function () {
-        saveBlob(fileSlug() + ".md", m.content, "text/markdown");
-      }, "miniBtn"));
-      acts.appendChild(mkBtn("Save .html", function () {
-        saveBlob(fileSlug() + ".html", docHtml(m.content), "text/html");
-      }, "miniBtn"));
-      if (pathBlocks(m.content).length > 1) {
-        acts.appendChild(mkBtn("Apply all files", function () {
-          applyAll(m.content);
+      if (hasText) {
+        acts.appendChild(mkBtn("Copy reply", function () {
+          if (navigator.clipboard && navigator.clipboard.writeText)
+            navigator.clipboard.writeText(m.content);
+          toast("Reply copied.");
         }, "miniBtn"));
+        acts.appendChild(mkBtn("Save .md", function () {
+          saveBlob(fileSlug() + ".md", m.content, "text/markdown");
+        }, "miniBtn"));
+        acts.appendChild(mkBtn("Save .html", function () {
+          saveBlob(fileSlug() + ".html", docHtml(m.content), "text/html");
+        }, "miniBtn"));
+        if (pathBlocks(m.content).length > 1) {
+          acts.appendChild(mkBtn("Apply all files", function () {
+            applyAll(m.content);
+          }, "miniBtn"));
+        }
+        acts.appendChild(mkBtn("Speak", function () { speak(m.content); },
+          "miniBtn"));
       }
-      acts.appendChild(mkBtn("Speak", function () { speak(m.content); },
-        "miniBtn"));
       // Only the newest reply can be carried on: a continuation appends to
       // the end of the conversation, so an older one cannot be resumed
       // without rewriting everything after it.
@@ -1527,15 +1547,17 @@ async function sendMessage(mode, text) {
   }
   var payload = { chat: chat.id || "", message: outgoing, mode: mode };
   if (mode === "code") {
-    // Deterministic-ish output for code; the built-in prompt steps aside
-    // the moment the user sets their own.
-    payload.temperature = 0.2;
-    payload.system = ($("systemText").value || "").trim() || CODE_SYSTEM;
+    // The coding conventions ride after the person's own prompt instead of
+    // being replaced by it: path= blocks are what Apply and Run & fix need.
+    // No temperature of its own any more — a fixed 0.2 is near-greedy,
+    // which the thinking models warn degrades and loops their output.
+    var own = ($("systemText").value || "").trim();
+    payload.system = (own ? own + "\n\n" : "") + CODE_SYSTEM;
   }
   try {
     var res = await streamInto(payload, chat, body, ui, function (t) {
       acc = t;
-    }, "");
+    }, "", "", "");
     // A reply that stopped at the token limit, or in the middle of a code
     // block, is not an answer — it is half of one. Ask for the rest, and
     // keep asking, rather than handing over a file that stops mid-function.
@@ -1545,12 +1567,12 @@ async function sendMessage(mode, text) {
       rounds++;
       res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
         ui, function (t) { acc = t; }, acc,
-        "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…");
+        "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…", res.thought);
     }
     doneMeta = res;
     chat.messages.push({ role: "assistant", content: acc,
-      tps: res.tps, seconds: res.seconds, stop: res.stop,
-      stopped: res.aborted, unfinished: res.unfinished,
+      reasoning: res.thought, tps: res.tps, seconds: res.seconds,
+      stop: res.stop, stopped: res.aborted, unfinished: res.unfinished,
       continued: rounds });
     renderThread(mode);
     // The server merged any continuations into one stored message; take its
@@ -1574,6 +1596,8 @@ async function sendMessage(mode, text) {
 /* Why a reply ended, in the words the reader needs — the difference between
    "the model finished" and "it ran out of room" used to be invisible. */
 function stopReason(m) {
+  if (m.reasoning && !(m.content || "").trim() && m.stop !== "aborted")
+    return "ran out of room while thinking — Continue asks for the answer";
   if (m.stop === "aborted" || (m.stopped && !m.stop)) return "you pressed Stop";
   if (m.stop === "length") return "stopped at the reply limit";
   if (m.unfinished) return "cut off mid-block — unfinished";
@@ -1593,13 +1617,14 @@ async function continueReply(mode) {
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
   var acc = last.content, rounds = 0;
   try {
-    var res = { unfinished: true, aborted: false, error: "" };
+    var res = { unfinished: true, aborted: false, error: "",
+                thought: last.reasoning || "" };
     do {
       rounds++;
       res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
         ui, function (t) { acc = t; }, acc,
         rounds > 1 ? "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…"
-          : "carrying on…");
+          : "carrying on…", res.thought);
     } while (res.unfinished && !res.aborted && !res.error &&
              $("autoCont").checked && rounds < MAX_CONTINUE);
   } catch (e) {
@@ -1626,12 +1651,22 @@ async function syncChat(mode) {
 /* One request, streamed into `body`. `seed` is the text already on screen —
    a continuation writes on to the end of it rather than replacing it, so the
    reader sees one growing answer instead of two stumps. */
-async function streamInto(payload, chat, body, ui, onText, seed, note) {
-  var acc = seed || "";
+async function streamInto(payload, chat, body, ui, onText, seed, note,
+                          seedThink) {
+  var acc = seed || "", think = seedThink || "";
   var out = { tps: 0, seconds: 0, stop: "", unfinished: false,
-    aborted: false, error: "", ctx: null };
+    aborted: false, error: "", ctx: null, thought: think,
+    thoughtOnly: false };
   var tail = note ? '<span class="cont-note">' + esc(note) + "</span>" : "";
-  body.innerHTML = renderBody(acc, true) + tail + '<span class="caret"></span>';
+  function paint(live) {
+    var answering = !!acc.trim();
+    body.innerHTML = thinkBlock(think, live && !answering) +
+      renderBody(acc, true) +
+      (live ? tail + '<span class="caret"></span>' : "");
+    var tt = body.querySelector(".thinktext");
+    if (tt && live && !answering) tt.scrollTop = tt.scrollHeight;
+  }
+  paint(true);
   var ctrl = new AbortController();
   S.abort = ctrl;
   var res = await fetch("/api/chat", {
@@ -1656,18 +1691,23 @@ async function streamInto(payload, chat, body, ui, onText, seed, note) {
         try { d = JSON.parse(p.slice(5).trim()); } catch (e) { return; }
         if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
         if (d.ctx) { out.ctx = d.ctx; showCtx(d.ctx); }
+        if (d.think) {
+          think += d.think;
+          paint(true);
+          $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
+        }
         if (d.delta) {
           acc += d.delta;
           onText(acc);
-          body.innerHTML = renderBody(acc, true) + tail +
-            '<span class="caret"></span>';
+          paint(true);
           $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
         if (d.error) { out.error = d.error; toast(d.error, true); }
         if (d.done) {
-          body.innerHTML = renderBody(acc, true);
+          paint(false);
           out.tps = d.tps; out.seconds = d.seconds;
           out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
+          out.thoughtOnly = !!d.thought_only;
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
         }
@@ -1676,10 +1716,52 @@ async function streamInto(payload, chat, body, ui, onText, seed, note) {
   } catch (e) {
     if (e.name !== "AbortError") throw e;
     out.aborted = true; out.stop = "aborted";
-    body.innerHTML = renderBody(acc, true);
+    paint(false);
   }
+  out.thought = think;
   onText(acc);
   return out;
+}
+/* A thinking model's reasoning, folded above its answer. Open while it is
+   the only thing arriving, so a long think never looks like a frozen page;
+   folded once the answer starts. Shown, never sent back to the model. */
+function thinkBlock(text, open) {
+  if (!(text || "").trim()) return "";
+  var words = text.trim().split(/\s+/).length;
+  return '<details class="think"' + (open ? " open" : "") + "><summary>" +
+    esc((open ? "Thinking… " : "Reasoning · ") + words + " words") +
+    '</summary><div class="thinktext">' + esc(text.trim()) +
+    "</div></details>";
+}
+function ctxLabel(n) {
+  return n ? Math.round(n / 1024) + "k ctx" : "auto ctx";
+}
+/* Which sampling the next reply uses, said plainly: the model's own numbers
+   and where they were read from, or the sliders. While the model's settings
+   are in force the sliders show them and are locked, so what is on screen is
+   what is sent. */
+function renderSampling(st) {
+  var c = st.config || {}, p = st.sampling_profile || {};
+  var useModel = (c.sampling || "model") === "model", has = !!p.source;
+  $("sampSel").value = useModel ? "model" : "manual";
+  var locked = useModel && has;
+  var temp = locked ? p.temperature : c.temperature;
+  var topp = locked ? p.top_p : c.top_p;
+  $("tempSl").disabled = locked; $("toppSl").disabled = locked;
+  $("tempSl").value = temp; $("tempVal").textContent = Number(temp).toFixed(2);
+  $("toppSl").value = topp; $("toppVal").textContent = Number(topp).toFixed(2);
+  var note;
+  if (!useModel) note = "The sliders below apply to both pages.";
+  else if (has) note = "From " + p.source + "'s generation_config.json: " +
+    "temperature " + p.temperature + " · top-p " + p.top_p + " · top-k " +
+    p.top_k + " · min-p " + p.min_p +
+    (p.repeat_penalty !== 1 ? " · repeat penalty " + p.repeat_penalty : "") +
+    ". Both pages use these.";
+  else if (st.model) note = "This model publishes no sampling settings, so " +
+    "the sliders below apply.";
+  else note = "A loaded model's own published settings are used when it " +
+    "has them; otherwise the sliders.";
+  $("sampNote").textContent = note;
 }
 /* Context use, measured by the model's own tokenizer, in the ctx pills. */
 function showCtx(c) {
@@ -1746,7 +1828,7 @@ async function loadFit(modelId, repo) {
   try {
     var d = await api("/api/fit?model=" + encodeURIComponent(modelId || "") +
       (repo ? "&repo=" + encodeURIComponent(repo) : "") +
-      "&ctx=" + (S.status && S.status.config ? S.status.config.ctx : 8192));
+      "&ctx=" + (S.status && S.status.config ? S.status.config.ctx || 0 : 0));
     if (modelId) { S.fitCache[modelId] = d; renderCatalogue(); }
     return d;
   } catch (e) {
@@ -1826,7 +1908,7 @@ async function loadLocal() {
   var box = $("localList");
   try {
     var d = await api("/api/fit/local?ctx=" +
-      (S.status && S.status.config ? S.status.config.ctx : 8192));
+      (S.status && S.status.config ? S.status.config.ctx || 0 : 0));
     $("modelsDir").textContent = "Stored in " +
       ((S.status && S.status.models_dir) || "./models");
     box.innerHTML = "";
@@ -1864,7 +1946,8 @@ async function loadModel(name) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: name }) });
     toast(name + " loaded: " + d.gpu_layers + " of " + d.fit.layers +
-      " layers on the GPU at " + d.ctx.toLocaleString() + " context.");
+      " layers on the GPU at " + d.ctx.toLocaleString() + " context" +
+      (d.auto_ctx ? " (Auto)" : "") + ".");
     await refresh();
     show(S.view === "code" ? "code" : "chat");
   } catch (e) { toast(e.message, true); }
@@ -2026,19 +2109,18 @@ async function refresh() {
   $("modelsTag").hidden = !!(st.models || []).length;
   $("engineTag").hidden = !!st.llama_installed;
   var c = st.config || {};
-  $("ctxSel").value = String(c.ctx || 8192);
+  $("ctxSel").value = String(c.ctx || 0);
   // The last measured use outlives the five-second status poll: once the
   // real number is known, showing the nominal size again would be a step
   // backwards into guessing.
   if (S.ctxUse) showCtx(S.ctxUse);
   else {
-    $("ctxPill").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
-    $("ctxPillCode").textContent = ((c.ctx || 8192) / 1024) + "k ctx";
+    // What the running server was started with (Auto resolved), else the
+    // setting that the next load will use.
+    $("ctxPill").textContent = ctxLabel(st.ctx_running || c.ctx);
+    $("ctxPillCode").textContent = ctxLabel(st.ctx_running || c.ctx);
   }
-  $("tempSl").value = c.temperature; $("tempVal").textContent =
-    Number(c.temperature).toFixed(2);
-  $("toppSl").value = c.top_p; $("toppVal").textContent =
-    Number(c.top_p).toFixed(2);
+  renderSampling(st);
   var mt = String(c.max_tokens || 0), sel = $("maxTokSel");
   // A limit set elsewhere (the config file, an older version) is kept as
   // its own entry rather than quietly snapping to the nearest preset.
@@ -2217,10 +2299,11 @@ function wire() {
   $("ctxSel").addEventListener("change", function () {
     // A new context size makes the old measurement meaningless.
     S.ctxUse = null;
-    $("ctxPill").textContent = ($("ctxSel").value / 1024) + "k ctx";
-    $("ctxPillCode").textContent = ($("ctxSel").value / 1024) + "k ctx";
+    $("ctxPill").textContent = ctxLabel(Number($("ctxSel").value));
+    $("ctxPillCode").textContent = ctxLabel(Number($("ctxSel").value));
     saveParams();
   });
+  $("sampSel").addEventListener("change", saveParams);
   $("kvSel").addEventListener("change", saveParams);
   $("btnApplyCtx").addEventListener("click", async function () {
     await saveParams();
@@ -2351,13 +2434,19 @@ function wire() {
   });
 }
 async function saveParams() {
+  var body = { ctx: Number($("ctxSel").value),
+    sampling: $("sampSel").value,
+    max_tokens: Number($("maxTokSel").value),
+    kv_bits: Number($("kvSel").value), system: $("systemText").value };
+  // Locked sliders are showing the model's numbers, not the person's —
+  // saving them would overwrite the manual values waiting behind them.
+  if (!$("tempSl").disabled) {
+    body.temperature = Number($("tempSl").value);
+    body.top_p = Number($("toppSl").value);
+  }
   await api("/api/config", { method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      ctx: Number($("ctxSel").value), temperature: Number($("tempSl").value),
-      top_p: Number($("toppSl").value),
-      max_tokens: Number($("maxTokSel").value),
-      kv_bits: Number($("kvSel").value), system: $("systemText").value })});
+    body: JSON.stringify(body) });
   try {
     localStorage.setItem("ls.autoContinue",
       $("autoCont").checked ? "1" : "0");

@@ -50,13 +50,18 @@ DEFAULTS = {
     "hf_token": "", "hf_endpoint": "https://huggingface.co",
     # max_tokens 0 means "as much of the context as is left after the
     # prompt" — a fixed small number is what cuts long answers in half.
-    "ctx": 8192, "temperature": 0.7, "top_p": 0.95, "max_tokens": 0,
+    # ctx 0 is Auto: the longest window the fit says costs no GPU layer.
+    "ctx": 0, "temperature": 0.7, "top_p": 0.95, "max_tokens": 0,
+    # "model": sample the way the model's own generation_config.json says;
+    # "manual": the temperature and top-p sliders.
+    "sampling": "model",
     # q8 KV is the best default on an 8 GB card: it roughly halves cache use
     # while preserving substantially more room for context and GPU layers.
     "system": "", "kv_bits": 8, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
-    "last_model_config": {}, "run_command": "", "recall": True,
-    "reply_limit_migrated": False,
+    "last_model_config": {}, "last_model_sampling": {}, "last_ctx": 0,
+    "run_command": "", "recall": True,
+    "reply_limit_migrated": False, "ctx_auto_migrated": False,
 }
 
 
@@ -75,6 +80,14 @@ def load_config() -> dict:
         if int(cfg.get("max_tokens") or 0) == 1024:
             cfg["max_tokens"] = 0
         cfg["reply_limit_migrated"] = True
+        save_config(cfg)
+    if not cfg.get("ctx_auto_migrated"):
+        # The same story for the old fixed 8k window: a thinking model can
+        # spend all of it deliberating and never write the code. The 8k
+        # default moves to Auto; any other size was a choice and stands.
+        if int(cfg.get("ctx") or 0) == 8192:
+            cfg["ctx"] = 0
+        cfg["ctx_auto_migrated"] = True
         save_config(cfg)
     return cfg
 
@@ -195,7 +208,11 @@ def api_status():
         "config": {k: cfg.get(k) for k in
                    ("ctx", "temperature", "top_p", "max_tokens", "system",
                     "kv_bits", "auto_start", "last_model", "plan_for",
-                    "run_command")},
+                    "run_command", "sampling")},
+        # the window the running server was started with (Auto resolved)
+        "ctx_running": server.ctx if server.alive() else 0,
+        # the loaded model's own sampling, when it publishes any
+        "sampling_profile": loaded_sampling(),
         "catalogue": fit.CATALOGUE,
         "presets": fit.presets(),
         "setup_complete": bool(cfg.get("setup_complete")),
@@ -212,8 +229,13 @@ def api_config():
         clean = {}
         if "ctx" in b:
             clean["ctx"] = int(b["ctx"])
-            if not 512 <= clean["ctx"] <= 262_144:
-                raise ValueError("Context must be between 512 and 262144.")
+            if clean["ctx"] != 0 and not 512 <= clean["ctx"] <= 262_144:
+                raise ValueError("Context must be Auto (0) or between 512 "
+                                 "and 262144.")
+        if "sampling" in b:
+            if b["sampling"] not in ("model", "manual"):
+                raise ValueError("Sampling must be 'model' or 'manual'.")
+            clean["sampling"] = b["sampling"]
         for key in ("temperature", "top_p"):
             if key in b:
                 clean[key] = float(b[key])
@@ -491,7 +513,35 @@ def deck_templates() -> list[str]:
                   if p.suffix.lower() in (".pptx", ".potx"))
 
 
-def doc_howto() -> str:
+# Words that mean a conversation is about an Office file. Only the question
+# itself is read — attached source files and search results ride along under
+# their own headers and would match on any stray "slide" or "deck" in code.
+DOC_ASK = re.compile(
+    r"\b(xlsx|excel|spreadsheets?|workbooks?|docx|word\s+(?:doc|document|"
+    r"file)s?|pptx|powerpoint|slides?|slide\s*decks?|decks?|"
+    r"presentations?)\b", re.I)
+DOC_FENCE = re.compile(r"```(?:xlsx|docx|pptx)\b", re.I)
+
+
+def wants_documents(history: list[dict]) -> bool:
+    """Whether the Office-file convention belongs in this request. It is
+    ~400 tokens about CSV sheets and slide templates; sent with every coding
+    question it was pure noise competing with the actual task."""
+    for m in history[-6:]:
+        text = m.get("content") or ""
+        if m.get("role") == "user":
+            ask = re.split(r"\n\n(?:Project files:|Web search results:)",
+                           text, maxsplit=1)[0]
+            if DOC_ASK.search(ask):
+                return True
+        elif DOC_FENCE.search(text):
+            return True      # a follow-up to a file it already wrote
+    return False
+
+
+def doc_howto(history: list[dict] | None = None) -> str:
+    if history is not None and not wants_documents(history):
+        return ""
     names = deck_templates()
     if not names:
         return DOC_HOWTO
@@ -1079,8 +1129,12 @@ def context_extra(query: str, chat_id: str) -> str:
             snips = recall_snippets(query, chat_id)
             mode = "keywords"
         if snips:
-            parts.append("Relevant excerpts from earlier conversations "
-                         "(matched by " + mode + "):\n" + "\n".join(snips))
+            # Background, not orders: a small model otherwise copies an old
+            # answer that merely shares a few words with the new question.
+            parts.append("Excerpts from earlier conversations (matched by " +
+                         mode + "). Use them only if they bear on the "
+                         "current question; otherwise ignore them:\n" +
+                         "\n".join(snips))
     if parts:
         parts.append("To permanently remember a new important fact, put it "
                      "on its own line starting with remember: in your "
@@ -1154,7 +1208,80 @@ def saved_model_config(name: str) -> dict | None:
             "head_dim": int(saved["head_dim"]),
             "exact": bool(saved.get("exact")),
             "hybrid": bool(saved.get("hybrid")),
-            "moe": bool(saved.get("moe"))}
+            "moe": bool(saved.get("moe")),
+            "max_ctx": int(saved.get("max_ctx") or 0)}
+
+
+def free_vram_hw(hw: dict) -> dict:
+    """The card as Auto context should see it: only the VRAM that is free
+    right now, measured, because the browser and the desktop are already
+    using some of it. Call with our own server stopped, or it counts the
+    model being replaced as taken."""
+    free = int(hw.get("vram_free") or 0)
+    if free and hw.get("vram") and not hw.get("planned"):
+        return {**hw, "vram": min(int(hw["vram"]), free)}
+    return hw
+
+
+def resolve_ctx(size: int, conf: dict, hw: dict, bits: int,
+                ctx: int | None = None) -> int:
+    """The context a load uses: the one asked for, else the setting, and
+    for Auto (0) whatever the fit calculation says costs nothing."""
+    ctx = int(ctx or cfg.get("ctx") or 0)
+    if ctx == 0:
+        ctx = fit.auto_ctx(size, conf, free_vram_hw(hw), bits)
+    if not 512 <= ctx <= 262_144:
+        raise RuntimeError("Context must be between 512 and 262144.")
+    return ctx
+
+
+def loaded_sampling() -> dict:
+    """The running model's own sampling profile, or {} when it publishes
+    none (or none has been read yet)."""
+    saved = cfg.get("last_model_sampling") or {}
+    name = Path(server.model).name if server.model else ""
+    if not name or saved.get("model") != name:
+        return {}
+    return {k: v for k, v in saved.items() if k != "model"}
+
+
+def remember_sampling(name: str) -> dict:
+    """Read a model's sampling from its repo and keep it beside its
+    architecture, so an automatic start needs no network to use it. When the
+    repo cannot be reached, what was saved for this model stands, and a model
+    with nothing saved is left unrecorded so the next start asks again."""
+    entry = fit.catalogue_match(name)
+    repo = (entry or {}).get("config_repo") or (entry or {}).get("repo", "")
+    profile = fit.model_sampling(cfg, repo) if repo else {}
+    with config_lock:
+        saved = cfg.get("last_model_sampling") or {}
+        if profile is None:
+            if saved.get("model") == name:
+                return {k: v for k, v in saved.items() if k != "model"}
+            cfg["last_model_sampling"] = {}
+            save_config(cfg)
+            return {}
+        cfg["last_model_sampling"] = {"model": name, **profile}
+        save_config(cfg)
+    return profile
+
+
+def sampling_params(b: dict) -> dict:
+    """What the next reply samples with. A value in the request wins; then,
+    unless the person switched to manual, the model's own settings; then
+    the sliders. The Code page no longer forces a temperature of its own —
+    0.2 is near-greedy, which thinking models are explicitly warned off."""
+    out = {"temperature": cfg.get("temperature"), "top_p": cfg.get("top_p")}
+    if cfg.get("sampling", "model") == "model":
+        prof = loaded_sampling()
+        for key in ("temperature", "top_p", "top_k", "min_p",
+                    "repeat_penalty"):
+            if prof.get(key) is not None:
+                out[key] = prof[key]
+    for key in ("temperature", "top_p"):
+        if b.get(key) is not None:
+            out[key] = b[key]
+    return out
 
 
 def load_model_by_name(name: str, ctx: int | None = None,
@@ -1167,17 +1294,21 @@ def load_model_by_name(name: str, ctx: int | None = None,
             raise RuntimeError("That model is not on disk.")
         if model["partial"]:
             raise RuntimeError("That download has not finished.")
-        ctx = int(ctx or cfg.get("ctx") or 8192)
-        if not 512 <= ctx <= 262_144:
+        chosen = int(ctx or 0)
+        if chosen and not 512 <= chosen <= 262_144:
             raise RuntimeError("Context must be between 512 and 262144.")
-        # plan_for is a catalogue comparison only. Using it here can select
-        # too many layers, or even install flags for a GPU not in this PC.
-        hw = fit.hardware({})
         entry = fit.catalogue_match(name)
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
             if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
-                           "head_dim": 128, "exact": False}
+                           "head_dim": 128, "exact": False, "max_ctx": 0}
+        # The model being replaced goes before the card is measured, so the
+        # free VRAM Auto sees is what the new one really has.
+        server.stop()
+        # plan_for is a catalogue comparison only. Using it here can select
+        # too many layers, or even install flags for a GPU not in this PC.
+        hw = fit.hardware({})
         bits = int(cfg.get("kv_bits", 8))
+        ctx = resolve_ctx(model["size"], conf, hw, bits, chosen)
         a = fit.assess(model["size"], conf, hw, ctx, bits)
         requested = a["gpu_layers"] if gpu_layers is None else int(gpu_layers)
         # A caller may deliberately offload fewer layers, but never exceed the
@@ -1196,11 +1327,18 @@ def load_model_by_name(name: str, ctx: int | None = None,
                 "model": name,
                 **{key: conf.get(key) for key in
                    ("layers", "kv_layers", "kv_heads", "head_dim", "exact",
-                    "hybrid", "moe")},
+                    "hybrid", "moe", "max_ctx")},
             }
-            cfg["ctx"] = ctx
+            # A size the caller named becomes the setting; Auto stays Auto
+            # and only the window it resolved to is recorded.
+            if chosen:
+                cfg["ctx"] = ctx
+            cfg["last_ctx"] = ctx
             save_config(cfg)
+        remember_sampling(name)
         return {"model": name, "gpu_layers": gl, "ctx": ctx, "fit": a,
+                "auto_ctx": not chosen and not int(cfg.get("ctx") or 0),
+                "sampling": loaded_sampling(),
                 "why": fit.verdict_text(a, hw)}
 
 
@@ -1323,7 +1461,7 @@ def api_fit():
     repo = request.args.get("repo") or (entry["repo"] if entry else "")
     if not repo:
         return jsonify({"error": "No model chosen."}), 400
-    ctx = int(request.args.get("ctx") or cfg.get("ctx") or 8192)
+    ctx = fit_ctx_arg()
     # Some entries exist for reference rather than for running: a serving
     # format this engine cannot load. Say why, and point at what does run.
     if entry and entry.get("runtime") and entry["runtime"] != "llama.cpp":
@@ -1348,7 +1486,7 @@ def api_fit():
     conf = fit.model_config(cfg, (entry or {}).get("config_repo") or repo)
     out = []
     for f in files:
-        a = fit.assess(f["size"], conf, hw, ctx, int(cfg.get("kv_bits", 16)))
+        a = assess_at(f["size"], conf, hw, ctx)
         out.append({**f, "fit": a, "why": fit.verdict_text(a, hw)})
     best = next((f for f in out if f["fit"]["verdict"] == "fits"
                  and not f["split"] and not f.get("companion")), None)
@@ -1360,7 +1498,7 @@ def api_fit():
 def api_fit_local():
     """The same judgement for a file already on disk."""
     hw = fit.hardware(cfg)
-    ctx = int(request.args.get("ctx") or cfg.get("ctx") or 8192)
+    ctx = fit_ctx_arg()
     out = []
     for m in engine.local_models():
         if m.get("folder") in (EMBED_DIR, IMAGE_DIR):
@@ -1369,9 +1507,31 @@ def api_fit_local():
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
             if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
                            "exact": False}
-        a = fit.assess(m["size"], conf, hw, ctx, int(cfg.get("kv_bits", 16)))
+        a = assess_at(m["size"], conf, hw, ctx)
         out.append({**m, "fit": a, "why": fit.verdict_text(a, hw)})
     return jsonify({"models": out, "hardware": hw, "ctx": ctx})
+
+
+def fit_ctx_arg() -> int:
+    """The context a fit page judges at: ?ctx= when given, else the
+    setting. 0 is Auto — judged file by file in assess_at."""
+    raw = request.args.get("ctx")
+    try:
+        return int(raw) if raw not in (None, "") else int(cfg.get("ctx") or 0)
+    except ValueError:
+        return int(cfg.get("ctx") or 0)
+
+
+def assess_at(size: int, conf: dict, hw: dict, ctx: int) -> dict:
+    """fit.assess at a fixed context, or on Auto at the one this file would
+    get — so the fit column describes what loading it would really do. The
+    whole card is the yardstick here, as for every other verdict on the
+    page; the load itself also subtracts what other programs are using."""
+    bits = int(cfg.get("kv_bits", 16))
+    auto = ctx == 0
+    if auto:
+        ctx = fit.auto_ctx(size, conf, hw, bits)
+    return {**fit.assess(size, conf, hw, ctx, bits), "auto_ctx": auto}
 
 
 # --------------------------------------------------------------------------- #
@@ -1701,6 +1861,17 @@ CONTINUE_NUDGE = (
     "text, and if it stopped inside a code block, continue the code and "
     "close the block properly."
 )
+# When the window ran out while the model was still thinking there is no
+# answer to carry on from — only reasoning, which is never sent back.
+ANSWER_NUDGE = (
+    "You ran out of room while still thinking, before writing any answer. "
+    "Write the answer now, directly and completely, without further "
+    "deliberation."
+)
+# A continuation is mechanical — pick up at the last character — so it runs
+# with thinking off. Left on, a thinking model re-deliberates the whole task
+# from scratch in the little room left and patches in something different.
+NO_THINK = {"enable_thinking": False}
 
 
 def budget(system_text: str, history: list[dict], want: int) -> dict:
@@ -1769,14 +1940,17 @@ def api_chat_send():
     chat_id = b.get("chat") or ""
     chat = get_chat(chat_id) if chat_id else None
     if resume:
-        if not chat or not chat.get("messages") or \
-                chat["messages"][-1].get("role") != "assistant" or \
-                not (chat["messages"][-1].get("content") or "").strip():
+        last = chat["messages"][-1] if chat and chat.get("messages") else {}
+        written = (last.get("content") or "").strip()
+        if last.get("role") != "assistant" or not (
+                written or (last.get("reasoning") or "").strip()):
             return jsonify({"error": "There is no cut-off reply to "
                                      "continue."}), 400
         history = [{"role": m["role"], "content": m["content"]}
                    for m in chat["messages"]]
-        history.append({"role": "user", "content": CONTINUE_NUDGE})
+        history.append({"role": "user",
+                        "content": CONTINUE_NUDGE if written
+                        else ANSWER_NUDGE})
         query = next((m["content"] for m in reversed(chat["messages"])
                       if m["role"] == "user"), "")
         # What is already written. Whether the answer is whole has to be
@@ -1804,18 +1978,30 @@ def api_chat_send():
         query = text
 
     system_text = ((b.get("system", cfg.get("system")) or "") +
-                   context_extra(query, chat["id"]) + doc_howto()).strip()
+                   context_extra(query, chat["id"]) +
+                   doc_howto(history)).strip()
     plan = budget(system_text, history,
                   b.get("max_tokens", cfg.get("max_tokens")))
-    params = {"temperature": b.get("temperature", cfg.get("temperature")),
-              "top_p": b.get("top_p", cfg.get("top_p")),
+    params = {**sampling_params(b),
               "max_tokens": plan["max_tokens"], "system": system_text}
+    if resume:
+        params["chat_template_kwargs"] = NO_THINK
 
     def stream():
         started = time.time()
         pieces: list[str] = []
+        thoughts: list[str] = []
         finished = False
         reason = ""
+        timings: dict = {}
+
+        def rate(chars: int, seconds: float) -> float:
+            # llama.cpp's own count of generated tokens per second when it
+            # reports one; ~4 characters a token over the wall clock if not.
+            measured = timings.get("predicted_per_second")
+            if isinstance(measured, (int, float)) and measured > 0:
+                return round(float(measured), 1)
+            return round((chars / 4) / max(seconds, 0.001), 1)
         try:
             yield "data: " + json.dumps(
                 {"chat": chat["id"], "title": chat["title"],
@@ -1837,24 +2023,38 @@ def api_chat_send():
                             pieces.append(ev["delta"])
                             yield "data: " + json.dumps(
                                 {"delta": ev["delta"]}) + "\n\n"
+                        elif "think" in ev:
+                            thoughts.append(ev["think"])
+                            yield "data: " + json.dumps(
+                                {"think": ev["think"]}) + "\n\n"
                         elif "stop" in ev:
                             reason = ev["stop"]
+                            timings.update(ev.get("timings") or {})
                 except Exception as exc:  # noqa: BLE001
                     yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
             finished = True
             elapsed = max(time.time() - started, 0.001)
             reply = "".join(pieces)
-            tps = round((len(reply) / 4) / elapsed, 1)
+            thought = "".join(thoughts)
             yield "data: " + json.dumps(
-                {"done": True, "tps": tps, "seconds": round(elapsed, 1),
+                {"done": True,
+                 "tps": rate(len(reply) + len(thought), elapsed),
+                 "seconds": round(elapsed, 1),
                  "stop": reason,
+                 # all of the room went on thinking and none on the answer
+                 "thought_only": bool(thought.strip() and not reply.strip()),
                  "unfinished": looks_unfinished(prior + reply,
                                                 reason)}) + "\n\n"
         finally:
             # Runs on a clean finish AND on GeneratorExit when the client goes
             # away, so a half-written reply is kept rather than thrown out.
             reply = "".join(pieces)
-            if reply:
+            thought = "".join(thoughts)
+            # Reasoning is kept for the reader but never sent back to the
+            # model: history is built from content alone, as the thinking
+            # models ask. A reply that is only reasoning is still stored, so
+            # it can be carried on into an answer.
+            if reply or thought.strip():
                 elapsed = max(time.time() - started, 0.001)
                 stop = reason if finished else "aborted"
                 if resume:
@@ -1862,26 +2062,29 @@ def api_chat_send():
                     # not beside it: one whole answer, not two halves.
                     last = chat["messages"][-1]
                     last["content"] = last["content"] + reply
+                    if thought:
+                        last["reasoning"] = (last.get("reasoning") or "") + \
+                            thought
                     last["seconds"] = round(
                         float(last.get("seconds") or 0) + elapsed, 1)
-                    last["tps"] = round(
-                        (len(last["content"]) / 4) / max(
-                            float(last["seconds"]), 0.001), 1)
+                    last["tps"] = rate(len(last["content"]) + len(
+                        last.get("reasoning") or ""),
+                        float(last["seconds"]))
                     last["stop"] = stop
                     last["stopped"] = not finished
                     last["unfinished"] = looks_unfinished(
                         last["content"], stop)
                     last["continued"] = int(last.get("continued") or 0) + 1
                 else:
-                    chat["messages"].append({
-                        "role": "assistant", "content": reply,
-                        "at": time.time(),
-                        # ~4 characters a token: rough, but measured rather
-                        # than predicted.
-                        "tps": round((len(reply) / 4) / elapsed, 1),
-                        "seconds": round(elapsed, 1),
-                        "stopped": not finished, "stop": stop,
-                        "unfinished": looks_unfinished(reply, stop)})
+                    msg = {"role": "assistant", "content": reply,
+                           "at": time.time(),
+                           "tps": rate(len(reply) + len(thought), elapsed),
+                           "seconds": round(elapsed, 1),
+                           "stopped": not finished, "stop": stop,
+                           "unfinished": looks_unfinished(reply, stop)}
+                    if thought:
+                        msg["reasoning"] = thought
+                    chat["messages"].append(msg)
                 chat["model"] = Path(server.model).name if server.model \
                     else chat.get("model")
                 put_chat(chat)
@@ -1910,17 +2113,25 @@ def main() -> None:
             hw = fit.hardware({})
             conf = saved_model_config(model["name"]) or {
                 "layers": 32, "kv_layers": 32, "kv_heads": 8,
-                "head_dim": 128, "exact": False,
+                "head_dim": 128, "exact": False, "max_ctx": 0,
             }
-            a = fit.assess(model["size"], conf, hw, int(cfg.get("ctx", 8192)),
-                           int(cfg.get("kv_bits", 8)))
+            bits = int(cfg.get("kv_bits", 8))
             try:
-                server.start(model["path"], a["gpu_layers"],
-                             int(cfg.get("ctx", 8192)),
-                             model_runtime_args(int(cfg.get("kv_bits", 8))))
-                print(f"  loading {model['name']}…")
+                ctx = resolve_ctx(model["size"], conf, hw, bits)
+                a = fit.assess(model["size"], conf, hw, ctx, bits)
+                server.start(model["path"], a["gpu_layers"], ctx,
+                             model_runtime_args(bits))
+                cfg["last_ctx"] = ctx
+                print(f"  loading {model['name']} at {ctx:,} context…")
             except Exception as exc:  # noqa: BLE001
                 print(f"  could not reload {model['name']}: {exc}")
+            # Saved beside the architecture on every load; a model last
+            # loaded by an older version has none yet, so read it once now,
+            # off the startup path.
+            if (cfg.get("last_model_sampling") or {}).get("model") != \
+                    model["name"]:
+                threading.Thread(target=remember_sampling,
+                                 args=(model["name"],), daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Llama Studio  →  {url}\n")
     if os.environ.get("LLAMA_STUDIO_NO_BROWSER") != "1":

@@ -11,6 +11,8 @@ rather than from a table of assumptions:
   fit       weights + KV + a working allowance against measured free VRAM
   speed     memory bandwidth / bytes-read-per-token, which is what makes a
             quantised model's speed predictable at all
+  context   on Auto, the longest window that costs no GPU layer
+  sampling  the model's own generation_config.json, when it has one
 
 Where a number is a guess it says so. Nothing here invents a benchmark.
 """
@@ -341,13 +343,79 @@ def model_config(cfg: dict, repo: str) -> dict:
                    "kv_heads": kv_heads, "head_dim": head_dim,
                    "exact": True,
                    "hybrid": kv_layers != layers,
-                   "moe": experts > 1}
+                   "moe": experts > 1,
+                   # the window it was trained on: Auto context never
+                   # stretches a model past it
+                   "max_ctx": int(text.get("max_position_embeddings")
+                                  or c.get("max_position_embeddings") or 0)}
             _CONFIG_CACHE[repo] = out
             return out
     except Exception:
         pass
     return {"layers": 32, "kv_layers": 32, "kv_heads": 8, "head_dim": 128,
-            "exact": False, "hybrid": False, "moe": False}
+            "exact": False, "hybrid": False, "moe": False, "max_ctx": 0}
+
+
+# --------------------------------------------------------------------------- #
+# sampling (the model authors' own settings, not a slider's)
+# --------------------------------------------------------------------------- #
+_SAMPLING_CACHE: dict[str, dict] = {}
+
+# generation_config.json key -> llama-server request field, with the range a
+# sane value falls in. Anything outside it discards the whole profile.
+_SAMPLING_KEYS = (("temperature", "temperature", 0.0, 2.0),
+                  ("top_p", "top_p", 0.0, 1.0),
+                  ("top_k", "top_k", 0, 1000),
+                  ("min_p", "min_p", 0.0, 1.0),
+                  ("repetition_penalty", "repeat_penalty", 0.5, 2.0))
+
+
+def model_sampling(cfg: dict, repo: str) -> dict | None:
+    """The sampling the model's authors ship in its generation_config.json.
+
+    Thinking models are tuned for a particular temperature / top-k / top-p
+    and degrade badly away from it (Qwen3's card: greedy or near-greedy
+    decoding "can lead to performance degradation and endless repetitions").
+    So the numbers are read from the model's own repo, like config.json is,
+    never from a table here. A key the file leaves out takes the value the
+    authors' reference stack (transformers) uses when it is absent — which
+    is also why min-p is 0: llama.cpp's 0.05 is its own addition.
+
+    {} means the model publishes no sampling: the sliders apply. None means
+    the repo could not be reached, which says nothing either way."""
+    if not repo:
+        return {}
+    if repo in _SAMPLING_CACHE:
+        return dict(_SAMPLING_CACHE[repo])
+    endpoint = (cfg.get("hf_endpoint") or "https://huggingface.co").rstrip("/")
+    token = (cfg.get("hf_token") or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = requests.get(f"{endpoint}/{repo}/resolve/main/"
+                         "generation_config.json", headers=headers, timeout=20)
+        if r.status_code == 404:
+            _SAMPLING_CACHE[repo] = {}
+            return {}
+        r.raise_for_status()
+        g = r.json()
+    except Exception:
+        return None    # a network blip is not cached as "no settings"
+    out: dict = {}
+    if isinstance(g, dict) and g.get("do_sample") is not False:
+        for src, dst, lo, hi in _SAMPLING_KEYS:
+            v = g.get(src)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if not (math.isfinite(v) and lo <= v <= hi):
+                out = {}
+                break
+            out[dst] = int(v) if dst == "top_k" else float(v)
+    if out:
+        out = {"temperature": 1.0, "top_p": 1.0, "top_k": 50,
+               "min_p": 0.0, "repeat_penalty": 1.0, **out,
+               "source": repo}
+    _SAMPLING_CACHE[repo] = out
+    return dict(out)
 
 
 def kv_bytes(conf: dict, ctx: int, kv_bits: int = 16) -> int:
@@ -417,6 +485,39 @@ def assess(weights: int, conf: dict, hw: dict, ctx: int = 8192,
             "ctx": ctx}
 
 
+# Auto context steps. 8k is the floor: below it a thinking model can spend
+# the whole window deliberating and never reach the answer. 32k is where Auto
+# stops — the native window of most models here, and what Qwen3 asks for a
+# thinking answer; longer windows are picked by hand.
+AUTO_CTX_STEPS = (8192, 16384, 32768)
+
+
+def auto_ctx(weights: int, conf: dict, hw: dict, kv_bits: int = 16) -> int:
+    """The context Auto gives a model: the longest step that costs nothing.
+
+    A step is taken only while the model keeps every GPU layer it had at the
+    floor, keeps fitting if it fitted there, and stays inside the window it
+    was trained on (config.json). So a model with VRAM to spare gets a long
+    context, and one that already spills is not pushed further off the card.
+    """
+    cap = int(conf.get("max_ctx") or 0)
+    steps = [s for s in AUTO_CTX_STEPS if not cap or s <= cap]
+    if not steps:
+        return max(512, cap)
+    floor = assess(weights, conf, hw, steps[0], kv_bits)
+    best = steps[0]
+    for step in steps[1:]:
+        a = assess(weights, conf, hw, step, kv_bits)
+        if a["gpu_layers"] < floor["gpu_layers"]:
+            break
+        if floor["verdict"] == "fits" and a["verdict"] != "fits":
+            break
+        if floor["fits_ram"] and not a["fits_ram"]:
+            break
+        best = step
+    return best
+
+
 # Everything memory-shaped is shown in GiB, because that is the unit a GPU
 # reports its VRAM in. HuggingFace lists file sizes in decimal GB, so a file
 # the repo calls 4.9 GB shows here as 4.6 GB — same bytes, honest unit.
@@ -452,6 +553,9 @@ def verdict_text(a: dict, hw: dict) -> str:
                  "layers in system RAM cost far less speed than they would "
                  "for a dense model this size. No speed estimate — the bytes "
                  "read per token cannot be measured from the file size.")
+    if a.get("auto_ctx"):
+        base += (f" Auto context gives it {a['ctx']:,} tokens — the longest "
+                 "window that costs no GPU layer.")
     if not a["exact_kv"]:
         base += (" KV cache is estimated — the model's config.json could not "
                  "be read.")

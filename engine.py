@@ -600,9 +600,13 @@ class Server:
         if not Path(model_path).exists():
             raise RuntimeError(f"No such model file: {model_path}")
         self.stop()
+        # --jinja: the model's own chat template, not llama.cpp's built-in
+        # approximation of it. Current builds default to it; an older build
+        # installed months ago does not, and without it a thinking model's
+        # template (and its enable_thinking switch) is never applied.
         cmd = [str(binary), "-m", model_path, "--host", "127.0.0.1",
                "--port", str(self.port), "-c", str(ctx),
-               "-ngl", str(max(0, gpu_layers)), "--no-webui"]
+               "-ngl", str(max(0, gpu_layers)), "--no-webui", "--jinja"]
         if extra:
             cmd += extra
         self.ctx = int(ctx)
@@ -704,21 +708,34 @@ class Server:
     # -------------------------------------------------------------- chat --- #
     def chat_stream(self, messages: list[dict], params: dict):
         """Yields events from llama-server's OpenAI-compatible endpoint:
-        {"delta": text} for each piece, then one {"stop": reason} — "length"
-        when the reply hit the token limit, "stop" when the model finished of
-        its own accord. Without that last event a cut-off reply is
-        indistinguishable from a finished one, which is exactly how a
-        truncated answer used to pass for a complete one."""
+        {"think": text} for each piece of a thinking model's reasoning,
+        {"delta": text} for each piece of the answer, then one
+        {"stop": reason, "timings": {...}} — "length" when the reply hit the
+        token limit, "stop" when the model finished of its own accord.
+        Without that last event a cut-off reply is indistinguishable from a
+        finished one, which is exactly how a truncated answer used to pass
+        for a complete one.
+
+        The reasoning arrives in its own field (reasoning_content) and used to
+        be dropped here unseen: a thinking model looked frozen for a minute,
+        and when the window ran out mid-thought there was no answer at all."""
         body = {"messages": messages, "stream": True,
                 "temperature": float(params.get("temperature", 0.7)),
                 "top_p": float(params.get("top_p", 0.95)),
                 "max_tokens": int(params.get("max_tokens", 1024))}
+        # The rest of a model's published sampling rides along only when
+        # there is one; otherwise llama-server's own defaults stand.
+        for key in ("top_k", "min_p", "repeat_penalty"):
+            if params.get(key) is not None:
+                body[key] = params[key]
+        if params.get("chat_template_kwargs"):
+            body["chat_template_kwargs"] = params["chat_template_kwargs"]
         sys_full = ((params.get("system") or "") +
                     (params.get("system_extra") or "")).strip()
         if sys_full:
             body["messages"] = [{"role": "system",
                                  "content": sys_full}] + messages
-        reason = ""
+        reason, timings = "", {}
         with requests.post(f"{self.url}/v1/chat/completions", json=body,
                            stream=True, timeout=600) as r:
             if r.status_code >= 400:
@@ -733,13 +750,19 @@ class Server:
                     chunk = json.loads(payload)
                 except ValueError:
                     continue
+                if isinstance(chunk.get("timings"), dict):
+                    timings = chunk["timings"]
                 for choice in chunk.get("choices", []):
                     if choice.get("finish_reason"):
                         reason = str(choice["finish_reason"])
-                    delta = (choice.get("delta") or {}).get("content")
+                    d = choice.get("delta") or {}
+                    think = d.get("reasoning_content")
+                    if think:
+                        yield {"think": think}
+                    delta = d.get("content")
                     if delta:
                         yield {"delta": delta}
-        yield {"stop": reason or "stop"}
+        yield {"stop": reason or "stop", "timings": timings}
 
     def props(self) -> dict:
         try:

@@ -49,6 +49,27 @@
    `/tokenize`, and old messages are dropped here with the count reported.
    Never leave llama.cpp to context-shift silently — it drops the system
    prompt first.
+16. **Sampling comes from the model's own `generation_config.json`**, read
+   like config.json (`fit.model_sampling`) and saved beside the architecture
+   as `last_model_sampling`. Keys it leaves out take transformers' defaults;
+   min-p is 0. Never a table of per-model numbers, and never a fixed
+   temperature forced by a page — the Code page's old 0.2 was near-greedy,
+   which thinking models are explicitly warned off. `sampling: "manual"` is
+   the person's override; a model with no profile uses the sliders.
+17. **Reasoning is shown, never sent back.** `chat_stream` yields
+   `{"think": …}` for `reasoning_content`; it is stored as `reasoning`, and
+   history is built from `content` only. Continuations run with
+   `chat_template_kwargs: {"enable_thinking": false}`. A reply that is only
+   reasoning (the window ran out mid-thought) is stored and carried on with
+   `ANSWER_NUDGE`, not dropped.
+18. **Context defaults to Auto (`ctx: 0`)**: `fit.auto_ctx` takes the longest
+   of 8k/16k/32k that costs no GPU layer, capped by the model's
+   `max_position_embeddings`, judged at load against free VRAM measured
+   after the old model is stopped. Auto stays the setting; the window it
+   resolved to is `last_ctx`. Never reintroduce a fixed 8k default — a
+   thinking model can spend all of it before writing any code.
+19. **The Office-file convention rides only with Office requests**
+   (`wants_documents`), never with every coding question.
 
 ## Validation gate
 
