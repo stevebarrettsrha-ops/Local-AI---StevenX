@@ -570,7 +570,7 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
     </select></div></div>
   <p class="note" id="sampNote"></p>
   <div class="orow"><span class="lab">Temperature</span><div class="ctl"><div class="slider">
-    <input type="range" id="tempSl" min="0" max="1.5" step="0.05" value="0.7">
+    <input type="range" id="tempSl" min="0" max="2" step="0.05" value="0.7">
     <span class="v" id="tempVal">0.70</span></div></div></div>
   <div class="orow"><span class="lab">Top-p</span><div class="ctl"><div class="slider">
     <input type="range" id="toppSl" min="0.1" max="1" step="0.05" value="0.95">
@@ -656,7 +656,8 @@ The model adds lines here itself when a reply contains remember: …"></textarea
 var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
           setupKicked: false, cur: { chat: null, code: null }, webOn: false,
-          ws: { path: "", attached: [], lastFile: "" }, ctxUse: null };
+          ws: { path: "", attached: [], lastFile: "" }, ctxUse: null,
+          live: null, thinkOpen: null };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -731,49 +732,95 @@ function closePops() {
 
 // Markdown-lite: fenced code blocks and inline code only, everything
 // escaped. An unclosed fence (mid-stream) renders as a code block too.
-function renderBody(text, withApply) {
-  var parts = String(text == null ? "" : text).split("```");
-  var html = "";
-  for (var i = 0; i < parts.length; i++) {
-    if (i % 2 === 0) {
-      html += '<span class="prose">' + esc(parts[i])
-        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-        .replace(/(https?:\/\/[^\s<>"')\]]+)/g,
-          '<a href="$1" target="_blank" rel="noopener">$1</a>') + "</span>";
-    } else {
-      // Info line: a language, optionally followed by path=<relative
-      // path> — the convention project-wide answers use so each block
-      // knows which file it belongs to.
-      var seg = parts[i], nl = seg.indexOf("\n");
-      var info = nl === -1 ? "" : seg.slice(0, nl).trim();
-      var codeTxt = nl === -1 ? seg : seg.slice(nl + 1);
-      var toks = info ? info.split(/\s+/) : [];
-      var lang = toks[0] && /^[\w+#.-]+$/.test(toks[0]) ? toks[0] : "";
-      var fpath = "";
-      toks.forEach(function (t) {
-        var pm = t.match(/^path=(.+)$/);
-        if (pm) fpath = pm[1];
-      });
-      if (info && !lang && !fpath) codeTxt = seg;
-      var target = fpath || S.ws.lastFile;
-      var canPreview = lang === "html" || lang === "svg";
-      var docKind = { xlsx: "Excel", docx: "Word", pptx: "PowerPoint" }[lang];
-      html += '<div class="codeblock"><div class="cbhead"><span>' +
-        esc(lang || "code") + (fpath ? " · " + esc(fpath) : "") +
-        '</span><span class="cbb">' +
-        (docKind ? '<button class="docgen" type="button" data-kind="' +
-          lang + '" title="Build the real ' + docKind +
-          ' file">Download .' + lang + "</button>" : "") +
-        (canPreview ?
-          '<button class="prev" type="button">Preview</button>' : "") +
-        (withApply && target ?
-          '<button class="apply" type="button" data-path="' + esc(fpath) +
-          '" title="' + esc(target) + '">Apply to file</button>' : "") +
-        '<button class="dl" type="button">Save</button>' +
-        '<button class="copy" type="button">Copy</button></span></div>' +
-        "<pre>" + esc(codeTxt.replace(/\n$/, "")) + "</pre></div>";
+/* A reply split into prose and code blocks the way Markdown reads it: a block
+   opens on a line of three or more backticks and closes only on a line of at
+   least as many backticks and nothing else. Splitting on every ``` cut a file
+   that itself holds a fenced example in half, and Apply wrote the half. A
+   block still open at the end is marked open: still arriving, or cut off. */
+function splitFences(text) {
+  var out = [], prose = [], code = null;
+  String(text == null ? "" : text).split("\n").forEach(function (ln) {
+    if (!code) {
+      var m = /^ {0,3}(`{3,})([^`]*)$/.exec(ln);
+      if (m) {
+        if (prose.length) out.push({ prose: prose.join("\n") });
+        prose = [];
+        code = { fence: m[1].length, info: m[2].trim(), lines: [] };
+      } else {
+        prose.push(ln);
+      }
+      return;
     }
-  }
+    var c = /^ {0,3}(`{3,})\s*$/.exec(ln);
+    if (c && c[1].length >= code.fence) {
+      out.push({ info: code.info, code: code.lines.join("\n"), open: false });
+      code = null;
+    } else {
+      code.lines.push(ln);
+    }
+  });
+  if (code) out.push({ info: code.info, code: code.lines.join("\n"),
+                       open: true });
+  else if (prose.length) out.push({ prose: prose.join("\n") });
+  return out;
+}
+/* A fence longer than any run of backticks inside the text, so a file that
+   contains fences of its own travels to the model in one piece. */
+function fenceFor(text) {
+  var runs = String(text).match(/`{3,}/g) || [];
+  var n = runs.reduce(function (a, r) { return Math.max(a, r.length); }, 2);
+  return new Array(n + 2).join("`");
+}
+/* The language and path= of a block's info line. */
+function blockInfo(info) {
+  var toks = info ? info.split(/\s+/) : [];
+  var lang = toks[0] && /^[\w+#.-]+$/.test(toks[0]) &&
+    !/^path=/.test(toks[0]) ? toks[0] : "";
+  var fpath = "";
+  toks.forEach(function (t) {
+    var pm = t.match(/^path=(.+)$/);
+    if (pm) fpath = pm[1];
+  });
+  return { lang: lang, path: fpath };
+}
+function renderBody(text, withApply) {
+  var html = "";
+  splitFences(text).forEach(function (b) {
+    if (b.prose != null) {
+      // Links end before an escaped quote or bracket: "<https://x>" used to
+      // link to "https://x&gt;".
+      html += '<span class="prose">' + esc(b.prose)
+        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/(https?:\/\/(?:[^\s<>"')\]&]|&amp;)+)/g,
+          '<a href="$1" target="_blank" rel="noopener">$1</a>') + "</span>";
+      return;
+    }
+    // Info line: a language, optionally followed by path=<relative path>
+    // — the convention project-wide answers use so each block knows which
+    // file it belongs to.
+    var bi = blockInfo(b.info), lang = bi.lang, fpath = bi.path;
+    var codeTxt = b.info && !lang && !fpath ? b.info + "\n" + b.code : b.code;
+    var target = fpath || S.ws.lastFile;
+    var canPreview = !b.open && (lang === "html" || lang === "svg");
+    var docKind = { xlsx: "Excel", docx: "Word", pptx: "PowerPoint" }[lang];
+    html += '<div class="codeblock" data-lang="' + esc(lang) + '">' +
+      '<div class="cbhead"><span>' +
+      esc(lang || "code") + (fpath ? " · " + esc(fpath) : "") +
+      (b.open ? " · unfinished" : "") +
+      '</span><span class="cbb">' +
+      (docKind && !b.open ? '<button class="docgen" type="button" ' +
+        'data-kind="' + lang + '" title="Build the real ' + docKind +
+        ' file">Download .' + lang + "</button>" : "") +
+      (canPreview ?
+        '<button class="prev" type="button">Preview</button>' : "") +
+      // An unfinished block is never offered for writing to a file.
+      (withApply && target && !b.open ?
+        '<button class="apply" type="button" data-path="' + esc(fpath) +
+        '" title="' + esc(target) + '">Apply to file</button>' : "") +
+      '<button class="dl" type="button">Save</button>' +
+      '<button class="copy" type="button">Copy</button></span></div>' +
+      "<pre>" + esc(codeTxt) + "</pre></div>";
+  });
   return html;
 }
 
@@ -866,8 +913,11 @@ async function loadTree() {
       box.appendChild(b);
     });
     if (d.truncated) {
-      box.innerHTML += '<div class="note" style="padding:4px 8px">' +
-        "Large folder — only the first 400 files are listed.</div>";
+      // insertAdjacentHTML, not innerHTML +=: rebuilding the list dropped
+      // every file button's click handler, so nothing could be attached.
+      box.insertAdjacentHTML("beforeend",
+        '<div class="note" style="padding:4px 8px">' +
+        "Large folder — only the first 400 files are listed.</div>");
     }
   } catch (e) {
     box.innerHTML = '<div class="note bad-text" style="padding:4px 8px">' +
@@ -929,25 +979,21 @@ function renderAttach() {
 }
 // Every fenced block in a reply that names its own file via path=.
 function pathBlocks(content) {
-  var parts = String(content == null ? "" : content).split("```"), out = [];
-  for (var i = 1; i < parts.length; i += 2) {
-    var seg = parts[i], nl = seg.indexOf("\n");
-    var info = nl === -1 ? "" : seg.slice(0, nl).trim();
-    var m = /(?:^|\s)path=(\S+)/.exec(info);
-    if (m) out.push({ path: m[1],
-                      code: (nl === -1 ? "" : seg.slice(nl + 1))
-                        .replace(/\n$/, "") });
-  }
-  return out;
+  // Whole blocks only: one still open at the end is half a file.
+  return splitFences(content).filter(function (b) {
+    return b.code != null && !b.open && blockInfo(b.info).path;
+  }).map(function (b) {
+    return { path: blockInfo(b.info).path, code: b.code };
+  });
 }
-async function applyJobs(jobs, quiet) {
+async function applyJobs(jobs, quiet, keepBackup) {
   var done = 0;
   for (var i = 0; i < jobs.length; i++) {
     try {
       await api("/api/workspace/file", { method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: jobs[i].path,
-                               content: jobs[i].code }) });
+        body: JSON.stringify({ path: jobs[i].path, content: jobs[i].code,
+                               keep_backup: !!keepBackup }) });
       done++;
     } catch (e) { toast(jobs[i].path + ": " + e.message, true); }
   }
@@ -1028,11 +1074,21 @@ async function autoFix() {
       }
       consoleLine("— failed, asking the model (round " + attempt + ") —");
       await attachAll(true);
-      await sendMessage("code",
+      var fence = fenceFor(r.output);
+      var res = await sendMessage("code",
         "Auto-fix round " + attempt + ": running `" + cmd + "` in this " +
-        "project failed with exit code " + r.exit + ". Output:\n```\n" +
-        r.output + "\n```\nFind the cause and output the corrected " +
-        "files.");
+        "project failed with exit code " + r.exit + ". Output:\n" + fence +
+        "\n" + r.output + "\n" + fence + "\nFind the cause and output " +
+        "the corrected files.");
+      // Stop pressed, a failure, or a reply that never finished: nothing
+      // it wrote is applied — half a file written over a working one, then
+      // run, was exactly what used to happen.
+      if (!res || res.aborted || res.error || res.unfinished) {
+        consoleLine("— stopped: the reply " + (res && res.aborted
+          ? "was stopped" : res && res.error ? "failed"
+          : "did not finish") + ", so nothing was applied —");
+        return;
+      }
       var msgs = (S.cur.code && S.cur.code.messages) || [];
       var last = msgs[msgs.length - 1] || {};
       var jobs = last.role === "assistant" ? pathBlocks(last.content) : [];
@@ -1041,9 +1097,11 @@ async function autoFix() {
           + "is guessed.", true);
         return;
       }
-      var done = await applyJobs(jobs, true);
-      consoleLine("— applied " + done + " file(s), previous versions "
-        + "kept as .bak —");
+      // Round one keeps each file's own version as .bak; later rounds
+      // leave that .bak alone instead of replacing it with round one's.
+      var done = await applyJobs(jobs, true, attempt > 1);
+      consoleLine("— applied " + done + " file(s), your versions kept as "
+        + ".bak —");
     }
   } finally {
     S.autoFixOn = false;
@@ -1235,9 +1293,9 @@ function speak(text) {
     toast("This browser offers no speech output.", true);
     return;
   }
-  var clean = String(text == null ? "" : text).split("```")
-    .filter(function (_, i) { return i % 2 === 0; })
-    .join(" — code block skipped — ")
+  var clean = splitFences(text).map(function (b) {
+      return b.prose != null ? b.prose : " — code block skipped — ";
+    }).join(" ")
     .replace(/`([^`]+)`/g, "$1").replace(/https?:\/\/\S+/g, "a link")
     .replace(/\s+/g, " ").trim();
   if (!clean) return;
@@ -1284,9 +1342,13 @@ async function switchEngine(e) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ family: e.family }) });
     await refresh();
+    S.ctxUse = null;
     toast(d.already ? d.model + " was already loaded."
-      : d.model + " loaded: " + d.gpu_layers + " of " + d.fit.layers +
-        " layers on the GPU.");
+      : d.model + " loaded: " + (d.n_cpu_moe
+        ? "every layer on the GPU, experts of " + d.n_cpu_moe + " of " +
+          d.layers + " blocks in system RAM"
+        : d.gpu_layers + " of " + d.layers + " layers on the GPU") +
+        " at " + d.ctx.toLocaleString() + " context.");
   } catch (err) { toast(err.message, true); refresh(); }
 }
 async function startSetup() {
@@ -1431,6 +1493,10 @@ function renderThread(mode) {
     }
     box.appendChild(el);
   });
+  // A reply still arriving in this conversation goes back under it: the
+  // clear above would otherwise leave it streaming into a detached node.
+  if (S.live && S.live.mode === mode && S.live.chat === chat)
+    box.appendChild(S.live.el);
   $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
 }
 function chatIcon(mode) {
@@ -1464,10 +1530,16 @@ async function openChat(id) {
   try { chat = await api("/api/chats/" + id); }
   catch (e) { return; }
   var mode = chat.mode === "code" ? "code" : "chat";
-  S.cur[mode] = chat;
+  // The conversation a reply is streaming into stays the one on screen:
+  // a fresh copy from disk would not have the reply, and never would.
+  S.cur[mode] = S.live && S.live.chat.id === id ? S.live.chat : chat;
+  S.ctxUse = null;
   show(mode); renderThread(mode); loadChats();
 }
 async function deleteChat(id, mode) {
+  // A reply still streaming into it is stopped first; otherwise it would
+  // finish, and the saved reply would bring the chat back.
+  if (S.live && S.live.chat.id === id && S.abort) S.abort.abort();
   await api("/api/chats/" + id, { method: "DELETE" });
   if (S.cur[mode] && S.cur[mode].id === id) {
     S.cur[mode] = null;
@@ -1478,6 +1550,7 @@ async function deleteChat(id, mode) {
 function newSession() {
   var mode = S.view === "code" ? "code" : "chat";
   S.cur[mode] = null;
+  S.ctxUse = null;
   show(mode); renderThread(mode); loadChats();
   $(PANES[mode].input).focus();
 }
@@ -1488,13 +1561,16 @@ async function send(mode) {
   $(ui.input).value = ""; grow($(ui.input));
   await sendMessage(mode, text);
 }
+/* Sends one message and streams the answer in. Resolves to the outcome
+   ({aborted, error, unfinished, ...}), or null when nothing was sent — Run
+   & fix reads it to know whether the reply may be applied. */
 async function sendMessage(mode, text) {
   var ui = PANES[mode];
-  if (!text || S.streaming) return;
+  if (!text || S.streaming) return null;
   if (!S.status || !S.status.ready) {
     toast("Load a model first — the Models page shows which ones fit.", true);
     show("models");
-    return;
+    return null;
   }
   if (!S.cur[mode])
     S.cur[mode] = { id: "", title: text.slice(0, 60), mode: mode, messages: [] };
@@ -1508,6 +1584,10 @@ async function sendMessage(mode, text) {
   $(ui.inner).appendChild(el);
   var body = el.querySelector(".body");
   body.innerHTML = '<span class="caret"></span>';
+  // Kept so that leaving the page and coming back — or reopening this chat
+  // from Recents — puts the reply still arriving back on screen.
+  S.live = { mode: mode, chat: chat, el: el };
+  S.thinkOpen = null;
 
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
@@ -1519,8 +1599,9 @@ async function sendMessage(mode, text) {
     // fenced with path= so replies can address files by name.
     outgoing = text + "\n\nProject files:";
     S.ws.attached.forEach(function (f) {
-      outgoing += "\n\n`" + f.path + "`:\n```" + fenceLang(f.path) +
-        " path=" + f.path + "\n" + f.content + "\n```";
+      var fence = fenceFor(f.content);
+      outgoing += "\n\n`" + f.path + "`:\n" + fence + fenceLang(f.path) +
+        " path=" + f.path + "\n" + f.content + "\n" + fence;
     });
     chat.messages[chat.messages.length - 1].content = outgoing;
     S.ws.attached = [];
@@ -1570,24 +1651,42 @@ async function sendMessage(mode, text) {
         "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…", res.thought);
     }
     doneMeta = res;
+    S.live = null;
     chat.messages.push({ role: "assistant", content: acc,
       reasoning: res.thought, tps: res.tps, seconds: res.seconds,
       stop: res.stop, stopped: res.aborted, unfinished: res.unfinished,
-      continued: rounds });
+      error: res.error || undefined, continued: rounds });
     renderThread(mode);
     // The server merged any continuations into one stored message; take its
     // copy so the page and the file on disk say the same thing.
     if (rounds) await syncChat(mode);
+    if (res.remembered && res.remembered.length)
+      toast("Added to memory: " + res.remembered.join(" · ") +
+        " — edit it under Memory.");
     if (S.speakOn) speak(acc);
+    return res;
   } catch (e) {
+    S.live = null;
     if (e.name === "AbortError") {
       chat.messages.push({ role: "assistant", content: acc, stopped: true,
         stop: "aborted" });
       renderThread(mode);
+      return { aborted: true };
+    }
+    if (acc) {
+      // A continuation that failed keeps what the first rounds wrote: the
+      // error goes beside the answer, not over it.
+      chat.messages.push({ role: "assistant", content: acc, stop: "error",
+        error: e.message, unfinished: true });
+      renderThread(mode);
+      toast(e.message, true);
+      await syncChat(mode);
     } else {
       body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
     }
+    return { error: e.message };
   } finally {
+    S.live = null;
     S.streaming = false; S.abort = null;
     $(ui.send).hidden = false; $(ui.stop).hidden = true;
     loadChats();
@@ -1596,6 +1695,7 @@ async function sendMessage(mode, text) {
 /* Why a reply ended, in the words the reader needs — the difference between
    "the model finished" and "it ran out of room" used to be invisible. */
 function stopReason(m) {
+  if (m.error) return "failed: " + m.error;
   if (m.reasoning && !(m.content || "").trim() && m.stop !== "aborted")
     return "ran out of room while thinking — Continue asks for the answer";
   if (m.stop === "aborted" || (m.stopped && !m.stop)) return "you pressed Stop";
@@ -1658,15 +1758,35 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
     aborted: false, error: "", ctx: null, thought: think,
     thoughtOnly: false };
   var tail = note ? '<span class="cont-note">' + esc(note) + "</span>" : "";
+  var pending = 0;
+  // At most every 80 ms rather than on every token: rebuilding the whole
+  // reply per token grew slower as the answer grew, and kept replacing the
+  // Copy / Save buttons under the pointer so clicks missed.
   function paint(live) {
+    if (live) {
+      if (!pending) pending = setTimeout(function () {
+        pending = 0; draw(true); }, 80);
+      return;
+    }
+    clearTimeout(pending); pending = 0;
+    draw(false);
+  }
+  function draw(live) {
     var answering = !!acc.trim();
-    body.innerHTML = thinkBlock(think, live && !answering) +
-      renderBody(acc, true) +
+    // The reasoning panel stays as the reader left it; untouched, it is
+    // open while it is all there is and folds once the answer starts.
+    var open = S.thinkOpen != null ? S.thinkOpen : live && !answering;
+    body.innerHTML = thinkBlock(think, open) + renderBody(acc, true) +
       (live ? tail + '<span class="caret"></span>' : "");
     var tt = body.querySelector(".thinktext");
-    if (tt && live && !answering) tt.scrollTop = tt.scrollHeight;
+    if (tt && live && open && !answering) tt.scrollTop = tt.scrollHeight;
+    var sum = body.querySelector(".think summary");
+    if (sum) sum.addEventListener("click", function () {
+      S.thinkOpen = !sum.parentNode.open;
+    });
+    $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
   }
-  paint(true);
+  draw(true);
   var ctrl = new AbortController();
   S.abort = ctrl;
   var res = await fetch("/api/chat", {
@@ -1694,13 +1814,11 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
         if (d.think) {
           think += d.think;
           paint(true);
-          $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
         if (d.delta) {
           acc += d.delta;
           onText(acc);
           paint(true);
-          $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
         }
         if (d.error) { out.error = d.error; toast(d.error, true); }
         if (d.done) {
@@ -1708,16 +1826,19 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
           out.tps = d.tps; out.seconds = d.seconds;
           out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
           out.thoughtOnly = !!d.thought_only;
+          out.remembered = d.remembered || [];
           $("speedPill").hidden = false;
           $("speedPill").textContent = d.tps + " tok/s";
         }
       });
     }
   } catch (e) {
+    clearTimeout(pending); pending = 0;
     if (e.name !== "AbortError") throw e;
     out.aborted = true; out.stop = "aborted";
     paint(false);
   }
+  clearTimeout(pending);
   out.thought = think;
   onText(acc);
   return out;
@@ -1786,7 +1907,7 @@ function showCtx(c) {
 
 /* ========================= models ========================= */
 function fitBadge(f) {
-  if (f.companion) return "";
+  if (f.companion || !f.fit) return "";
   var v = f.fit.verdict;
   var label = v === "fits" ? "fits" : v === "tight" ? "tight"
     : v === "spills" ? "spills to RAM" : "cpu only";
@@ -1871,7 +1992,8 @@ function renderQuants(slot, d) {
       '<span class="state">' + gb(f.size) + "</span>" + fitBadge(f) +
       (f.name === d.recommended ? '<span class="state rec">best here</span>' : "") +
       '<span class="why">' + esc(f.companion
-        ? "Loaded alongside a model with --mmproj to restore vision."
+        ? "Vision projector — a companion to the model, not a model. The "
+          + "chat page does not send images yet, so it is not loaded."
         : f.why + (speedText(f) ? " · " + speedText(f) : "")) + "</span>" +
       '<span class="right"></span>';
     var right = row.querySelector(".right");
@@ -1924,11 +2046,13 @@ async function loadLocal() {
         (m.folder ? esc(m.folder) + "/" : "") + esc(m.name) + "</b><span>" +
         gb(m.size) + " · " + esc(m.quant || "?") +
         (m.partial ? " · unfinished" : "") + " · " + esc(m.why) +
-        (m.fit.speed ? " · ~" + m.fit.speed + " tok/s" : "") +
+        (m.fit && m.fit.speed ? " · ~" + m.fit.speed + " tok/s" : "") +
         '</span></div><div class="right">' + fitBadge(m) +
+        (m.companion ? '<span class="state">vision projector</span>' : "") +
         (loaded ? '<span class="state ok">loaded</span>' : "") + "</div>";
       var right = el.querySelector(".right");
-      if (!m.partial && !loaded) {
+      // A vision projector is a companion, never a model to load.
+      if (!m.partial && !loaded && !m.companion) {
         right.appendChild(mkBtn("Load", function () { loadModel(m.name); },
           "btn thin go"));
       }
@@ -1945,6 +2069,7 @@ async function loadModel(name) {
     var d = await api("/api/engine/load", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: name }) });
+    S.ctxUse = null;     // the new model's window, not the last one's
     // A mixture-of-experts model keeps every layer on the card and parks
     // the experts that do not fit in RAM; say so rather than a layer count.
     var where = d.n_cpu_moe
@@ -2118,7 +2243,16 @@ async function refresh() {
   $("modelsTag").hidden = !!(st.models || []).length;
   $("engineTag").hidden = !!st.llama_installed;
   var c = st.config || {};
-  $("ctxSel").value = String(c.ctx || 0);
+  var cx = String(c.ctx || 0), csel = $("ctxSel");
+  // A size set elsewhere (the config file, an earlier version) is kept as
+  // its own entry: a blank select would save as Auto on the next change.
+  if (!Array.prototype.some.call(csel.options,
+      function (o) { return o.value === cx; })) {
+    var copt = document.createElement("option");
+    copt.value = cx; copt.textContent = ctxLabel(Number(cx)).replace(" ctx", "");
+    csel.appendChild(copt);
+  }
+  csel.value = cx;
   // The last measured use outlives the five-second status poll: once the
   // real number is known, showing the nominal size again would be a step
   // backwards into guessing.
@@ -2141,7 +2275,9 @@ async function refresh() {
   }
   sel.value = mt;
   $("kvSel").value = String(c.kv_bits || 16);
-  $("systemText").value = c.system || "";
+  // Not while the editor is open: the five-second poll used to replace a
+  // draft being typed with the saved text.
+  if ($("systemPop").hidden) $("systemText").value = c.system || "";
   $("systemLabel").textContent = (c.system || "").trim()
     ? "System prompt · set" : "System prompt";
   $("btnSystem").classList.toggle("on", !!(c.system || "").trim());
@@ -2191,7 +2327,9 @@ function wire() {
     var block = t.closest ? t.closest(".codeblock") : null;
     if (!block) return;
     var pre = block.querySelector("pre");
-    var lang = (block.querySelector(".cbhead span") || {}).textContent || "";
+    // From the block itself: the header also carries " · path", which made
+    // Save name a python file .txt and Preview take an svg for html.
+    var lang = block.dataset.lang || "";
     if (t.classList.contains("copy")) {
       var done = function () {
         t.textContent = "Copied";
@@ -2212,10 +2350,18 @@ function wire() {
     } else if (t.classList.contains("docgen")) {
       makeDoc(t.dataset.kind, pre.textContent, t);
     } else if (t.classList.contains("prev")) {
-      // The page the model wrote, rendered for real in a new tab.
-      var url = URL.createObjectURL(new Blob([pre.textContent],
-        { type: lang === "svg" ? "image/svg+xml" : "text/html" }));
-      window.open(url, "_blank");
+      // The page the model wrote, rendered for real in a new tab — inside a
+      // sandboxed frame with an origin of its own. Opened directly, it ran
+      // as this app, able to call every endpoint, including the one that
+      // runs commands; and model output can be steered by a web page or a
+      // file it was shown. The wrapper around it runs no script at all.
+      var wrap = '<!doctype html><meta charset="utf-8"><title>Preview' +
+        '</title><style>html,body{margin:0;height:100%;background:#fff}' +
+        'iframe{border:0;width:100%;height:100%;display:block}</style>' +
+        '<iframe sandbox="allow-scripts allow-forms allow-modals ' +
+        'allow-popups" srcdoc="' + esc(pre.textContent) + '"></iframe>';
+      var url = URL.createObjectURL(new Blob([wrap], { type: "text/html" }));
+      window.open(url, "_blank", "noopener");
       setTimeout(function () { URL.revokeObjectURL(url); }, 30000);
     }
   });
@@ -2310,10 +2456,10 @@ function wire() {
     S.ctxUse = null;
     $("ctxPill").textContent = ctxLabel(Number($("ctxSel").value));
     $("ctxPillCode").textContent = ctxLabel(Number($("ctxSel").value));
-    saveParams();
+    refit();
   });
   $("sampSel").addEventListener("change", saveParams);
-  $("kvSel").addEventListener("change", saveParams);
+  $("kvSel").addEventListener("change", refit);
   $("btnApplyCtx").addEventListener("click", async function () {
     await saveParams();
     if (S.status && S.status.model) { closePops(); loadModel(S.status.model); }
@@ -2441,6 +2587,16 @@ function wire() {
       e.preventDefault(); newSession();
     }
   });
+}
+/* Context and KV precision change every fit verdict: saved, then the
+   Models page judged again instead of showing the old window's answers. */
+async function refit() {
+  await saveParams();
+  S.fitCache = {};
+  if (S.view === "models") {
+    loadLocal();
+    if (S.openModel) loadFit(S.openModel);
+  }
 }
 async function saveParams() {
   var body = { ctx: Number($("ctxSel").value),

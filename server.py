@@ -13,13 +13,16 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
 import webbrowser
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import requests
 from flask import (Flask, Response, jsonify, request, send_file,
@@ -59,7 +62,8 @@ DEFAULTS = {
     # while preserving substantially more room for context and GPU layers.
     "system": "", "kv_bits": 8, "auto_start": True, "plan_for": "",
     "last_model": "", "setup_complete": False, "workspace": "",
-    "last_model_config": {}, "last_model_sampling": {}, "last_ctx": 0,
+    "last_model_config": {}, "model_configs": {}, "last_model_sampling": {},
+    "last_ctx": 0,
     "run_command": "", "recall": True,
     "reply_limit_migrated": False, "ctx_auto_migrated": False,
 }
@@ -70,9 +74,19 @@ def load_config() -> dict:
     cfg = dict(DEFAULTS)
     if CONFIG_PATH.exists():
         try:
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cfg.update(loaded)
         except Exception:
-            pass
+            # Kept for the person to recover (it holds their HF token);
+            # the defaults about to be saved must not write over it.
+            try:
+                shutil.copyfile(CONFIG_PATH, CONFIG_PATH.with_name(
+                    f"config.unreadable-{time.strftime('%Y%m%d-%H%M%S')}"
+                    ".json"))
+            except OSError:
+                pass
+    sane_config(cfg)
     if not cfg.get("reply_limit_migrated"):
         # The old 1024-token reply limit was a default nobody chose, and it
         # ended long answers mid-sentence with no explanation. Move that one
@@ -90,6 +104,38 @@ def load_config() -> dict:
         cfg["ctx_auto_migrated"] = True
         save_config(cfg)
     return cfg
+
+
+def sane_config(c: dict) -> dict:
+    """Every setting the code reads with int()/float() made safe, key by
+    key: a hand-edited "ctx": "auto" or "kv_bits": null used to crash each
+    send or load (or the start-up itself). A bad value takes its default."""
+    def ok_num(key, kind, test):
+        try:
+            v = kind(c.get(key))
+            if (kind is float and not math.isfinite(v)) or not test(v):
+                raise ValueError
+            c[key] = v
+        except (TypeError, ValueError):
+            c[key] = DEFAULTS[key]
+    ok_num("ctx", int, lambda v: v == 0 or 512 <= v <= 262_144)
+    ok_num("max_tokens", int, lambda v: 0 <= v <= 262_144)
+    ok_num("kv_bits", int, lambda v: v in (8, 16))
+    ok_num("temperature", float, lambda v: 0 <= v <= 2)
+    ok_num("top_p", float, lambda v: 0 < v <= 1)
+    ok_num("last_ctx", int, lambda v: v >= 0)
+    for key, value in DEFAULTS.items():
+        if isinstance(value, bool) and not isinstance(c.get(key), bool):
+            c[key] = value
+        elif isinstance(value, str) and not isinstance(c.get(key), str):
+            c[key] = value
+        elif isinstance(value, dict) and not isinstance(c.get(key), dict):
+            c[key] = {}
+    if c["sampling"] not in ("model", "manual"):
+        c["sampling"] = "model"
+    if c["plan_for"] and c["plan_for"] not in fit.GPUS:
+        c["plan_for"] = ""
+    return c
 
 
 def _atomic_json(path: Path, value) -> None:
@@ -121,13 +167,32 @@ cfg = load_config()
 # chats
 # --------------------------------------------------------------------------- #
 def read_chats() -> list[dict]:
+    """Every stored conversation. Only a missing file means none: an empty
+    list returned for a file that could not be read was written back by the
+    next save, wiping the whole history. A file briefly locked (antivirus,
+    OneDrive on Windows) is retried; one that fails to parse is set aside
+    under its own name, never overwritten."""
     with chats_lock:
         if not CHATS_PATH.exists():
             return []
+        for attempt in range(5):
+            try:
+                text = CHATS_PATH.read_text(encoding="utf-8")
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
         try:
-            return json.loads(CHATS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [c for c in data if isinstance(c, dict) and "id" in c]
+        except ValueError:
+            pass
+        aside = CHATS_PATH.with_name(
+            f"chats.unreadable-{time.strftime('%Y%m%d-%H%M%S')}.json")
+        os.replace(CHATS_PATH, aside)
+        return []
 
 
 def write_chats(items: list[dict]) -> None:
@@ -164,6 +229,34 @@ def index():
 @app.get("/web/<path:name>")
 def web_asset(name: str):
     return send_from_directory(WEB_DIR, name)
+
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+@app.before_request
+def same_machine_only():
+    """Only this machine's own page may drive the API.
+
+    Binding to 127.0.0.1 is not enough on its own: a web page the person
+    visits can rebind its domain to 127.0.0.1 (the request then names that
+    domain in Host), or post to this port directly (it carries the page's
+    Origin). Either could otherwise reach the endpoints that write files and
+    run commands. A request with no Origin — a same-origin GET, curl, the
+    test client — is the app itself or a local tool, and passes."""
+    raw = request.host or ""
+    host = raw.split("]")[0] + "]" if raw.startswith("[") \
+        else raw.rsplit(":", 1)[0]
+    if host.lower() not in LOOPBACK_HOSTS:
+        return jsonify({"error": "Not a local request."}), 403
+    origin = request.headers.get("Origin")
+    if origin is not None and request.method not in ("GET", "HEAD",
+                                                     "OPTIONS"):
+        allowed = {f"http://{h}:{PORT}" for h in
+                   ("127.0.0.1", "localhost", "[::1]")}
+        if origin.lower() not in allowed:
+            return jsonify({"error": "Cross-origin request refused."}), 403
+    return None
 
 
 @app.after_request
@@ -266,6 +359,13 @@ def api_config():
                 clean[key] = b[key]
         if clean.get("plan_for") and clean["plan_for"] not in fit.GPUS:
             raise ValueError("Unknown planned GPU.")
+        # The HuggingFace token is sent to this address: encrypted, or a
+        # mirror on this machine, never plain http across a network.
+        if "hf_endpoint" in clean and not re.match(
+                r"(https://[^/\s]+|http://(127\.0\.0\.1|localhost)(:\d+)?)"
+                r"(/\S*)?$", clean["hf_endpoint"].strip()):
+            raise ValueError("The HuggingFace address must start with "
+                             "https://.")
     except (TypeError, ValueError) as exc:
         return jsonify({"error": str(exc)}), 400
     with config_lock:
@@ -301,22 +401,51 @@ def write_memory(text: str) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def remember_lines(reply: str) -> int:
+def memory_excerpt(mem: str) -> str:
+    """What of the memory file rides with a request: all of it when it is
+    short, else its newest lines — a note added last week must not be the
+    one that never gets sent because older ones fill the allowance."""
+    if len(mem) <= MEMORY_INJECT:
+        return mem
+    lines, used = [], 0
+    for ln in reversed(mem.splitlines()):
+        if used + len(ln) + 1 > MEMORY_INJECT:
+            break
+        lines.append(ln)
+        used += len(ln) + 1
+    return "(older notes omitted)\n" + "\n".join(reversed(lines))
+
+
+def remember_lines(reply: str) -> list[str]:
     """Lines the model marked `remember:` become permanent memory. The
-    file is user-editable and capped, so a chatty model cannot flood it."""
-    new = [ln.strip()[9:].strip() for ln in reply.splitlines()
-           if ln.strip().lower().startswith("remember:")]
-    new = [n for n in new if n]
+    file is user-editable and capped, so a chatty model cannot flood it.
+
+    Lines inside code blocks are code, not notes, and are skipped. What was
+    added is returned so the page can say so: memory rides with every
+    future request, so nothing should join it unseen."""
+    new, fenced = [], False
+    for ln in reply.splitlines():
+        s = ln.strip()
+        if re.match(r"(`{3,}|~{3,})", s):
+            fenced = not fenced
+        elif not fenced and s.lower().startswith("remember:") and s[9:].strip():
+            new.append(s[9:].strip())
     if not new:
-        return 0
+        return []
     with memory_lock:
         mem = read_memory()
         have = {ln.lstrip("- ").strip().lower() for ln in mem.splitlines()}
-        added = [n for n in new if n.lower() not in have]
+        added, text = [], mem.rstrip() + "\n" if mem.strip() else ""
+        for n in new:
+            line = "- " + n + "\n"
+            if n.lower() in have or len(text) + len(line) > MEMORY_CAP:
+                continue       # a full file takes nothing it would drop
+            text += line
+            have.add(n.lower())
+            added.append(n)
         if added:
-            write_memory((mem.rstrip() + "\n" if mem.strip() else "") +
-                         "\n".join("- " + n for n in added) + "\n")
-        return len(added)
+            write_memory(text)
+        return added
 
 
 # ---- semantic recall: a small embedding model beside the chat model ---- #
@@ -325,9 +454,10 @@ EMBED_DIR = "embed"
 EMBED_SIM_MIN = 0.5
 EMB_PATH = DATA_DIR / "embeddings.json"
 embedder = engine.EmbedServer(8082)
-_emb_lock = threading.Lock()
+_emb_lock = threading.RLock()
 _emb_index: dict | None = None
-_emb_busy = False
+# one indexing pass at a time; a second caller skips rather than waits
+_emb_run = threading.Lock()
 
 
 def embed_model_file() -> Path | None:
@@ -364,7 +494,10 @@ def ensure_embedder(wait: int = 15) -> bool:
         return True
     if not embedder.alive():
         try:
-            embedder.start(str(model), 0, 2048, ["--embeddings"])
+            # --device none: -ngl 0 alone still opens a CUDA context and
+            # a GPU buffer, VRAM the chat model's fit did not allow for.
+            embedder.start(str(model), 0, 2048,
+                           ["--embeddings", "--device", "none"])
         except Exception:
             return False
     return embedder.wait_ready(wait)
@@ -378,29 +511,40 @@ def _cos(a: list[float], b: list[float]) -> float:
 
 
 def _exchange_rows():
+    """(chat, key, question, answer) for every stored exchange. The key is
+    the question's own timestamp, which stays put when a reply lands before
+    it — a position in the list does not."""
     for c in read_chats():
         msgs = c.get("messages", [])
         for i, m in enumerate(msgs):
             if m.get("role") != "user":
                 continue
-            reply = msgs[i + 1]["content"] if i + 1 < len(msgs) \
+            reply = (msgs[i + 1].get("content") or "") if i + 1 < len(msgs) \
                 and msgs[i + 1].get("role") == "assistant" else ""
-            yield c, i, m.get("content", ""), reply
+            yield c, f'{c["id"]}:{m.get("at", i)}', m.get("content", ""), \
+                reply
 
 
 def index_exchanges() -> None:
     """Embed every stored exchange the index does not have yet. The
     nomic prefixes (search_document / search_query) are the model's own
     convention for asymmetric retrieval."""
-    global _emb_busy
-    if _emb_busy or not ensure_embedder():
+    if not _emb_run.acquire(blocking=False):
         return
-    _emb_busy = True
     try:
+        if not ensure_embedder():
+            return
         idx = emb_index()
+        rows = list(_exchange_rows())
+        # Exchanges that no longer exist — a deleted chat — leave the index,
+        # or recall would keep quoting a conversation the person removed.
+        live = {key for _, key, _, _ in rows}
+        with _emb_lock:
+            stale = [k for k in idx if k not in live]
+            for k in stale:
+                del idx[k]
         todo = []
-        for c, i, um, am in _exchange_rows():
-            key = f'{c["id"]}:{i}'
+        for c, key, um, am in rows:
             # An exchange whose reply has not arrived yet is skipped, not
             # indexed half-finished: once a key exists it is never
             # revisited, so indexing early would freeze an empty answer.
@@ -415,14 +559,16 @@ def index_exchanges() -> None:
                 vecs = embedder.embed([t[4] for t in batch])
             except Exception:
                 return
-            for (key, c, um, am, _), v in zip(batch, vecs):
-                idx[key] = {"chat": c["id"], "title": c.get("title", ""),
-                            "q": um[:200].replace("\n", " "),
-                            "a": am[:400].replace("\n", " "), "v": v}
-        if todo:
+            with _emb_lock:
+                for (key, c, um, am, _), v in zip(batch, vecs):
+                    idx[key] = {"chat": c["id"],
+                                "title": c.get("title", ""),
+                                "q": um[:200].replace("\n", " "),
+                                "a": am[:400].replace("\n", " "), "v": v}
+        if todo or stale:
             emb_save()
     finally:
-        _emb_busy = False
+        _emb_run.release()
 
 
 def semantic_recall(query: str, exclude_id: str,
@@ -436,8 +582,13 @@ def semantic_recall(query: str, exclude_id: str,
         qv = embedder.embed(["search_query: " + query[:1000]])[0]
     except Exception:
         return None
-    scored = sorted(((_cos(qv, e["v"]), e) for e in emb_index().values()
-                     if e.get("chat") != exclude_id),
+    # A snapshot: the indexer thread adds to the index while this reads it.
+    with _emb_lock:
+        entries = list(emb_index().values())
+    live = {c["id"] for c in read_chats()}
+    scored = sorted(((_cos(qv, e["v"]), e) for e in entries
+                     if e.get("chat") != exclude_id
+                     and e.get("chat") in live),
                     key=lambda t: -t[0])
     out = []
     for sim, e in scored[:limit]:
@@ -549,12 +700,20 @@ def doc_howto(history: list[dict] | None = None) -> str:
                         ", ".join(names[:6]) + ".")
 
 
+def plain_name(name: str) -> bool:
+    """A bare file name that can only mean a file inside the folder it is
+    joined to. ':' is refused too: on Windows 'C:x' joined to another
+    drive's folder lands on drive C."""
+    return bool(name) and name not in (".", "..") and not any(
+        c in name for c in ("/", "\\", ":", "\0")) and ".." not in name
+
+
 def _load_template(fname: str) -> io.BytesIO:
     """A template from data/templates, as bytes python-pptx will open.
     .potx is the same zip as .pptx apart from its declared content type,
     so that one line is patched on the way in."""
     fname = (fname or "").strip()
-    if "/" in fname or "\\" in fname or ".." in fname:
+    if not plain_name(fname):
         raise RuntimeError("That template name is not allowed.")
     p = DATA_DIR / "templates" / fname
     if not p.is_file() or p.suffix.lower() not in (".pptx", ".potx"):
@@ -617,7 +776,10 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
         if m:
             if rows:
                 sheets.append((name, rows, chart))
-            name, rows, chart = m.group(1).strip()[:31], [], None
+            # Excel refuses \ / * ? : [ ] in a sheet name ("Budget
+            # 2024/25" failed the whole file) and caps it at 31 characters.
+            name = re.sub(r"[\\/*?:\[\]]", "-", m.group(1).strip())[:31]
+            rows, chart = [], None
         elif line.strip():
             rows.append(next(csv.reader([line])))
     if rows:
@@ -629,7 +791,9 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
         for r, row in enumerate(srows, 1):
             for c, val in enumerate(row, 1):
                 v = val.strip()
-                if v and re.fullmatch(r"-?\d+(\.\d+)?", v):
+                # A leading zero (00123, a ZIP or an ID) is text, as a
+                # number it would lose the zeros.
+                if v and re.fullmatch(r"-?(0|[1-9]\d*)(\.\d+)?", v):
                     v = float(v) if "." in v else int(v)
                 cell = ws.cell(row=r, column=c, value=v)
                 if r == 1:
@@ -746,7 +910,7 @@ def _pptx_image(name: str) -> Path | None:
     """Only images from the app's own gallery (data/images); 'latest'
     means the newest generated picture."""
     name = name.strip()
-    if "/" in name or "\\" in name or ".." in name:
+    if not plain_name(name):
         return None
     if not IMAGES_OUT.is_dir():
         return None
@@ -921,10 +1085,13 @@ def api_image_generate():
     if not binary or not model:
         return jsonify({"error": "The image engine is not installed yet — "
                                  "download it on the Images page."}), 400
-    w = max(256, min(768, int(b.get("width") or 512))) // 64 * 64
-    h = max(256, min(768, int(b.get("height") or 512))) // 64 * 64
-    steps = max(1, min(50, int(b.get("steps") or 20)))
-    seed = int(b.get("seed") or time.time()) % 2_000_000_000
+    try:
+        w = max(256, min(768, int(b.get("width") or 512))) // 64 * 64
+        h = max(256, min(768, int(b.get("height") or 512))) // 64 * 64
+        steps = max(1, min(50, int(b.get("steps") or 20)))
+        seed = int(b.get("seed") or time.time()) % 2_000_000_000
+    except (TypeError, ValueError):
+        return jsonify({"error": "Size, steps and seed must be numbers."}), 400
 
     def run(task):
         IMAGES_OUT.mkdir(parents=True, exist_ok=True)
@@ -986,7 +1153,7 @@ def api_images_list():
 
 @app.get("/images/<name>")
 def api_image_file(name: str):
-    if "/" in name or "\\" in name or ".." in name:
+    if not plain_name(name):
         return jsonify({"error": "Bad name."}), 400
     return send_from_directory(IMAGES_OUT, name)
 
@@ -994,7 +1161,7 @@ def api_image_file(name: str):
 @app.delete("/api/images")
 def api_image_delete():
     name = ((request.get_json(silent=True) or {}).get("name") or "")
-    if "/" in name or "\\" in name or ".." in name or not name:
+    if not plain_name(name):
         return jsonify({"error": "Bad name."}), 400
     (IMAGES_OUT / name).unlink(missing_ok=True)
     (IMAGES_OUT / (name + ".json")).unlink(missing_ok=True)
@@ -1121,9 +1288,12 @@ def context_extra(query: str, chat_id: str) -> str:
     mem = read_memory().strip()
     if mem:
         parts.append("Things to remember from earlier (persistent memory; "
-                     "the user can edit these):\n" + mem[:MEMORY_INJECT])
+                     "the user can edit these):\n" + memory_excerpt(mem))
     if cfg.get("recall", True):
-        snips = semantic_recall(query, chat_id)
+        try:
+            snips = semantic_recall(query, chat_id)
+        except Exception:  # noqa: BLE001 - recall must never fail a send
+            snips = None
         mode = "meaning"
         if snips is None:
             snips = recall_snippets(query, chat_id)
@@ -1150,8 +1320,12 @@ def api_memory_get():
 
 @app.post("/api/memory")
 def api_memory_set():
-    b = request.get_json(silent=True) or {}
-    write_memory(str(b.get("text") or ""))
+    b = request.get_json(silent=True)
+    # Only an explicit edit replaces the file: a request without a text
+    # field (or without a JSON body at all) must never wipe it.
+    if not isinstance(b, dict) or not isinstance(b.get("text"), str):
+        return jsonify({"error": "Send the memory as {\"text\": ...}."}), 400
+    write_memory(b["text"])
     return jsonify({"ok": True})
 
 
@@ -1167,9 +1341,10 @@ def engines_list() -> list[dict]:
     """One entry per engine family folder that holds a finished model."""
     groups: dict[str, list[dict]] = {}
     for m in engine.local_models():
-        # embedding and image models are helpers, never chat engines
+        # embedding and image models are helpers, and a vision projector
+        # is a companion — never chat engines
         if m["folder"] and m["folder"] not in (EMBED_DIR, IMAGE_DIR) \
-                and not m["partial"]:
+                and not m["partial"] and not m.get("companion"):
             groups.setdefault(m["folder"], []).append(m)
     loaded_name = Path(server.model).name if server.model else ""
     out = []
@@ -1192,24 +1367,86 @@ def model_runtime_args(kv_bits: int) -> list[str]:
     return []
 
 
+CONF_KEYS = ("layers", "kv_layers", "kv_heads", "head_dim", "exact", "hybrid",
+             "moe", "max_ctx", "swa_layers", "sliding_window", "nextn")
+
+
 def saved_model_config(name: str) -> dict | None:
-    """Return a usable persisted architecture, tolerating edited old config."""
-    saved = cfg.get("last_model_config") or {}
+    """A persisted architecture for this file, tolerating edited old config.
+    Kept per model, so an engine switch while offline does not fall back
+    to a guess because some other model was the last one loaded."""
+    saved = (cfg.get("model_configs") or {}).get(name)
+    if not isinstance(saved, dict):
+        legacy = cfg.get("last_model_config") or {}
+        saved = legacy if isinstance(legacy, dict) and \
+            legacy.get("model") == name else None
+    if not saved:
+        return None
     try:
-        if saved.get("model") != name or not all(
-                int(saved.get(key) or 0) > 0
-                for key in ("layers", "kv_heads", "head_dim")):
+        if not all(int(saved.get(key) or 0) > 0
+                   for key in ("layers", "kv_heads", "head_dim")):
             return None
+        return {"layers": int(saved["layers"]),
+                "kv_layers": int(saved.get("kv_layers") or saved["layers"]),
+                "kv_heads": int(saved["kv_heads"]),
+                "head_dim": int(saved["head_dim"]),
+                "exact": bool(saved.get("exact")),
+                "hybrid": bool(saved.get("hybrid")),
+                "moe": bool(saved.get("moe")),
+                "max_ctx": int(saved.get("max_ctx") or 0),
+                "swa_layers": int(saved.get("swa_layers") or 0),
+                "sliding_window": int(saved.get("sliding_window") or 0),
+                "nextn": int(saved.get("nextn") or 0)}
     except (AttributeError, TypeError, ValueError):
         return None
-    return {"layers": int(saved["layers"]),
-            "kv_layers": int(saved.get("kv_layers") or saved["layers"]),
-            "kv_heads": int(saved["kv_heads"]),
-            "head_dim": int(saved["head_dim"]),
-            "exact": bool(saved.get("exact")),
-            "hybrid": bool(saved.get("hybrid")),
-            "moe": bool(saved.get("moe")),
-            "max_ctx": int(saved.get("max_ctx") or 0)}
+
+
+def remember_config(name: str, conf: dict) -> None:
+    """Keep a measured architecture for automatic startup and offline
+    switches. A guess is never kept: saved, it used to outlive the outage
+    that produced it and stand in for the real thing from then on."""
+    if not conf.get("exact"):
+        return
+    with config_lock:
+        keep = {m["name"] for m in engine.local_models()} | {name}
+        store = {k: v for k, v in (cfg.get("model_configs") or {}).items()
+                 if k in keep}
+        store[name] = {k: conf.get(k) for k in CONF_KEYS}
+        cfg["model_configs"] = store
+        cfg["last_model_config"] = {"model": name, **store[name]}
+        save_config(cfg)
+
+
+def local_conf(model: dict, online: bool = True) -> tuple[dict, dict | None]:
+    """The architecture of a file on disk, and the catalogue entry it
+    really is (or None). Best source first: the catalogue model's own
+    config.json — refused when its layer count is not the file's, since
+    then the name matched and the model did not — then what an earlier
+    load saved, then the file's own metadata, then a labelled guess.
+    Whatever the source, the layer count is the file's block count: that
+    is what llama.cpp offloads by, so it is what -ngl must count."""
+    layout = None if model.get("partial") else \
+        fit.gguf_layout(model["path"])
+    blocks = (layout or {}).get("blocks") or 0
+    entry = fit.catalogue_match(model["name"])
+    conf = None
+    if entry and online:
+        found = fit.model_config(cfg, entry.get("config_repo")
+                                 or entry["repo"])
+        if found.get("exact"):
+            if blocks and blocks not in (
+                    found["layers"], found["layers"] + found.get("nextn", 0)):
+                entry = None
+            else:
+                conf = found
+    if conf is None:
+        conf = saved_model_config(model["name"]) or fit.file_config(layout) \
+            or dict(fit.GENERIC_CONF)
+    if blocks and conf["layers"] != blocks:
+        whole = conf.get("kv_layers", conf["layers"]) == conf["layers"]
+        conf = {**conf, "layers": blocks,
+                **({"kv_layers": blocks} if whole else {})}
+    return conf, entry
 
 
 def free_vram_hw(hw: dict) -> dict:
@@ -1259,12 +1496,17 @@ def launch(model: dict, conf: dict, hw: dict, ctx: int, bits: int,
     `auto` says ctx came from Auto: a window picked for the expert
     placement is picked again by the layer rule if that placement fails."""
     def split(ctx: int) -> tuple[dict, int]:
+        # The verdict describes the card; the layers placed on it are
+        # judged on what is free right now, the same basis as Auto context
+        # and the expert placement — past it, CUDA runs out of memory, or
+        # Windows quietly spills into shared memory at a fraction of speed.
         a = fit.assess(model["size"], conf, hw, ctx, bits)
-        requested = a["gpu_layers"] if gpu_layers is None \
-            else int(gpu_layers)
+        room = fit.assess(model["size"], conf, free_vram_hw(hw), ctx,
+                          bits)["gpu_layers"]
+        requested = room if gpu_layers is None else int(gpu_layers)
         # A caller may deliberately offload fewer layers, but never exceed
         # the measured safe fit or the model's real layer count.
-        return a, max(0, min(requested, a["gpu_layers"], a["layers"]))
+        return a, max(0, min(requested, room, a["layers"]))
 
     a, gl = split(ctx)
     plan = None
@@ -1317,12 +1559,13 @@ def loaded_sampling() -> dict:
     return {k: v for k, v in saved.items() if k != "model"}
 
 
-def remember_sampling(name: str) -> dict:
+def remember_sampling(name: str, entry: dict | None = None) -> dict:
     """Read a model's sampling from its repo and keep it beside its
     architecture, so an automatic start needs no network to use it. When the
     repo cannot be reached, what was saved for this model stands, and a model
-    with nothing saved is left unrecorded so the next start asks again."""
-    entry = fit.catalogue_match(name)
+    with nothing saved is left unrecorded so the next start asks again.
+    `entry` is the catalogue model the file really is (local_conf decides);
+    a file that matches none samples with the sliders."""
     repo = (entry or {}).get("config_repo") or (entry or {}).get("repo", "")
     profile = fit.model_sampling(cfg, repo) if repo else {}
     with config_lock:
@@ -1366,13 +1609,14 @@ def load_model_by_name(name: str, ctx: int | None = None,
             raise RuntimeError("That model is not on disk.")
         if model["partial"]:
             raise RuntimeError("That download has not finished.")
+        if model.get("companion"):
+            raise RuntimeError("That is a vision projector (mmproj), a "
+                               "companion to a model — not a model to load "
+                               "on its own.")
         chosen = int(ctx or 0)
         if chosen and not 512 <= chosen <= 262_144:
             raise RuntimeError("Context must be between 512 and 262144.")
-        entry = fit.catalogue_match(name)
-        conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
-            if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
-                           "head_dim": 128, "exact": False, "max_ctx": 0}
+        conf, entry = local_conf(model)
         # The model being replaced goes before the card is measured, so the
         # free VRAM Auto sees is what the new one really has.
         server.stop()
@@ -1385,24 +1629,19 @@ def load_model_by_name(name: str, ctx: int | None = None,
                           fit.gguf_layout(model["path"]))
         placed = launch(model, conf, hw, ctx, bits, gpu_layers, auto)
         ctx = placed["ctx"]
+        # Preserve the measured architecture so automatic startup uses
+        # the same layer/KV calculation instead of a generic 32-layer
+        # fallback (Qwen3 8B has 36 layers).
+        remember_config(name, conf)
         with config_lock:
             cfg["last_model"] = name
-            # Preserve the measured architecture so automatic startup uses
-            # the same layer/KV calculation instead of a generic 32-layer
-            # fallback (Qwen3 8B has 36 layers).
-            cfg["last_model_config"] = {
-                "model": name,
-                **{key: conf.get(key) for key in
-                   ("layers", "kv_layers", "kv_heads", "head_dim", "exact",
-                    "hybrid", "moe", "max_ctx")},
-            }
             # A size the caller named becomes the setting; Auto stays Auto
             # and only the window it resolved to is recorded.
             if chosen:
                 cfg["ctx"] = ctx
             cfg["last_ctx"] = ctx
             save_config(cfg)
-        remember_sampling(name)
+        remember_sampling(name, entry)
         return {"model": name, **placed, "auto_ctx": auto,
                 "sampling": loaded_sampling()}
 
@@ -1418,15 +1657,31 @@ def pick_quant(files: list[dict], conf: dict, hw: dict, ctx: int,
         return None
     scored = [(f, fit.assess(f["size"], conf, hw, ctx, kv_bits))
               for f in cand]
+    return choose_quant(scored, hw)
+
+
+def choose_quant(scored: list[tuple[dict, dict]], hw: dict) -> dict | None:
+    """Q4_K_M when it runs here, else the largest file that fits VRAM, else
+    the largest that fits RAM, else the smallest. Largest by bytes, not by
+    list position: the list is ordered by a quant table that unknown quants
+    (IQ2_M, Q5_0) fall to the end of, and the Models page used to call the
+    smallest fitting file "best here"."""
+    scored = [(f, a) for f, a in scored
+              if not f.get("split") and not f.get("companion")
+              and f.get("size")]
+    if not scored:
+        return None
     q4 = next(((f, a) for f, a in scored if f["quant"] == "Q4_K_M"), None)
     if q4 and (q4[1]["verdict"] == "fits" or
                (not hw.get("vram") and q4[1]["fits_ram"])):
         return q4[0]
     fits = [f for f, a in scored if a["verdict"] == "fits"]
     if fits:
-        return fits[-1]
+        return max(fits, key=lambda f: f["size"])
     ram_ok = [f for f, a in scored if a["fits_ram"]]
-    return ram_ok[-1] if ram_ok else cand[0]
+    if ram_ok:
+        return max(ram_ok, key=lambda f: f["size"])
+    return min((f for f, _ in scored), key=lambda f: f["size"])
 
 
 @app.post("/api/engine/switch")
@@ -1553,8 +1808,11 @@ def api_fit():
     for f in files:
         a = assess_at(f["size"], conf, hw, ctx)
         out.append({**f, "fit": a, "why": fit.verdict_text(a, hw)})
-    best = next((f for f in out if f["fit"]["verdict"] == "fits"
-                 and not f["split"] and not f.get("companion")), None)
+    # The same choice first-run setup makes — shown only when it runs here.
+    best = choose_quant([(f, f["fit"]) for f in out], hw)
+    if best and not (best["fit"]["verdict"] == "fits" or (
+            not hw.get("vram") and best["fit"]["fits_ram"])):
+        best = None
     return jsonify({"repo": repo, "ctx": ctx, "hardware": hw, "config": conf,
                     "files": out, "recommended": best["name"] if best else ""})
 
@@ -1568,14 +1826,20 @@ def api_fit_local():
     for m in engine.local_models():
         if m.get("folder") in (EMBED_DIR, IMAGE_DIR):
             continue
-        entry = fit.catalogue_match(m["name"])
-        conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
-            if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
-                           "exact": False}
+        if m.get("companion"):
+            # listed so it can be deleted, never judged or offered to load
+            out.append({**m, "fit": None, "why": COMPANION_WHY})
+            continue
+        conf, _ = local_conf(m)
         a = assess_at(m["size"], conf, hw, ctx,
                       "" if m["partial"] else m["path"])
         out.append({**m, "fit": a, "why": fit.verdict_text(a, hw)})
     return jsonify({"models": out, "hardware": hw, "ctx": ctx})
+
+
+COMPANION_WHY = ("Vision projector (mmproj) — a companion to a model, not a "
+                 "model. The chat page does not send images yet, so it is "
+                 "not loaded.")
 
 
 def fit_ctx_arg() -> int:
@@ -1619,8 +1883,11 @@ def assess_at(size: int, conf: dict, hw: dict, ctx: int,
 @app.post("/api/engine/install")
 def api_engine_install():
     try:
-        return jsonify({"ok": True,
-                        "task": engine.install(fit.hardware({})).view()})
+        # The chat server and the recall embedder run from the build being
+        # replaced; Windows will not swap files a running process holds.
+        return jsonify({"ok": True, "task": engine.install(
+            fit.hardware({}),
+            before_swap=lambda: (server.stop(), embedder.stop())).view()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -1782,9 +2049,15 @@ def ws_resolve(rel: str) -> Path:
     root = workspace_root()
     if not root:
         raise RuntimeError("No folder is open.")
+    # Refused before anything touches the disk: resolving a UNC path like
+    # \\host\share on Windows already opens a network connection.
+    if PureWindowsPath(rel).anchor or PurePosixPath(rel).is_absolute():
+        raise RuntimeError("That path is outside the open folder.")
     target = (root / rel).resolve()
     root = root.resolve()
-    if target != root and not str(target).startswith(str(root) + os.sep):
+    # is_relative_to rather than a string prefix: a drive root (C:\) as
+    # the open folder would otherwise refuse every file in it.
+    if not target.is_relative_to(root):
         raise RuntimeError("That path is outside the open folder.")
     return target
 
@@ -1860,18 +2133,54 @@ def api_workspace_write():
     try:
         target = ws_resolve(b.get("path") or "")
         content = b.get("content")
-        if content is None:
+        if not isinstance(content, str):
             raise RuntimeError("Nothing to write.")
-        backup = ""
+        # .git holds hooks git itself executes: a model-written file there
+        # would run on the person's next commit. The tree never shows it.
+        if any(part.lower() == ".git" for part in
+               target.relative_to(workspace_root().resolve()).parts):
+            raise RuntimeError("Files inside .git are not written.")
+        backup, old = "", b""
         if target.exists():
+            old = target.read_bytes()
             bak = target.with_name(target.name + ".bak")
-            bak.write_bytes(target.read_bytes())
+            # Run & fix rewrites a file round after round; its first .bak is
+            # the person's own version, which later rounds must not replace.
+            if not (b.get("keep_backup") and bak.exists()):
+                # A .bak that is a link would carry the old contents to
+                # wherever it points: replace the link, never write through.
+                if bak.is_symlink():
+                    bak.unlink()
+                bak.write_bytes(old)
             backup = bak.name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        # The file keeps its own line endings: text mode on Windows would
+        # turn every LF file (shell scripts, most repos) into CRLF.
+        text = content.replace("\r\n", "\n")
+        if b"\r\n" in old:
+            text = text.replace("\n", "\r\n")
+        with open(target, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
         return jsonify({"ok": True, "path": b.get("path"), "backup": backup})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
+
+
+RUN_TIMEOUT = 60
+RUN_TAIL = 8000
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """The command and everything it started: killing only the shell leaves
+    a dev server or test runner behind, still holding the port."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+        proc.kill()
 
 
 @app.post("/api/workspace/run")
@@ -1882,24 +2191,43 @@ def api_workspace_run():
     root = workspace_root()
     if not root:
         return jsonify({"error": "No folder is open."}), 400
-    b = request.get_json(silent=True) or {}
-    cmd = (b.get("command") or cfg.get("run_command") or "").strip()
+    b = request.get_json(silent=True)
+    # Named in the request every time, never taken from the saved setting:
+    # a request that carries no command runs nothing.
+    cmd = ((b or {}).get("command") or "").strip() \
+        if isinstance(b, dict) else ""
     if not cmd:
-        return jsonify({"error": "No run command set."}), 400
+        return jsonify({"error": "No run command given."}), 400
     cfg["run_command"] = cmd
     save_config(cfg)
     started = time.time()
+    # Output goes to a file, not memory: a runaway print loop cannot fill
+    # RAM, and a child that keeps the pipe open cannot hang the request.
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+             if os.name == "nt" else {"start_new_session": True})
     try:
-        p = subprocess.run(cmd, shell=True, cwd=str(root),
-                           capture_output=True, text=True, timeout=60)
-        out = ((p.stdout or "") + (p.stderr or "")).strip()
-        return jsonify({"ok": True, "exit": p.returncode,
-                        "output": out[-8000:],
+        with tempfile.TemporaryFile() as out:
+            proc = subprocess.Popen(cmd, shell=True, cwd=str(root),
+                                    stdout=out, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, **group)
+            try:
+                code = proc.wait(RUN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    pass
+                code = -1
+            size = out.seek(0, os.SEEK_END)
+            out.seek(max(0, size - RUN_TAIL * 4))
+            text = out.read().decode("utf-8", errors="replace")
+        text = text.strip()[-RUN_TAIL:]
+        if code == -1:
+            text = (text + f"\n\nTimed out after {RUN_TIMEOUT} seconds — "
+                    "stopped, with everything it started.").strip()
+        return jsonify({"ok": True, "exit": code, "output": text,
                         "seconds": round(time.time() - started, 1)})
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": True, "exit": -1,
-                        "output": "Timed out after 60 seconds.",
-                        "seconds": 60.0})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -1922,7 +2250,18 @@ def api_chat(chat_id: str):
 
 @app.delete("/api/chats/<chat_id>")
 def api_chat_delete(chat_id: str):
-    write_chats([c for c in read_chats() if c["id"] != chat_id])
+    # One lock across the read and the write, so a reply being saved at
+    # the same moment is not lost to this rewrite (or this to it).
+    with chats_lock:
+        write_chats([c for c in read_chats() if c["id"] != chat_id])
+    # Its exchanges leave the recall index now, not at the next indexing.
+    with _emb_lock:
+        idx = emb_index()
+        gone = [k for k, e in idx.items() if e.get("chat") == chat_id]
+        for k in gone:
+            del idx[k]
+    if gone:
+        emb_save()
     return jsonify({"ok": True})
 
 
@@ -1953,7 +2292,31 @@ ANSWER_NUDGE = (
 NO_THINK = {"enable_thinking": False}
 
 
-def budget(system_text: str, history: list[dict], want: int) -> dict:
+def as_history(messages: list[dict]) -> list[dict]:
+    """The stored conversation as the model is shown it: the answers' text
+    only — reasoning never goes back — with the roles strictly alternating.
+    A turn that failed leaves a question with no answer after it, and chat
+    templates such as Gemma's and Mistral's refuse two user turns in a row
+    ("roles must alternate"), which would break every later message in that
+    chat. So a run of same-role turns is joined into one."""
+    out: list[dict] = []
+    for m in messages:
+        role, text = m.get("role"), m.get("content") or ""
+        if role not in ("user", "assistant"):
+            continue
+        if out and out[-1]["role"] == role:
+            if text:
+                joined = out[-1]["content"]
+                out[-1] = {"role": role,
+                           "content": joined + "\n\n" + text if joined
+                           else text}
+            continue
+        out.append({"role": role, "content": text})
+    return out
+
+
+def budget(system_text: str, history: list[dict], want,
+           keep: int = 1) -> dict:
     """Fit prompt and reply inside the context window the server really has.
 
     Handed more prompt than it can hold, llama.cpp either refuses the request
@@ -1962,41 +2325,139 @@ def budget(system_text: str, history: list[dict], want: int) -> dict:
     app forgetting the conversation mid-answer. So the trimming happens here
     instead: deliberate, counted with the model's own tokenizer, and
     reported back to the page.
+
+    `keep` is how many of the newest messages must survive: the question,
+    and on a continuation also the partial reply and the nudge after it.
+    Dropping those handed the model a bare "carry on" with nothing to carry
+    on from. When even they do not fit — an answer that filled the window
+    — the partial reply is cut to its ending, which is all the model needs
+    to pick up where it stopped, leaving it a quarter of the window.
     """
     n_ctx = server.n_ctx() or int(cfg.get("ctx") or 8192)
-    want = max(0, int(want or 0))
-    msgs = list(history)
+    try:
+        want = max(0, int(want or 0))
+    except (TypeError, ValueError):
+        want = 0
+    msgs = [dict(m) for m in history]
     sys_t = server.count_tokens(system_text)
     fixed = sys_t + CTX_MARGIN + PER_MSG
+    limit = n_ctx - REPLY_FLOOR
     prompt = fixed + server.count_tokens(
         "\n".join(m["content"] for m in msgs)) + PER_MSG * len(msgs)
-    dropped = 0
-    if prompt > n_ctx - REPLY_FLOOR and len(msgs) > 1:
+    dropped, tail_only = 0, False
+    if prompt > limit and msgs:
         # Only the path that needs per-message counts pays for them.
         counts = [server.count_tokens(m["content"]) + PER_MSG for m in msgs]
-        # The newest turn is never dropped — it is the question being asked.
-        while len(msgs) > 1 and fixed + sum(counts) > n_ctx - REPLY_FLOOR:
+        while len(msgs) > keep and fixed + sum(counts) > limit:
             msgs.pop(0)
             counts.pop(0)
             dropped += 1
+        # A window that now opens on an answer has lost its question, and
+        # the strict templates refuse to start on one.
+        while len(msgs) > keep and msgs[0]["role"] != "user":
+            msgs.pop(0)
+            counts.pop(0)
+            dropped += 1
+        if keep >= 3 and fixed + sum(counts) > limit:
+            goal = n_ctx - max(REPLY_FLOOR, n_ctx // 4)
+            i = len(msgs) - 2
+            text = msgs[i]["content"]
+            for _ in range(4):
+                over = fixed + sum(counts) - goal
+                own = counts[i] - PER_MSG
+                if over <= 0 or not text or own <= 0:
+                    break
+                chars = int(len(text) * max(0, own - over) / own * 0.9)
+                text = text[len(text) - chars:] if chars > 0 else ""
+                msgs[i]["content"] = "…" + text
+                counts[i] = server.count_tokens(msgs[i]["content"]) + PER_MSG
+                tail_only = True
         prompt = fixed + sum(counts)
     free = n_ctx - prompt
     cap = min(want, free) if want else free
     return {"history": msgs, "max_tokens": max(16, cap), "dropped": dropped,
             "n_ctx": n_ctx, "prompt_tokens": prompt, "free": free,
-            "capped": bool(want and want < free), "overflow": free < 64}
+            "capped": bool(want and want < free), "overflow": free < 64,
+            "tail_only": tail_only}
+
+
+# A line that opens or closes a code block. Three backticks mentioned in a
+# sentence are not one.
+FENCE_LINE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})", re.M)
 
 
 def looks_unfinished(text: str, reason: str) -> bool:
-    """Whether a reply stopped short of a whole answer. A token limit says so
-    outright; an odd number of code fences says it just as plainly, since a
-    block that was opened and never closed is a file that got cut in half."""
-    if reason == "length":
+    """Whether a reply stopped short of a whole answer. A token limit or a
+    failure says so outright; an odd number of fence lines says it just as
+    plainly, since a block that was opened and never closed is a file that
+    got cut in half."""
+    if reason in ("length", "error"):
         return True
     body = text.rstrip()
     if not body:
         return False
-    return body.count("```") % 2 == 1
+    return len(FENCE_LINE.findall(body)) % 2 == 1
+
+
+def merge_reply(chat_id: str, anchor, resume: bool, reply: str,
+                thought: str, stop: str, finished: bool, elapsed: float,
+                tps: float, error: str) -> None:
+    """Write a reply into the conversation as it is on disk now, not as it
+    was when the request began. Another reply may have landed meanwhile —
+    a second tab, a Send straight after Stop — and writing the old copy
+    back erased it; a chat deleted mid-reply was brought back to life.
+    The reply goes right after the question it answers (a continuation:
+    onto the message it continues), found by its timestamp."""
+    with chats_lock:
+        items = read_chats()
+        cur = next((c for c in items if c.get("id") == chat_id), None)
+        if cur is None:
+            return                      # deleted while it was streaming
+        msgs = cur.setdefault("messages", [])
+        if resume:
+            last = next((m for m in reversed(msgs)
+                         if m.get("role") == "assistant"
+                         and m.get("at") == anchor), None)
+            if last is None or not (reply or thought or finished):
+                return                  # stopped before a word: unchanged
+            # The continuation belongs to the message it continues, not
+            # beside it: one whole answer, not two halves.
+            last["content"] = (last.get("content") or "") + reply
+            if thought:
+                last["reasoning"] = (last.get("reasoning") or "") + thought
+            last["seconds"] = round(
+                float(last.get("seconds") or 0) + elapsed, 1)
+            last["tps"] = tps
+            last["stop"] = stop
+            last["stopped"] = not finished
+            last["unfinished"] = looks_unfinished(last["content"], stop)
+            last["continued"] = int(last.get("continued") or 0) + 1
+            if error:
+                last["error"] = error
+            else:
+                last.pop("error", None)
+        else:
+            if not (reply or thought.strip() or error):
+                return
+            i = next((k for k, m in enumerate(msgs)
+                      if m.get("role") == "user" and m.get("at") == anchor),
+                     None)
+            if i is None:
+                return
+            msg = {"role": "assistant", "content": reply, "at": time.time(),
+                   "tps": tps, "seconds": round(elapsed, 1),
+                   "stopped": not finished, "stop": stop,
+                   "unfinished": looks_unfinished(reply, stop)}
+            if thought:
+                msg["reasoning"] = thought
+            if error:
+                # A failed turn is stored as one, so the page says why and
+                # the question keeps an answer after it.
+                msg["error"] = error
+            msgs.insert(i + 1, msg)
+        cur["model"] = Path(server.model).name if server.model \
+            else cur.get("model")
+        write_chats(items)
 
 
 @app.post("/api/chat")
@@ -2025,8 +2486,7 @@ def api_chat_send():
                 written or (last.get("reasoning") or "").strip()):
             return jsonify({"error": "There is no cut-off reply to "
                                      "continue."}), 400
-        history = [{"role": m["role"], "content": m["content"]}
-                   for m in chat["messages"]]
+        history = as_history(chat["messages"])
         history.append({"role": "user",
                         "content": CONTINUE_NUDGE if written
                         else ANSWER_NUDGE})
@@ -2035,7 +2495,8 @@ def api_chat_send():
         # What is already written. Whether the answer is whole has to be
         # judged on the two halves joined — the closing fence arriving on
         # its own in the last round is a finished reply, not a new stump.
-        prior = chat["messages"][-1]["content"]
+        prior = last.get("content") or ""
+        anchor = last.get("at")
     else:
         if not chat:
             chat = {"id": uuid.uuid4().hex[:12],
@@ -2047,20 +2508,27 @@ def api_chat_send():
                     "mode": "code" if b.get("mode") == "code" else "chat",
                     "messages": []}
         prior = ""
+        anchor = time.time()
         chat["messages"].append({"role": "user", "content": text,
-                                 "at": time.time()})
+                                 "at": anchor})
+        # A system prompt sent with the question belongs to the conversation
+        # (the Code page's conventions), so a continuation — which sends
+        # none — is written under the same rules.
+        if isinstance(b.get("system"), str):
+            chat["system"] = b["system"]
         # Stored before a single token comes back: if the person presses Stop
         # or closes the tab mid-reply, their own message is not lost with it.
         put_chat(chat)
-        history = [{"role": m["role"], "content": m["content"]}
-                   for m in chat["messages"]]
+        history = as_history(chat["messages"])
         query = text
 
-    system_text = ((b.get("system", cfg.get("system")) or "") +
-                   context_extra(query, chat["id"]) +
+    base = b["system"] if isinstance(b.get("system"), str) \
+        else chat.get("system", cfg.get("system"))
+    system_text = ((base or "") + context_extra(query, chat["id"]) +
                    doc_howto(history)).strip()
     plan = budget(system_text, history,
-                  b.get("max_tokens", cfg.get("max_tokens")))
+                  b.get("max_tokens", cfg.get("max_tokens")),
+                  keep=3 if resume else 1)
     params = {**sampling_params(b),
               "max_tokens": plan["max_tokens"], "system": system_text}
     if resume:
@@ -2071,8 +2539,9 @@ def api_chat_send():
         pieces: list[str] = []
         thoughts: list[str] = []
         finished = False
-        reason = ""
+        reason, error = "", ""
         timings: dict = {}
+        remembered = None
 
         def rate(chars: int, seconds: float) -> float:
             # llama.cpp's own count of generated tokens per second when it
@@ -2088,13 +2557,13 @@ def api_chat_send():
                          "prompt": plan["prompt_tokens"],
                          "reply_room": plan["max_tokens"],
                          "dropped": plan["dropped"],
+                         "tail_only": plan["tail_only"],
                          "capped": plan["capped"]}}) + "\n\n"
             if plan["overflow"]:
-                yield "data: " + json.dumps(
-                    {"error": "This conversation no longer fits in the "
-                              "context window, even after trimming. Raise "
-                              "the context size or start a new chat."}) \
-                    + "\n\n"
+                error = ("This conversation no longer fits in the context "
+                         "window, even after trimming. Raise the context "
+                         "size or start a new chat.")
+                yield "data: " + json.dumps({"error": error}) + "\n\n"
             else:
                 try:
                     for ev in server.chat_stream(plan["history"], params):
@@ -2110,67 +2579,53 @@ def api_chat_send():
                             reason = ev["stop"]
                             timings.update(ev.get("timings") or {})
                 except Exception as exc:  # noqa: BLE001
-                    yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+                    # A reply cut off by a failure is not a finished one.
+                    error = str(exc)
+                    yield "data: " + json.dumps({"error": error}) + "\n\n"
+            if error:
+                reason = "error"
             finished = True
             elapsed = max(time.time() - started, 0.001)
             reply = "".join(pieces)
             thought = "".join(thoughts)
+            try:
+                remembered = remember_lines(reply)
+            except OSError:
+                remembered = []   # a memory file that cannot be written
+                #                   must not cost the reply its done event
             yield "data: " + json.dumps(
                 {"done": True,
                  "tps": rate(len(reply) + len(thought), elapsed),
                  "seconds": round(elapsed, 1),
-                 "stop": reason,
+                 "stop": reason, "error": error,
                  # all of the room went on thinking and none on the answer
                  "thought_only": bool(thought.strip() and not reply.strip()),
+                 # what joined the permanent memory, so the page can say so
+                 "remembered": remembered,
                  "unfinished": looks_unfinished(prior + reply,
                                                 reason)}) + "\n\n"
         finally:
             # Runs on a clean finish AND on GeneratorExit when the client goes
             # away, so a half-written reply is kept rather than thrown out.
-            reply = "".join(pieces)
-            thought = "".join(thoughts)
             # Reasoning is kept for the reader but never sent back to the
             # model: history is built from content alone, as the thinking
             # models ask. A reply that is only reasoning is still stored, so
             # it can be carried on into an answer.
-            if reply or thought.strip():
-                elapsed = max(time.time() - started, 0.001)
-                stop = reason if finished else "aborted"
-                if resume:
-                    # The continuation belongs to the message it continues,
-                    # not beside it: one whole answer, not two halves.
-                    last = chat["messages"][-1]
-                    last["content"] = last["content"] + reply
-                    if thought:
-                        last["reasoning"] = (last.get("reasoning") or "") + \
-                            thought
-                    last["seconds"] = round(
-                        float(last.get("seconds") or 0) + elapsed, 1)
-                    last["tps"] = rate(len(last["content"]) + len(
-                        last.get("reasoning") or ""),
-                        float(last["seconds"]))
-                    last["stop"] = stop
-                    last["stopped"] = not finished
-                    last["unfinished"] = looks_unfinished(
-                        last["content"], stop)
-                    last["continued"] = int(last.get("continued") or 0) + 1
-                else:
-                    msg = {"role": "assistant", "content": reply,
-                           "at": time.time(),
-                           "tps": rate(len(reply) + len(thought), elapsed),
-                           "seconds": round(elapsed, 1),
-                           "stopped": not finished, "stop": stop,
-                           "unfinished": looks_unfinished(reply, stop)}
-                    if thought:
-                        msg["reasoning"] = thought
-                    chat["messages"].append(msg)
-                chat["model"] = Path(server.model).name if server.model \
-                    else chat.get("model")
-                put_chat(chat)
+            reply = "".join(pieces)
+            thought = "".join(thoughts)
+            elapsed = max(time.time() - started, 0.001)
+            merge_reply(chat["id"], anchor, resume, reply, thought,
+                        reason if finished else "aborted", finished, elapsed,
+                        rate(len(reply) + len(thought), elapsed), error)
+            if reply:
                 # Any `remember:` lines in the reply become permanent
                 # memory for every future conversation, and the fresh
                 # exchange joins the semantic index in the background.
-                remember_lines(reply)
+                if remembered is None:
+                    try:
+                        remember_lines(reply)
+                    except OSError:
+                        pass
                 threading.Thread(target=index_exchanges,
                                  daemon=True).start()
 
@@ -2186,10 +2641,7 @@ def autostart(model: dict) -> None:
     with engine_lock:
         # Planning mode must never affect what is launched on this PC.
         hw = fit.hardware({})
-        conf = saved_model_config(model["name"]) or {
-            "layers": 32, "kv_layers": 32, "kv_heads": 8,
-            "head_dim": 128, "exact": False, "max_ctx": 0,
-        }
+        conf, _ = local_conf(model, online=False)
         bits = int(cfg.get("kv_bits", 8))
         try:
             ctx = resolve_ctx(model["size"], conf, hw, bits, None,
@@ -2223,8 +2675,10 @@ def main() -> None:
             # off the startup path.
             if (cfg.get("last_model_sampling") or {}).get("model") != \
                     model["name"]:
-                threading.Thread(target=remember_sampling,
-                                 args=(model["name"],), daemon=True).start()
+                threading.Thread(
+                    target=lambda: remember_sampling(
+                        model["name"], local_conf(model)[1]),
+                    daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Llama Studio  →  {url}\n")
     if os.environ.get("LLAMA_STUDIO_NO_BROWSER") != "1":

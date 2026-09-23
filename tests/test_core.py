@@ -121,9 +121,13 @@ class EngineProfileTests(unittest.TestCase):
             self.assertEqual(start.call_args.args[3], [
                 "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
             ])
-            self.assertEqual(server.cfg["last_model_config"]["model"],
-                             "custom.gguf")
-            self.assertEqual(server.cfg["last_model_config"]["layers"], 32)
+            # An unknown file's 32-layer architecture is a guess, and a
+            # saved guess would outlive the reason for it: never persisted.
+            self.assertNotIn("custom.gguf",
+                             server.cfg.get("model_configs") or {})
+            self.assertNotEqual(
+                (server.cfg.get("last_model_config") or {}).get("model"),
+                "custom.gguf")
         finally:
             server.cfg.clear()
             server.cfg.update(old)

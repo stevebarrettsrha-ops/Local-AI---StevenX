@@ -81,6 +81,47 @@
 21. **`-ngl` is the layer count plus one when every layer fits**
    (`ngl_flag`): llama.cpp counts the output head as a layer past the last
    block, so exactly the layer count leaves it on the CPU.
+22. **Only this machine's own page drives the API** (`same_machine_only`):
+   the Host must be loopback, and a non-GET request carrying an `Origin`
+   must come from the app's origin. Binding to 127.0.0.1 alone does not stop
+   DNS rebinding or cross-site posts. `/api/workspace/run` runs only the
+   command named in the request body, never the saved one.
+23. **Preview runs model HTML in a sandboxed iframe** without
+   `allow-same-origin`, inside a wrapper page that runs no script, and it is
+   opened `noopener`. Never open model output as a same-origin page: it
+   could call every endpoint.
+24. **Workspace writes:** `ws_resolve` refuses absolute, drive and UNC paths
+   before touching the disk. Nothing is written inside `.git`. A `.bak` is
+   never written through a link. Each file keeps its own line endings.
+   Run & fix passes `keep_backup` after round one, and never applies a
+   reply that was stopped, failed or unfinished. An unclosed code block is
+   never offered for Apply (`splitFences` marks it `open`).
+25. **A reply is merged into the chat as it is on disk** (`merge_reply`, after
+   its question by timestamp), never by writing back the copy read when the
+   request began. History sent to the model alternates roles (`as_history`).
+   A continuation always keeps the question, the partial reply and the nudge
+   (`budget(keep=3)`), trimming the partial reply to its tail if it must.
+   An error mid-reply is `stop: "error"`, unfinished, with the message
+   stored.
+26. **The llama-server stream is decoded as UTF-8** (`r.encoding`): it is sent
+   as bare `text/event-stream`, which requests reads as Latin-1. `error`
+   events in the stream raise.
+27. **The GGUF file is the authority on the layer count** (`local_conf`). A
+   catalogue config whose layers disagree with the file is refused, along
+   with that entry's sampling. `catalogue_match` needs every name word as a
+   whole word and no conflicting size. Only exact configs are persisted, per
+   model (`model_configs`).
+28. **KV cache:** q8_0 is 34 bytes per 32 values; latent attention (MLA) caches
+   `kv_lora_rank + qk_rope_head_dim`; sliding-window layers hold only their
+   window. Only linear/SSM layer types count as "hybrid".
+29. **Builds are chosen by OS, CPU architecture and GPU vendor**, with exact
+   flavour patterns (`_build`), from .zip or .tar.gz. An install is staged
+   and swapped in whole, stopping the servers only for the swap. Downloads
+   resume with `If-Range`, must end at the announced size, and have one
+   writer per `.part`.
+30. **A llama-server we did not start is never used:** `ready()` requires our
+   process alive, `start()` refuses a taken port with a named reason, and on
+   Windows the children die with the app (job object).
 
 ## Validation gate
 

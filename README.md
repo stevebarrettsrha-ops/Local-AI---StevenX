@@ -10,12 +10,11 @@ takes the longest window — 8k, 16k or 32k — that keeps every layer the model
 had on the GPU, judged against the VRAM that is actually free when it loads
 (the desktop and the browser use some) and never past the window the model
 was trained on. On an RTX 4060 8 GB / 32 GB RAM machine that gives Qwen3 8B
-Q4_K_M 16k, fully GPU-resident, where it used to get 8k; 32k needs the card
-otherwise idle. A model that already spills to RAM stays at 8k rather than
-being pushed further off the card (mixture-of-experts models work
-differently; see below). Pick a size by hand under Parameters to
-override it. Select 16-bit
-KV under Parameters only when maximum cache precision matters more than VRAM.
+Q4_K_M 16k, fully GPU-resident, where it used to get 8k. 32k of cache
+(2.4 GiB at q8) does not fit beside its weights on 8 GB. A model that already
+spills to RAM stays at 8k rather than being pushed further off the card
+(mixture-of-experts models work differently; see below). Pick a size by hand
+under Parameters to override it. Select 16-bit KV under Parameters only when maximum cache precision matters more than VRAM.
 The selected cache precision is passed directly to `llama-server` for both
 manual loads and automatic startup; fit calculations and runtime flags therefore
 describe the same memory profile. The measured model architecture is persisted
@@ -64,7 +63,10 @@ Loading a model always uses the real hardware.
 ## Running a model
 
 1. **Engine → Install or update** fetches an official llama.cpp release build
-   matching your GPU (CUDA, HIP, Metal or CPU). No compiler.
+   matching your GPU (CUDA, Vulkan, Metal or CPU) and your processor (x64 or
+   ARM). No compiler. An update is unpacked beside the old build and swapped
+   in whole once it has downloaded; the running model is stopped only for
+   the swap.
 2. **Models** lists models worth running here. Open one, read the fit column,
    download the quant you want — resumable, with progress.
 3. **Load** starts `llama-server` with `-ngl` set from the fit calculation, so
@@ -142,6 +144,14 @@ Tokens per second is now llama.cpp's own measurement, and it counts the
 reasoning. It used to estimate from the visible answer over the whole wall
 clock, which made a thinking model look several times slower than it was.
 
+**Replies arrive as the model wrote them.** llama-server sends its stream
+without naming a character set, and the HTTP library the app uses reads such
+text as Latin-1. So every dash, curly quote, arrow, accented letter and emoji
+in a reply arrived garbled ("—" came out as "â" and two invisible control
+characters), and was sent back to the model that way in the next turn's
+history. The stream is now read as the UTF-8 it
+is.
+
 ### Replies that finish
 
 A long answer — a whole program, a full set of lyrics — used to stop in the
@@ -216,9 +226,10 @@ Two details that model family exposes, both handled:
   attention, and only the full-attention layers keep a KV cache. Counting all 64
   layers would overstate the cache four-fold and wrongly condemn quants that
   actually fit.
-- **mmproj files.** The vision projector in a GGUF repo is not a model; it is
-  loaded beside one with `--mmproj`. It is listed as a companion rather than as
-  a candidate.
+- **mmproj files.** The vision projector in a GGUF repo is not a model; it
+  would be loaded beside one with `--mmproj`. It is listed as a companion rather
+  than as a candidate, never judged, offered to load, or counted as an engine.
+  The chat page does not send images yet, so the app does not load it.
 
 Repos in FP8, NVFP4, INT8 or MLX are for vLLM, TensorRT and Apple MLX — llama.cpp
 loads GGUF only. Both builds of that family are in the catalogue: the FP8 one is
@@ -291,8 +302,10 @@ fenced block tagged `path=<relative path>`, so each block gets an
 **Apply to file** button and a multi-file reply gets **Apply all files**,
 which writes every changed file back to disk in one go. Every apply keeps
 the previous version beside the file as `.bak`, so nothing is ever
-silently lost. Reads are capped at 300 KB per file and writes can only
-land inside the opened folder. For this whole-project mode the Qwen3
+silently lost, and keeps each file's own line endings. Reads are capped at
+300 KB per file. Writes can only land inside the opened folder, never inside
+`.git` (whose hooks git runs), and a block the model had not finished is
+never offered for writing. For this whole-project mode the Qwen3
 Coder 30B A3B entry in the catalogue is the model to reach for.
 
 ### Run &amp; fix
@@ -304,8 +317,13 @@ autonomous loop: run; on a non-zero exit, send the error output and the
 current files to the model, apply the corrected files it returns (each
 with a `.bak` of the previous version), and run again — up to three
 rounds, stopping the moment the command passes, the model returns no
-file changes, or the rounds run out. The command is always the one you
-typed; model output never chooses what gets executed.
+file changes, or the rounds run out. It also stops, applying nothing, when
+you press Stop or a reply fails or is cut off, since half a file written
+over a working one is worse than no fix. The `.bak` beside each file
+keeps your own version across all the rounds. The command is always the
+one you typed. The model chooses no command, only the files the command
+runs, so open projects you trust. A command still running after 60 seconds
+is stopped along with everything it started (a dev server, a test runner).
 
 ## Documents and files
 
@@ -314,7 +332,10 @@ the browser — nothing is uploaded anywhere:
 
 - every code block has **Copy**, **Save** (named with the right extension —
   .html, .py, .js, .md and so on) and, for HTML and SVG, **Preview**, which
-  opens the generated page rendered in a new tab;
+  opens the generated page rendered in a new tab. The page runs in a
+  sandboxed frame with an origin of its own, so its scripts work but cannot
+  reach this app: model output can be steered by a web page or a file it
+  was shown, and a preview must not be able to write files or run commands;
 - every reply has **Copy reply**, **Save .md** (the raw text) and
   **Save .html** (the reply wrapped as a clean, printable standalone
   document).
@@ -381,9 +402,23 @@ Port: `LLAMA_STUDIO_PORT`. `LLAMA_STUDIO_NO_BROWSER=1` stops it opening a tab.
 
 ### Production checks
 
-The desktop service binds only to loopback. It validates persisted generation
-settings, caps request bodies, writes configuration and chats atomically, and
-adds browser hardening/no-cache headers to API responses. Run the regression
+The desktop service binds only to loopback, and that alone is not enough: a
+web page you visit can post to a local port, or rebind its own domain to
+127.0.0.1. So every API request must name this machine as its host, and any
+request that changes something and carries an `Origin` must come from the
+app's own page. Otherwise it is refused before it reaches the endpoints
+that write files and run commands.
+
+The service also validates settings, falling back to the default one value
+at a time when `config.json` has been hand-edited, and a config or chat file
+that can't be read is set aside under its own name rather than overwritten.
+It caps request bodies, writes configuration and chats atomically, and adds
+browser hardening/no-cache headers to API responses. Replies are saved into
+the conversation as it is on disk at that moment, so two replies at once
+cannot erase each other and a deleted chat stays deleted. On Windows the
+llama-server processes are tied to the app, so closing its console window
+no longer leaves one holding the port and the VRAM. If one is left over
+anyway, loading says so instead of quietly using it. Run the regression
 suite before packaging:
 
 ```bash

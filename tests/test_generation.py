@@ -91,10 +91,14 @@ class SamplingProfileTests(unittest.TestCase):
                     mock.patch.object(server.fit, "model_sampling",
                                       return_value=None):
                 server.cfg["last_model_sampling"] = dict(prof)
-                kept = server.remember_sampling("Qwen3-8B-Q4_K_M.gguf")
+                kept = server.remember_sampling(
+                    "Qwen3-8B-Q4_K_M.gguf",
+                    fit.catalogue_match("Qwen3-8B-Q4_K_M.gguf"))
                 self.assertEqual(kept["temperature"], 0.6)
                 self.assertEqual(server.cfg["last_model_sampling"], prof)
-                server.remember_sampling("Qwen3-14B-Q4_K_M.gguf")
+                server.remember_sampling(
+                    "Qwen3-14B-Q4_K_M.gguf",
+                    fit.catalogue_match("Qwen3-14B-Q4_K_M.gguf"))
                 # nothing recorded for the new model, so autostart retries
                 self.assertEqual(server.cfg["last_model_sampling"], {})
         finally:
@@ -112,9 +116,13 @@ class AutoContextTests(unittest.TestCase):
         return {"vram": vram_mib * 1024 ** 2, "ram": 32 * GB,
                 "bandwidth": 272}
 
-    def test_idle_8gb_card_gives_a_thinking_model_32k(self) -> None:
+    def test_idle_8gb_card_gives_a_thinking_model_16k(self) -> None:
+        # 32k of q8 cache is 2.4 GiB (34 bytes per 32 values): with 4.7 GiB
+        # of weights that is past an 8 GB card, 16k is not.
         self.assertEqual(fit.auto_ctx(self.Q4, self.QWEN3_8B, self.hw(), 8),
-                         32768)
+                         16384)
+        self.assertEqual(fit.auto_ctx(self.Q4, self.QWEN3_8B,
+                                      self.hw(16 * 1024), 8), 32768)
 
     def test_busy_card_gets_less_but_never_under_the_floor(self) -> None:
         self.assertEqual(fit.auto_ctx(self.Q4, self.QWEN3_8B,

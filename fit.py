@@ -28,6 +28,7 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 from pathlib import Path
 
 import requests
@@ -136,23 +137,51 @@ def quant_of(filename: str) -> str:
     return m.group(1).upper() if m else ""
 
 
-def catalogue_match(filename: str) -> dict | None:
-    """The catalogue entry a file on disk most likely came from.
+SIZE_RE = re.compile(r"(?<![a-z0-9])e?\d+(?:\.\d+)?b(?![a-z0-9])")
+# Words a filename may leave out without being a different model.
+SOFT_WORDS = {"instruct", "gguf", "uncensored"}
 
-    Scores each entry by how much of its name, token by token from the
-    left, appears in the filename, and stops at the first missing token —
-    so "Gemma-4-E4B-…" lands on Gemma 4 E4B rather than Gemma 3, and a
-    file no entry describes matches nothing rather than something."""
-    low = re.sub(r"[^a-z0-9.]+", "-", filename.lower())
+
+def _words(text: str) -> set[str]:
+    low = text.lower()
+    # Dotted versions (3.1, v0.3) stay whole, and "Qwen3-8B.Q4_K_M" still
+    # yields 8b: both splits count.
+    return (set(re.split(r"[^a-z0-9.]+", low)) |
+            set(re.split(r"[^a-z0-9]+", low))) - {""}
+
+
+def catalogue_match(filename: str) -> dict | None:
+    """The catalogue entry a file on disk came from — or None.
+
+    Every word of the entry's name must be in the filename as a whole
+    word, apart from a few that builds leave out (Instruct, Uncensored);
+    a size word may be missing only when the filename names no size at
+    all (bartowski's phi-4). Matching the family word alone used to be
+    enough, which put Qwen3-32B — and every other Qwen3 — on Qwen3 8B's
+    layer count, KV cache and sampling. Entries in formats llama.cpp
+    cannot load are never a file on disk. The best of several matches is
+    the one with the most of its name found."""
+    stem = Path(filename).name.lower()
+    stem = stem[:-5] if stem.endswith(".gguf") else stem
+    words = _words(stem)
+    sizes = set(SIZE_RE.findall(stem))
     best, best_score = None, 0
     for entry in CATALOGUE:
-        score = 0
-        for tok in re.sub(r"[^a-z0-9.]+", " ", entry["name"].lower()).split():
-            if tok in low:
+        if entry.get("runtime", "llama.cpp") != "llama.cpp":
+            continue
+        score, ok = 0, True
+        for tok in re.split(r"[^a-z0-9.]+", entry["name"].lower()):
+            if not tok:
+                continue
+            if tok in words:
                 score += len(tok)
+            elif tok in SOFT_WORDS or (SIZE_RE.fullmatch(tok) and
+                                       not sizes):
+                continue
             else:
+                ok = False
                 break
-        if score > best_score:
+        if ok and score > best_score:
             best, best_score = entry, score
     return best
 
@@ -192,6 +221,14 @@ BANDWIDTH = {k.lower(): v[1] for k, v in GPUS.items()}
 SYSTEM_BANDWIDTH = 60
 
 
+def _mib(value: str) -> int:
+    """nvidia-smi's MiB figure in bytes; 0 for [N/A] and the like."""
+    try:
+        return int(float(value)) * 1024 * 1024
+    except ValueError:
+        return 0
+
+
 def gpu_info() -> dict:
     """name, total VRAM, free VRAM — via nvidia-smi, then rocm-smi."""
     if shutil.which("nvidia-smi"):
@@ -202,23 +239,37 @@ def gpu_info() -> dict:
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=20)
             if out.returncode == 0 and out.stdout.strip():
-                name, total, free = [x.strip() for x in
-                                     out.stdout.strip().splitlines()[0].split(",")]
-                return {"name": name, "vram": int(float(total)) * 1024 * 1024,
-                        "vram_free": int(float(free)) * 1024 * 1024,
-                        "vendor": "nvidia"}
+                # Every card, not just the first line (which can be a small
+                # display card), and a field reading [N/A] costs only that
+                # field: it used to drop the GPU altogether, and with it
+                # the CUDA build and every GPU layer.
+                cards = []
+                for line in out.stdout.strip().splitlines():
+                    parts = [x.strip() for x in line.split(",")]
+                    if len(parts) < 3:
+                        continue
+                    total, free = _mib(parts[-2]), _mib(parts[-1])
+                    cards.append({"name": ",".join(parts[:-2]).strip(),
+                                  "vram": total, "vram_free": free or total,
+                                  "vendor": "nvidia"})
+                if cards:
+                    return max(cards, key=lambda c: c["vram"])
         except Exception:
             pass
     if shutil.which("rocm-smi"):
         try:
-            out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
+            out = subprocess.run(["rocm-smi", "--showmeminfo", "vram",
+                                  "--showproductname", "--json"],
                                  capture_output=True, text=True, timeout=20)
             data = json.loads(out.stdout)
             for card in data.values():
+                if not isinstance(card, dict):
+                    continue
                 total = int(card.get("VRAM Total Memory (B)", 0))
                 used = int(card.get("VRAM Total Used Memory (B)", 0))
                 if total:
-                    return {"name": card.get("Card series", "AMD GPU"),
+                    return {"name": card.get("Card Series")
+                            or card.get("Card series") or "AMD GPU",
                             "vram": total, "vram_free": total - used,
                             "vendor": "amd"}
         except Exception:
@@ -264,12 +315,17 @@ def ram_bytes() -> int:
 
 
 def bandwidth_of(name: str) -> int:
+    """Published bandwidth of a card in the table, matched as whole words
+    so an "RTX A1000" is not an A100 and an "L40S" is not an L4. Laptop
+    parts share desktop names but not their memory buses: no number for
+    them rather than the desktop's."""
     low = (name or "").lower()
-    if "apple" in low or "unified" in low:
+    if re.search(r"apple|unified|laptop|mobile|max-q", low):
         return 0
     best, best_len = 0, 0
     for key, value in BANDWIDTH.items():
-        if key in low and len(key) > best_len:
+        if re.search(r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])",
+                     low) and len(key) > best_len:
             best, best_len = value, len(key)
     return best
 
@@ -300,10 +356,20 @@ def hardware(cfg: dict | None = None) -> dict:
 _CONFIG_CACHE: dict[str, dict] = {}
 
 
+GENERIC_CONF = {"layers": 32, "kv_layers": 32, "kv_heads": 8, "head_dim": 128,
+                "exact": False, "hybrid": False, "moe": False, "max_ctx": 0}
+_CONFIG_MISS: dict[str, float] = {}
+CONFIG_RETRY = 300      # seconds before an unreadable config is asked again
+
+
 def model_config(cfg: dict, repo: str) -> dict:
     """layers / kv heads / head dim from the model's own config.json."""
     if repo in _CONFIG_CACHE:
         return _CONFIG_CACHE[repo]
+    # A gated or unreachable config is not asked for again on every render
+    # of the Models page — each attempt could wait out a 20 s timeout.
+    if time.time() - _CONFIG_MISS.get(repo, 0) < CONFIG_RETRY:
+        return dict(GENERIC_CONF)
     endpoint = (cfg.get("hf_endpoint") or "https://huggingface.co").rstrip("/")
     token = (cfg.get("hf_token") or "").strip()
     headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -313,50 +379,107 @@ def model_config(cfg: dict, repo: str) -> dict:
         r.raise_for_status()
         c = r.json()
         text = c.get("text_config") or c
-        layers = int(text.get("num_hidden_layers") or 0)
-        # Hybrid models (Qwen3-Next / Qwen3.8 and friends) alternate linear
-        # attention with full attention, and only the full-attention layers
-        # keep a KV cache. Counting every layer overstates it several times
-        # over, which would wrongly condemn a model as too big.
-        kv_layers = layers
-        types = text.get("layer_types") or text.get("layers_block_type")
-        if isinstance(types, list) and types:
-            full = sum(1 for t in types if "full" in str(t).lower()
-                       or str(t).lower() in ("attention", "attn"))
-            if full:
-                kv_layers = full
-        elif text.get("full_attention_interval"):
-            step = int(text["full_attention_interval"])
-            if step > 1:
-                kv_layers = max(1, layers // step)
-        heads = int(text.get("num_attention_heads") or 0)
-        kv_heads = int(text.get("num_key_value_heads") or heads or 0)
-        hidden = int(text.get("hidden_size") or 0)
-        head_dim = int(text.get("head_dim") or
-                       (hidden // heads if heads else 0))
-        # Mixture-of-experts models read only a few experts per token, so
-        # "file size ÷ bandwidth" would overstate the read several-fold.
-        # The exact bytes per token cannot be measured from config.json
-        # (shared weights are always read), so the speed estimate is
-        # withheld for these rather than invented.
-        experts = int(text.get("num_experts") or text.get("n_routed_experts")
-                      or text.get("num_local_experts") or 0)
-        if layers and kv_heads and head_dim:
-            out = {"layers": layers, "kv_layers": kv_layers,
-                   "kv_heads": kv_heads, "head_dim": head_dim,
-                   "exact": True,
-                   "hybrid": kv_layers != layers,
-                   "moe": experts > 1,
-                   # the window it was trained on: Auto context never
-                   # stretches a model past it
-                   "max_ctx": int(text.get("max_position_embeddings")
-                                  or c.get("max_position_embeddings") or 0)}
+        out = _config_from(text, c)
+        if out:
             _CONFIG_CACHE[repo] = out
             return out
     except Exception:
         pass
-    return {"layers": 32, "kv_layers": 32, "kv_heads": 8, "head_dim": 128,
-            "exact": False, "hybrid": False, "moe": False, "max_ctx": 0}
+    _CONFIG_MISS[repo] = time.time()
+    return dict(GENERIC_CONF)
+
+
+def _config_from(text: dict, c: dict) -> dict | None:
+    layers = int(text.get("num_hidden_layers") or 0)
+    # Hybrid models (Qwen3-Next / Qwen3.8 and friends) alternate linear
+    # attention with full attention, and only the full-attention layers
+    # keep a KV cache. Counting every layer overstates it several times
+    # over, which would wrongly condemn a model as too big. Sliding-window
+    # layers (Gemma) are another matter: they do keep a cache, only a short
+    # one — counted apart, at the window's length.
+    kv_layers, swa_layers, hybrid = layers, 0, False
+    types = text.get("layer_types") or text.get("layers_block_type")
+    window = int(text.get("sliding_window") or 0)
+    if isinstance(types, list) and types:
+        kinds = [str(t).lower() for t in types]
+        swa_layers = sum(1 for t in kinds if "sliding" in t)
+        full = sum(1 for t in kinds if "full" in t
+                   or t in ("attention", "attn"))
+        hybrid = any(k in t for t in kinds
+                     for k in ("linear", "mamba", "ssm", "conv", "recurrent"))
+        if full or swa_layers:
+            kv_layers = full
+    elif text.get("full_attention_interval"):
+        step = int(text["full_attention_interval"])
+        if step > 1:
+            kv_layers = max(1, layers // step)
+            hybrid = True
+    elif text.get("sliding_window_pattern") and window:
+        # Gemma 3's older configs: every Nth layer global, the rest local.
+        step = int(text["sliding_window_pattern"])
+        if step > 1:
+            kv_layers = layers // step
+            swa_layers = layers - kv_layers
+    heads = int(text.get("num_attention_heads") or 0)
+    kv_heads = int(text.get("num_key_value_heads") or heads or 0)
+    hidden = int(text.get("hidden_size") or 0)
+    head_dim = int(text.get("head_dim") or
+                   (hidden // heads if heads else 0))
+    # Multi-head latent attention (DeepSeek, GLM 4.7 Flash) caches one
+    # compressed latent per token and layer — kv_lora_rank plus the rope
+    # part — not keys and values per head, which overstated it 4-7x.
+    if text.get("kv_lora_rank"):
+        kv_heads = 1
+        head_dim = int(text["kv_lora_rank"]) + int(
+            text.get("qk_rope_head_dim") or 0)
+    # Mixture-of-experts models read only a few experts per token, so
+    # "file size ÷ bandwidth" would overstate the read several-fold.
+    # The exact bytes per token cannot be measured from config.json
+    # (shared weights are always read), so the speed estimate is
+    # withheld for these rather than invented.
+    experts = int(text.get("num_experts") or text.get("n_routed_experts")
+                  or text.get("num_local_experts") or 0)
+    if not (layers and kv_heads and head_dim):
+        return None
+    if swa_layers and not window:
+        # sliding layers with no window stated: counted as full, never
+        # as nothing
+        kv_layers, swa_layers = kv_layers + swa_layers, 0
+    return {"layers": layers, "kv_layers": kv_layers,
+            "kv_heads": kv_heads, "head_dim": head_dim,
+            "swa_layers": swa_layers if window else 0,
+            "sliding_window": window if swa_layers else 0,
+            "exact": True, "hybrid": hybrid, "moe": experts > 1,
+            # extra prediction layers some builds carry past the last block
+            "nextn": int(text.get("num_nextn_predict_layers") or 0),
+            # the window it was trained on: Auto context never stretches a
+            # model past it
+            "max_ctx": int(text.get("max_position_embeddings")
+                           or c.get("max_position_embeddings") or 0)}
+
+
+def file_config(layout: dict | None) -> dict | None:
+    """The same architecture read from the GGUF's own metadata, for a file
+    whose config.json is unknown or unreachable (a model not in the
+    catalogue, a gated repo, no network). Measured, not a 32-layer guess —
+    and None when the file does not say plainly (per-layer head counts)."""
+    m = (layout or {}).get("meta") or {}
+    blocks = (layout or {}).get("blocks") or 0
+    heads = m.get("head_count")
+    kv_heads = m.get("head_count_kv") or heads
+    head_dim = m.get("key_length") or (
+        m["embedding_length"] // heads if heads and m.get("embedding_length")
+        else 0)
+    if m.get("kv_lora_rank"):
+        kv_heads = 1
+        head_dim = int(m["kv_lora_rank"]) + int(m.get("rope_dim") or 0)
+    if not (blocks and isinstance(kv_heads, int) and kv_heads
+            and isinstance(head_dim, int) and head_dim):
+        return None
+    return {"layers": blocks, "kv_layers": blocks, "kv_heads": kv_heads,
+            "head_dim": head_dim, "exact": True, "hybrid": False,
+            "moe": bool(layout.get("experts")), "nextn": 0,
+            "max_ctx": int(m.get("context_length") or 0), "from_file": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -467,6 +590,10 @@ def _read_layout(path: str, size: int) -> dict | None:
 
         def text(at: int) -> tuple[str, int]:
             n = struct.unpack_from("<Q", mm, at)[0]
+            # A key or a tensor name is short; a length past that is a
+            # corrupt (or big-endian) header, not a string to copy out.
+            if n > 1 << 16 or at + 8 + n > len(mm):
+                raise ValueError("implausible GGUF string")
             return (mm[at + 8:at + 8 + n].decode("utf-8", "replace"),
                     at + 8 + n)
 
@@ -488,6 +615,8 @@ def _read_layout(path: str, size: int) -> dict | None:
                         at += 8 + struct.unpack_from("<Q", mm, at)[0]
                     else:
                         _, at = value(inner, at)
+                    if at > len(mm):
+                        raise ValueError("GGUF array runs past the file")
                 return None, at
             raise ValueError(f"unknown GGUF value type {kind}")
 
@@ -523,7 +652,20 @@ def _read_layout(path: str, size: int) -> dict | None:
     arch = str(meta.get("general.architecture") or "")
     blocks = max(int(meta.get(f"{arch}.block_count") or 0),
                  max(experts) + 1 if experts else 0)
+    if blocks > 4096:
+        return None             # no real model; a corrupt header
+    def num(key: str):
+        v = meta.get(f"{arch}.{key}")
+        return v if isinstance(v, int) and not isinstance(v, bool) else 0
     return {"arch": arch, "blocks": blocks,
+            # what the file says of its own attention, for file_config
+            "meta": {"head_count": num("attention.head_count"),
+                     "head_count_kv": num("attention.head_count_kv"),
+                     "key_length": num("attention.key_length"),
+                     "kv_lora_rank": num("attention.kv_lora_rank"),
+                     "rope_dim": num("rope.dimension_count"),
+                     "embedding_length": num("embedding_length"),
+                     "context_length": num("context_length")},
             # expert bytes per block, blk.0 first; [] for a dense model
             "experts": [experts.get(i, 0) for i in range(blocks)]
             if experts else [],
@@ -534,11 +676,21 @@ def _read_layout(path: str, size: int) -> dict | None:
             "expert_used": int(meta.get(f"{arch}.expert_used_count") or 0)}
 
 
+# Bytes per cached value. q8_0 stores each block of 32 values in 34 bytes
+# (one 16-bit scale per block), so it is not quite one byte a value.
+KV_BYTES = {16: 2.0, 8: 34 / 32}
+
+
 def kv_bytes(conf: dict, ctx: int, kv_bits: int = 16) -> int:
-    """Key and value, every layer, at the chosen context length."""
-    per_token = 2 * conf.get("kv_layers", conf["layers"]) * conf["kv_heads"] \
-        * conf["head_dim"] * (kv_bits / 8)
-    return int(per_token * ctx)
+    """Key and value, every layer, at the chosen context length. Sliding-
+    window layers hold only their window (plus a batch llama.cpp keeps
+    beside it), however long the context."""
+    per_value = KV_BYTES.get(int(kv_bits), kv_bits / 8)
+    per_layer = 2 * conf["kv_heads"] * conf["head_dim"] * per_value
+    full = conf.get("kv_layers", conf["layers"]) * per_layer * ctx
+    swa = conf.get("swa_layers", 0) * per_layer * min(
+        ctx, int(conf.get("sliding_window") or 0) + 512)
+    return int(full + swa)
 
 
 # --------------------------------------------------------------------------- #
