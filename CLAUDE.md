@@ -70,6 +70,17 @@
    thinking model can spend all of it before writing any code.
 19. **The Office-file convention rides only with Office requests**
    (`wants_documents`), never with every coding question.
+20. **A MoE model bigger than the card keeps every layer on the GPU** and
+   holds the experts that do not fit in RAM with `--n-cpu-moe N`. N comes
+   from `fit.moe_plan` over `fit.gguf_layout` — the file's own tensor table,
+   matched with llama.cpp's `LLM_FFN_EXPS_REGEX` — never a parameter-count
+   estimate. `launch` falls back to the plain layer split (and re-picks an
+   Auto window by the layer rule) when that does not come up, so the
+   speed-up can never cost a load. A manual gpu_layers always gets the
+   plain split.
+21. **`-ngl` is the layer count plus one when every layer fits**
+   (`ngl_flag`): llama.cpp counts the output head as a layer past the last
+   block, so exactly the layer count leaves it on the CPU.
 
 ## Validation gate
 

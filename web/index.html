@@ -1945,9 +1945,18 @@ async function loadModel(name) {
     var d = await api("/api/engine/load", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: name }) });
-    toast(name + " loaded: " + d.gpu_layers + " of " + d.fit.layers +
-      " layers on the GPU at " + d.ctx.toLocaleString() + " context" +
-      (d.auto_ctx ? " (Auto)" : "") + ".");
+    // A mixture-of-experts model keeps every layer on the card and parks
+    // the experts that do not fit in RAM; say so rather than a layer count.
+    var where = d.n_cpu_moe
+      ? "every layer on the GPU, experts of " + d.n_cpu_moe + " of " +
+        d.layers + " blocks in system RAM"
+      : d.gpu_layers + " of " + d.layers + " layers on the GPU";
+    toast(name + " loaded: " + where + " at " + d.ctx.toLocaleString() +
+      " context" + (d.auto_ctx ? " (Auto)" : "") + "." +
+      (d.moe_fallback ? " Holding its experts in RAM did not start on " +
+        "this llama.cpp build, so whole layers were split instead — " +
+        "updating llama.cpp on the Engine page brings it back." : ""),
+      d.moe_fallback);
     await refresh();
     show(S.view === "code" ? "code" : "chat");
   } catch (e) { toast(e.message, true); }

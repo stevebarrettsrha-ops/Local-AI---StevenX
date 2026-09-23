@@ -1224,15 +1224,87 @@ def free_vram_hw(hw: dict) -> dict:
 
 
 def resolve_ctx(size: int, conf: dict, hw: dict, bits: int,
-                ctx: int | None = None) -> int:
+                ctx: int | None = None, layout: dict | None = None) -> int:
     """The context a load uses: the one asked for, else the setting, and
     for Auto (0) whatever the fit calculation says costs nothing."""
     ctx = int(ctx or cfg.get("ctx") or 0)
     if ctx == 0:
-        ctx = fit.auto_ctx(size, conf, free_vram_hw(hw), bits)
+        ctx = fit.auto_ctx(size, conf, free_vram_hw(hw), bits, layout)
     if not 512 <= ctx <= 262_144:
         raise RuntimeError("Context must be between 512 and 262144.")
     return ctx
+
+
+def ngl_flag(gpu_layers: int, layers: int) -> int:
+    """-ngl for llama-server. llama.cpp counts the output head as one layer
+    past the last block, so `-ngl <layer count>` leaves that head — a
+    vocabulary-sized matrix read every token — on the CPU. When the fit
+    puts every layer on the card it has already counted the head's bytes
+    (they are in the file size it divides up), so the head goes too."""
+    return gpu_layers + 1 if gpu_layers >= layers else gpu_layers
+
+
+def launch(model: dict, conf: dict, hw: dict, ctx: int, bits: int,
+           gpu_layers: int | None = None, auto: bool = False) -> dict:
+    """Start llama-server for a file on disk and wait until it answers.
+
+    A mixture-of-experts model bigger than the card goes up with every
+    layer on the GPU and the experts that do not fit held in system RAM
+    (--n-cpu-moe, sized by fit.moe_plan from the file's tensor table). If
+    that does not come up — a build older than the flag, or a compute
+    buffer bigger than allowed for — the plain layer split the app always
+    used is tried before giving up, so the speed-up can never cost a load.
+    Anything else, and any deliberate gpu_layers, gets the plain split.
+
+    `auto` says ctx came from Auto: a window picked for the expert
+    placement is picked again by the layer rule if that placement fails."""
+    def split(ctx: int) -> tuple[dict, int]:
+        a = fit.assess(model["size"], conf, hw, ctx, bits)
+        requested = a["gpu_layers"] if gpu_layers is None \
+            else int(gpu_layers)
+        # A caller may deliberately offload fewer layers, but never exceed
+        # the measured safe fit or the model's real layer count.
+        return a, max(0, min(requested, a["gpu_layers"], a["layers"]))
+
+    a, gl = split(ctx)
+    plan = None
+    if gpu_layers is None and gl < a["layers"]:
+        plan = fit.moe_plan(fit.gguf_layout(model["path"]), conf,
+                            free_vram_hw(hw), ctx, bits)
+        if plan and not plan["n_cpu_moe"]:
+            plan = None      # it all fits after all: nothing to hold back
+    if plan:
+        server.start(model["path"], ngl_flag(plan["layers"], plan["layers"]),
+                     ctx, model_runtime_args(bits) +
+                     ["--n-cpu-moe", str(plan["n_cpu_moe"])])
+        if server.wait_ready(600):
+            shown = {**a, **moe_fields(plan)}
+            return {"fit": shown, "ctx": ctx, "gpu_layers": plan["layers"],
+                    "layers": plan["layers"],
+                    "n_cpu_moe": plan["n_cpu_moe"], "moe_fallback": False,
+                    "why": fit.verdict_text(shown, hw)}
+        if auto:
+            ctx = fit.auto_ctx(model["size"], conf, free_vram_hw(hw), bits)
+            a, gl = split(ctx)
+    server.start(model["path"], ngl_flag(gl, a["layers"]), ctx,
+                 model_runtime_args(bits))
+    if not server.wait_ready(600):
+        server.stop()
+        raise RuntimeError("llama-server did not come up.")
+    # the expert placement was tried and did not come up
+    shown = {**a, **({"moe_layer_split": "fallback"} if plan else {})}
+    return {"fit": shown, "ctx": ctx, "gpu_layers": gl,
+            "layers": a["layers"], "n_cpu_moe": 0,
+            "moe_fallback": bool(plan), "why": fit.verdict_text(shown, hw)}
+
+
+def moe_fields(plan: dict) -> dict:
+    """What a verdict needs to describe an expert placement. The file's own
+    tensor table is the authority on MoE-ness, even when config.json could
+    not be read — and a MoE gets no dense-model speed estimate."""
+    return {"moe": True, "speed": None, "n_cpu_moe": plan["n_cpu_moe"],
+            "expert_used": plan["expert_used"],
+            "expert_count": plan["expert_count"]}
 
 
 def loaded_sampling() -> dict:
@@ -1308,16 +1380,11 @@ def load_model_by_name(name: str, ctx: int | None = None,
         # too many layers, or even install flags for a GPU not in this PC.
         hw = fit.hardware({})
         bits = int(cfg.get("kv_bits", 8))
-        ctx = resolve_ctx(model["size"], conf, hw, bits, chosen)
-        a = fit.assess(model["size"], conf, hw, ctx, bits)
-        requested = a["gpu_layers"] if gpu_layers is None else int(gpu_layers)
-        # A caller may deliberately offload fewer layers, but never exceed the
-        # measured safe fit or the model's real layer count.
-        gl = max(0, min(requested, a["gpu_layers"], a["layers"]))
-        server.start(model["path"], gl, ctx, model_runtime_args(bits))
-        if not server.wait_ready(600):
-            server.stop()
-            raise RuntimeError("llama-server did not come up.")
+        auto = not chosen and not int(cfg.get("ctx") or 0)
+        ctx = resolve_ctx(model["size"], conf, hw, bits, chosen,
+                          fit.gguf_layout(model["path"]))
+        placed = launch(model, conf, hw, ctx, bits, gpu_layers, auto)
+        ctx = placed["ctx"]
         with config_lock:
             cfg["last_model"] = name
             # Preserve the measured architecture so automatic startup uses
@@ -1336,10 +1403,8 @@ def load_model_by_name(name: str, ctx: int | None = None,
             cfg["last_ctx"] = ctx
             save_config(cfg)
         remember_sampling(name)
-        return {"model": name, "gpu_layers": gl, "ctx": ctx, "fit": a,
-                "auto_ctx": not chosen and not int(cfg.get("ctx") or 0),
-                "sampling": loaded_sampling(),
-                "why": fit.verdict_text(a, hw)}
+        return {"model": name, **placed, "auto_ctx": auto,
+                "sampling": loaded_sampling()}
 
 
 def pick_quant(files: list[dict], conf: dict, hw: dict, ctx: int,
@@ -1507,7 +1572,8 @@ def api_fit_local():
         conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
             if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
                            "exact": False}
-        a = assess_at(m["size"], conf, hw, ctx)
+        a = assess_at(m["size"], conf, hw, ctx,
+                      "" if m["partial"] else m["path"])
         out.append({**m, "fit": a, "why": fit.verdict_text(a, hw)})
     return jsonify({"models": out, "hardware": hw, "ctx": ctx})
 
@@ -1522,16 +1588,29 @@ def fit_ctx_arg() -> int:
         return int(cfg.get("ctx") or 0)
 
 
-def assess_at(size: int, conf: dict, hw: dict, ctx: int) -> dict:
+def assess_at(size: int, conf: dict, hw: dict, ctx: int,
+              path: str = "") -> dict:
     """fit.assess at a fixed context, or on Auto at the one this file would
     get — so the fit column describes what loading it would really do. The
     whole card is the yardstick here, as for every other verdict on the
-    page; the load itself also subtracts what other programs are using."""
+    page; the load itself also subtracts what other programs are using.
+
+    A file already on disk also gets its exact expert placement, read from
+    its own tensor table; one still on HuggingFace is described in general
+    terms, since its header has not been downloaded."""
     bits = int(cfg.get("kv_bits", 16))
+    layout = fit.gguf_layout(path) if path else None
     auto = ctx == 0
     if auto:
-        ctx = fit.auto_ctx(size, conf, hw, bits)
-    return {**fit.assess(size, conf, hw, ctx, bits), "auto_ctx": auto}
+        ctx = fit.auto_ctx(size, conf, hw, bits, layout)
+    a = {**fit.assess(size, conf, hw, ctx, bits), "auto_ctx": auto}
+    if layout and layout["experts"] and a["gpu_layers"] < a["layers"]:
+        plan = fit.moe_plan(layout, conf, hw, ctx, bits)
+        if plan and plan["n_cpu_moe"]:
+            a.update(moe_fields(plan))
+        elif not plan:
+            a.update({"moe": True, "speed": None, "moe_layer_split": "room"})
+    return a
 
 
 # --------------------------------------------------------------------------- #
@@ -2101,6 +2180,30 @@ def api_chat_send():
 
 
 # --------------------------------------------------------------------------- #
+def autostart(model: dict) -> None:
+    """Bring the last model back up at launch, placed exactly as a manual
+    load would place it, from the architecture saved then — no network."""
+    with engine_lock:
+        # Planning mode must never affect what is launched on this PC.
+        hw = fit.hardware({})
+        conf = saved_model_config(model["name"]) or {
+            "layers": 32, "kv_layers": 32, "kv_heads": 8,
+            "head_dim": 128, "exact": False, "max_ctx": 0,
+        }
+        bits = int(cfg.get("kv_bits", 8))
+        try:
+            ctx = resolve_ctx(model["size"], conf, hw, bits, None,
+                              fit.gguf_layout(model["path"]))
+            placed = launch(model, conf, hw, ctx, bits,
+                            auto=not int(cfg.get("ctx") or 0))
+            ctx = cfg["last_ctx"] = placed["ctx"]
+            print(f"  {model['name']} ready at {ctx:,} context" +
+                  (f", experts of {placed['n_cpu_moe']} blocks in RAM"
+                   if placed["n_cpu_moe"] else "") + ".")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  could not reload {model['name']}: {exc}")
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     engine.MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2109,22 +2212,12 @@ def main() -> None:
                       if m["name"] == cfg["last_model"] and not m["partial"]),
                      None)
         if model and engine.server_binary():
-            # Planning mode must never affect what is launched on this PC.
-            hw = fit.hardware({})
-            conf = saved_model_config(model["name"]) or {
-                "layers": 32, "kv_layers": 32, "kv_heads": 8,
-                "head_dim": 128, "exact": False, "max_ctx": 0,
-            }
-            bits = int(cfg.get("kv_bits", 8))
-            try:
-                ctx = resolve_ctx(model["size"], conf, hw, bits)
-                a = fit.assess(model["size"], conf, hw, ctx, bits)
-                server.start(model["path"], a["gpu_layers"], ctx,
-                             model_runtime_args(bits))
-                cfg["last_ctx"] = ctx
-                print(f"  loading {model['name']} at {ctx:,} context…")
-            except Exception as exc:  # noqa: BLE001
-                print(f"  could not reload {model['name']}: {exc}")
+            # Waiting for the model (and, for a MoE, falling back to the
+            # plain split if its placement does not start) happens beside
+            # the web server, so the page opens straight away.
+            print(f"  loading {model['name']}…")
+            threading.Thread(target=autostart, args=(model,),
+                             daemon=True).start()
             # Saved beside the architecture on every load; a model last
             # loaded by an older version has none yet, so read it once now,
             # off the startup path.

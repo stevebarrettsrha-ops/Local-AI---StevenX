@@ -12,7 +12,8 @@ had on the GPU, judged against the VRAM that is actually free when it loads
 was trained on. On an RTX 4060 8 GB / 32 GB RAM machine that gives Qwen3 8B
 Q4_K_M 16k, fully GPU-resident, where it used to get 8k; 32k needs the card
 otherwise idle. A model that already spills to RAM stays at 8k rather than
-being pushed further off the card. Pick a size by hand under Parameters to
+being pushed further off the card (mixture-of-experts models work
+differently; see below). Pick a size by hand under Parameters to
 override it. Select 16-bit
 KV under Parameters only when maximum cache precision matters more than VRAM.
 The selected cache precision is passed directly to `llama-server` for both
@@ -67,7 +68,9 @@ Loading a model always uses the real hardware.
 2. **Models** lists models worth running here. Open one, read the fit column,
    download the quant you want — resumable, with progress.
 3. **Load** starts `llama-server` with `-ngl` set from the fit calculation, so
-   as many layers as will fit go on the GPU and no more.
+   as many layers as will fit go on the GPU and no more. A mixture-of-experts
+   model keeps every layer on the GPU and leaves the experts that don't fit
+   in system RAM instead (see *Big models on a small card*).
 4. Chat. Replies stream, and each one reports its measured tokens per second.
 
 Any GGUF repo can be checked by pasting `user/Model-GGUF` into the box on the
@@ -172,6 +175,40 @@ quant — even Q2_K is ~10 GiB against 8 GB of VRAM, so roughly two thirds of th
 layers sit on the GPU and the rest stream from system RAM at a few tokens a
 second. The fit column says exactly how many layers land where, so the decision
 is yours rather than a surprise after a 10 GB download.
+
+### Mixture-of-experts models: experts in RAM, layers on the card
+
+A mixture-of-experts model like Qwen3 Coder 30B A3B or GLM 4.7 Flash is a
+different case. Most of its file is expert weights, and each token reads
+only a few of them: 8 of 128 per layer for Qwen3 Coder. So when it is bigger
+than the card, it is not split into whole layers. Every layer goes on the
+GPU, including attention and the KV cache, which every token reads in full.
+The expert weights that don't fit wait in system RAM (llama.cpp's
+`--n-cpu-moe`). Only the few experts a token uses are read from there, so
+far less comes from slow memory than when whole layers sit on the CPU.
+
+How many blocks' experts stay in RAM is measured, not guessed. The app reads
+the GGUF file's own tensor table (just the header, about 40 ms even with a
+150k-token vocabulary), adds up the expert tensors block by block, and fills
+the card from the last block backwards. It uses the VRAM that is actually
+free at load time. On an RTX 4060 8 GB, Qwen3 Coder Q4_K_M loads with all
+48 layers on the GPU and roughly three quarters of its blocks' experts in
+RAM. It used to get about 19 whole layers on the GPU and the other 29,
+attention included, on the CPU. Auto context reads differently for these
+models too: another 8k of window moves only about one more block of experts
+to RAM, so Auto takes the longest window (up to 32k) at which the attention
+and cache still fit on the card.
+
+If llama-server doesn't start that way (a llama.cpp build older than
+`--n-cpu-moe`, or not enough room), the app falls back to the whole-layer
+split it always used, re-picks an Auto window by the layer rule, and says so
+when the load finishes. Updating llama.cpp on the Engine page brings the
+faster placement back.
+
+One smaller fix for every model: when a model fits entirely, `-ngl` is now
+the layer count plus one. llama.cpp counts the output layer (a
+vocabulary-sized matrix read every token) as one layer past the last block,
+so passing exactly the layer count had left it on the CPU.
 
 Two details that model family exposes, both handled:
 
