@@ -11,6 +11,8 @@ rather than from a table of assumptions:
   fit       weights + KV + a working allowance against measured free VRAM
   speed     memory bandwidth / bytes-read-per-token, which is what makes a
             quantised model's speed predictable at all
+  context   on Auto, the longest window that costs no GPU layer
+  sampling  the model's own generation_config.json, when it has one
 
 Where a number is a guess it says so. Nothing here invents a benchmark.
 """
@@ -19,9 +21,12 @@ from __future__ import annotations
 
 import json
 import math
+import mmap
+import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -82,10 +87,10 @@ CATALOGUE = [
      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
      "config_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
      "note": "The big agentic coder. Mixture of experts — only ~3B of the "
-             "30B runs per token — so it stays usable with most layers in "
-             "system RAM: the practical way to run a big coder on an 8 GB "
-             "card beside 32 GB of RAM. Quantise the KV cache (q8) for "
-             "long contexts."},
+             "30B runs per token — so every layer runs on the card while "
+             "the experts that do not fit wait in system RAM: the practical "
+             "way to run a big coder on an 8 GB card beside 32 GB of RAM. "
+             "Quantise the KV cache (q8) for long contexts."},
     {"id": "glm-4.7-flash", "name": "GLM 4.7 Flash", "params": 30.0,
      "family": "glm",
      "repo": "unsloth/GLM-4.7-Flash-GGUF",
@@ -341,13 +346,192 @@ def model_config(cfg: dict, repo: str) -> dict:
                    "kv_heads": kv_heads, "head_dim": head_dim,
                    "exact": True,
                    "hybrid": kv_layers != layers,
-                   "moe": experts > 1}
+                   "moe": experts > 1,
+                   # the window it was trained on: Auto context never
+                   # stretches a model past it
+                   "max_ctx": int(text.get("max_position_embeddings")
+                                  or c.get("max_position_embeddings") or 0)}
             _CONFIG_CACHE[repo] = out
             return out
     except Exception:
         pass
     return {"layers": 32, "kv_layers": 32, "kv_heads": 8, "head_dim": 128,
-            "exact": False, "hybrid": False, "moe": False}
+            "exact": False, "hybrid": False, "moe": False, "max_ctx": 0}
+
+
+# --------------------------------------------------------------------------- #
+# sampling (the model authors' own settings, not a slider's)
+# --------------------------------------------------------------------------- #
+_SAMPLING_CACHE: dict[str, dict] = {}
+
+# generation_config.json key -> llama-server request field, with the range a
+# sane value falls in. Anything outside it discards the whole profile.
+_SAMPLING_KEYS = (("temperature", "temperature", 0.0, 2.0),
+                  ("top_p", "top_p", 0.0, 1.0),
+                  ("top_k", "top_k", 0, 1000),
+                  ("min_p", "min_p", 0.0, 1.0),
+                  ("repetition_penalty", "repeat_penalty", 0.5, 2.0))
+
+
+def model_sampling(cfg: dict, repo: str) -> dict | None:
+    """The sampling the model's authors ship in its generation_config.json.
+
+    Thinking models are tuned for a particular temperature / top-k / top-p
+    and degrade badly away from it (Qwen3's card: greedy or near-greedy
+    decoding "can lead to performance degradation and endless repetitions").
+    So the numbers are read from the model's own repo, like config.json is,
+    never from a table here. A key the file leaves out takes the value the
+    authors' reference stack (transformers) uses when it is absent — which
+    is also why min-p is 0: llama.cpp's 0.05 is its own addition.
+
+    {} means the model publishes no sampling: the sliders apply. None means
+    the repo could not be reached, which says nothing either way."""
+    if not repo:
+        return {}
+    if repo in _SAMPLING_CACHE:
+        return dict(_SAMPLING_CACHE[repo])
+    endpoint = (cfg.get("hf_endpoint") or "https://huggingface.co").rstrip("/")
+    token = (cfg.get("hf_token") or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = requests.get(f"{endpoint}/{repo}/resolve/main/"
+                         "generation_config.json", headers=headers, timeout=20)
+        if r.status_code == 404:
+            _SAMPLING_CACHE[repo] = {}
+            return {}
+        r.raise_for_status()
+        g = r.json()
+    except Exception:
+        return None    # a network blip is not cached as "no settings"
+    out: dict = {}
+    if isinstance(g, dict) and g.get("do_sample") is not False:
+        for src, dst, lo, hi in _SAMPLING_KEYS:
+            v = g.get(src)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            if not (math.isfinite(v) and lo <= v <= hi):
+                out = {}
+                break
+            out[dst] = int(v) if dst == "top_k" else float(v)
+    if out:
+        out = {"temperature": 1.0, "top_p": 1.0, "top_k": 50,
+               "min_p": 0.0, "repeat_penalty": 1.0, **out,
+               "source": repo}
+    _SAMPLING_CACHE[repo] = out
+    return dict(out)
+
+
+# --------------------------------------------------------------------------- #
+# the GGUF's own tensor table (where a file's bytes actually are)
+# --------------------------------------------------------------------------- #
+# llama.cpp's LLM_FFN_EXPS_REGEX, anchored to a block: the tensors that
+# --n-cpu-moe N keeps in system RAM for blocks 0..N-1. Shared experts
+# (ffn_*_shexp) are not among them and stay with the rest of the layer.
+EXPS_RE = re.compile(r"^blk\.(\d+)\.ffn_(?:up|down|gate|gate_up)_(?:ch)?exps")
+
+# GGUF value types with a fixed width, keyed by type id.
+_GGUF_FIXED = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+               6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+_LAYOUT_CACHE: dict[tuple, dict | None] = {}
+
+
+def gguf_layout(path: str) -> dict | None:
+    """How a model file's bytes divide between expert weights, block by
+    block, and everything else — read from the file's own tensor table, not
+    estimated from the parameter count.
+
+    Only the header is read (it is memory-mapped, so a 17 GB file costs a
+    few MB of reading). Each tensor's size is the gap to the next tensor's
+    offset, which includes its alignment padding: a few bytes, never less
+    than the truth. None for anything that is not a readable GGUF."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if key not in _LAYOUT_CACHE:
+        try:
+            _LAYOUT_CACHE[key] = _read_layout(path, st.st_size)
+        except Exception:
+            _LAYOUT_CACHE[key] = None
+    return _LAYOUT_CACHE[key]
+
+
+def _read_layout(path: str, size: int) -> dict | None:
+    with open(path, "rb") as fh, \
+            mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        if mm[:4] != b"GGUF" or struct.unpack_from("<I", mm, 4)[0] < 2:
+            return None
+        n_tensors, n_kv = struct.unpack_from("<QQ", mm, 8)
+        pos = 24
+
+        def text(at: int) -> tuple[str, int]:
+            n = struct.unpack_from("<Q", mm, at)[0]
+            return (mm[at + 8:at + 8 + n].decode("utf-8", "replace"),
+                    at + 8 + n)
+
+        def value(kind: int, at: int):
+            if kind in _GGUF_FIXED:
+                fmt = _GGUF_FIXED[kind]
+                return (struct.unpack_from(fmt, mm, at)[0],
+                        at + struct.calcsize(fmt))
+            if kind == 8:
+                return text(at)
+            if kind == 9:
+                inner, count = struct.unpack_from("<IQ", mm, at)
+                at += 12
+                if inner in _GGUF_FIXED:          # skipped in one step
+                    return None, at + count * struct.calcsize(
+                        _GGUF_FIXED[inner])
+                for _ in range(count):            # the vocabulary: 150k+
+                    if inner == 8:
+                        at += 8 + struct.unpack_from("<Q", mm, at)[0]
+                    else:
+                        _, at = value(inner, at)
+                return None, at
+            raise ValueError(f"unknown GGUF value type {kind}")
+
+        meta = {}
+        for _ in range(n_kv):
+            name, pos = text(pos)
+            kind = struct.unpack_from("<I", mm, pos)[0]
+            meta[name], pos = value(kind, pos + 4)
+        tensors = []
+        for _ in range(n_tensors):
+            name, pos = text(pos)
+            dims = struct.unpack_from("<I", mm, pos)[0]
+            pos += 4 + 8 * dims + 4                # dims, then ggml type
+            tensors.append((struct.unpack_from("<Q", mm, pos)[0], name))
+            pos += 8
+    align = int(meta.get("general.alignment") or 32)
+    data = -(-pos // align) * align
+    tensors.sort()
+    experts: dict[int, int] = {}
+    other = 0
+    for i, (offset, name) in enumerate(tensors):
+        end = tensors[i + 1][0] if i + 1 < len(tensors) else size - data
+        if end < offset:
+            return None
+        m = EXPS_RE.match(name)
+        if m:
+            experts[int(m.group(1))] = experts.get(int(m.group(1)), 0) + \
+                end - offset
+        else:
+            other += end - offset
+    if data > size:
+        return None
+    arch = str(meta.get("general.architecture") or "")
+    blocks = max(int(meta.get(f"{arch}.block_count") or 0),
+                 max(experts) + 1 if experts else 0)
+    return {"arch": arch, "blocks": blocks,
+            # expert bytes per block, blk.0 first; [] for a dense model
+            "experts": [experts.get(i, 0) for i in range(blocks)]
+            if experts else [],
+            # every other tensor: attention, norms, shared experts, the
+            # embeddings and the output head
+            "other": other,
+            "expert_count": int(meta.get(f"{arch}.expert_count") or 0),
+            "expert_used": int(meta.get(f"{arch}.expert_used_count") or 0)}
 
 
 def kv_bytes(conf: dict, ctx: int, kv_bits: int = 16) -> int:
@@ -417,12 +601,107 @@ def assess(weights: int, conf: dict, hw: dict, ctx: int = 8192,
             "ctx": ctx}
 
 
+def moe_plan(layout: dict | None, conf: dict, hw: dict, ctx: int,
+             kv_bits: int = 16) -> dict | None:
+    """Where a mixture-of-experts model goes when it is bigger than the card:
+    every layer on the GPU — attention, norms, shared experts, KV cache —
+    and the expert weights that do not fit held in system RAM, the first
+    blocks' first, which is what llama.cpp's --n-cpu-moe N does.
+
+    That beats splitting whole layers (plain -ngl) by a wide margin: a token
+    reads only expert_used of expert_count experts in each layer, so the
+    part left in slow RAM is a small fraction of what is read, while
+    attention — read in full every token — stays on the fast card.
+
+    Sizes come from the file's own tensor table (gguf_layout). None when
+    this is not a MoE file, or when even the non-expert weights and the KV
+    cache do not fit — the plain layer split is all that is left then."""
+    if not layout or not layout.get("experts") or not hw.get("vram"):
+        return None
+    kv = kv_bytes(conf, ctx, kv_bits)
+    room = hw["vram"] - kv - OVERHEAD - layout["other"]
+    if room < 0:
+        return None
+    per = layout["experts"]
+    kept, n_cpu = 0, len(per)
+    # --n-cpu-moe keeps blocks 0..N-1 in RAM, so the card is filled from
+    # the last block backwards.
+    for i in range(len(per) - 1, -1, -1):
+        if kept + per[i] > room:
+            break
+        kept += per[i]
+        n_cpu = i
+    return {"n_cpu_moe": n_cpu, "layers": layout["blocks"],
+            "experts_gpu": kept, "experts_cpu": sum(per) - kept,
+            "other": layout["other"], "kv": kv,
+            "expert_used": layout.get("expert_used", 0),
+            "expert_count": layout.get("expert_count", 0)}
+
+
+# Auto context steps. 8k is the floor: below it a thinking model can spend
+# the whole window deliberating and never reach the answer. 32k is where Auto
+# stops — the native window of most models here, and what Qwen3 asks for a
+# thinking answer; longer windows are picked by hand.
+AUTO_CTX_STEPS = (8192, 16384, 32768)
+
+
+def auto_ctx(weights: int, conf: dict, hw: dict, kv_bits: int = 16,
+             layout: dict | None = None) -> int:
+    """The context Auto gives a model: the longest step that costs nothing.
+
+    A step is taken only while the model keeps every GPU layer it had at the
+    floor, keeps fitting if it fitted there, and stays inside the window it
+    was trained on (config.json). So a model with VRAM to spare gets a long
+    context, and one that already spills is not pushed further off the card.
+
+    A mixture-of-experts model placed with moe_plan is judged differently:
+    its layers never leave the card, and a step of context only moves about
+    one more block of experts to RAM, of which a token reads a small
+    fraction. So it takes the longest step at which the attention and the
+    cache still fit on the card whole.
+    """
+    cap = int(conf.get("max_ctx") or 0)
+    steps = [s for s in AUTO_CTX_STEPS if not cap or s <= cap]
+    if not steps:
+        return max(512, cap)
+    floor = assess(weights, conf, hw, steps[0], kv_bits)
+    plan = moe_plan(layout, conf, hw, steps[0], kv_bits)
+    if plan and plan["n_cpu_moe"] and floor["gpu_layers"] < floor["layers"]:
+        best = steps[0]
+        for step in steps[1:]:
+            if not moe_plan(layout, conf, hw, step, kv_bits):
+                break
+            if floor["fits_ram"] and not assess(weights, conf, hw, step,
+                                                kv_bits)["fits_ram"]:
+                break
+            best = step
+        return best
+    best = steps[0]
+    for step in steps[1:]:
+        a = assess(weights, conf, hw, step, kv_bits)
+        if a["gpu_layers"] < floor["gpu_layers"]:
+            break
+        if floor["verdict"] == "fits" and a["verdict"] != "fits":
+            break
+        if floor["fits_ram"] and not a["fits_ram"]:
+            break
+        best = step
+    return best
+
+
 # Everything memory-shaped is shown in GiB, because that is the unit a GPU
 # reports its VRAM in. HuggingFace lists file sizes in decimal GB, so a file
 # the repo calls 4.9 GB shows here as 4.6 GB — same bytes, honest unit.
 def verdict_text(a: dict, hw: dict) -> str:
     gb = 1024 ** 3
-    if a["verdict"] == "fits":
+    experts_ride = a.get("moe") and a["verdict"] in ("tight", "spills") \
+        and not a.get("moe_layer_split")
+    if experts_ride:
+        # A MoE model bigger than the card does not lose whole layers: its
+        # experts go to RAM instead, so a layer count would mislead.
+        base = (f"Bigger than the card: {a['needed']/gb:.1f} GB against "
+                f"{hw.get('vram', 0)/gb:.1f} GB.")
+    elif a["verdict"] == "fits":
         base = (f"Fits: {a['weights']/gb:.1f} GB of weights plus "
                 f"{a['kv']/gb:.1f} GB of KV cache at {a['ctx']:,} tokens, "
                 f"inside {hw.get('vram', 0)/gb:.1f} GB.")
@@ -448,10 +727,38 @@ def verdict_text(a: dict, hw: dict) -> str:
                  "cache, which is why it is smaller than the layer count "
                  "suggests.")
     if a.get("moe"):
-        base += (" Mixture of experts: only a few experts run per token, so "
-                 "layers in system RAM cost far less speed than they would "
-                 "for a dense model this size. No speed estimate — the bytes "
-                 "read per token cannot be measured from the file size.")
+        if a.get("n_cpu_moe"):
+            used, count = a.get("expert_used"), a.get("expert_count")
+            share = (f"only {used} of {count} experts"
+                     if used and count else "only a few experts")
+            base += (f" Mixture of experts: every layer runs on the GPU and "
+                     f"the experts of {a['n_cpu_moe']} of {a['layers']} "
+                     "blocks wait in system RAM (--n-cpu-moe). A token reads "
+                     f"{share} in each block, so that costs far less than "
+                     "moving whole layers off the card.")
+        elif a.get("moe_layer_split") == "fallback":
+            base += (" Mixture of experts, but llama-server did not start "
+                     "with its experts held in system RAM (a build older "
+                     "than --n-cpu-moe, or not enough room), so whole layers "
+                     "are split instead. Updating llama.cpp on the Engine "
+                     "page usually brings the faster placement back.")
+        elif a.get("moe_layer_split"):
+            base += (" Mixture of experts, but even its attention and cache "
+                     "do not fit on the card, so whole layers are split "
+                     "instead.")
+        elif experts_ride:
+            base += (" Mixture of experts: it loads with every layer on the "
+                     "GPU and the experts that do not fit in system RAM "
+                     "(--n-cpu-moe). A token reads only a few experts per "
+                     "block, so that costs far less than moving whole layers "
+                     "off the card.")
+        base += (" No speed estimate — the bytes read per token cannot be "
+                 "measured from the file size.")
+    if a.get("auto_ctx"):
+        base += (f" Auto context gives it {a['ctx']:,} tokens — the longest "
+                 + ("window at which its attention and cache still fit on "
+                    "the card." if a.get("n_cpu_moe") else
+                    "window that costs no GPU layer."))
     if not a["exact_kv"]:
         base += (" KV cache is estimated — the model's config.json could not "
                  "be read.")

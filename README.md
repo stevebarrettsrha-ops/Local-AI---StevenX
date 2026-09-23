@@ -5,9 +5,16 @@ actually hold, downloads the right GGUF, runs `llama-server`, and talks to it.
 
 Port 7806. `run.bat` on Windows, `./run.sh` elsewhere.
 
-Fresh installs default to an 8k context and an 8-bit KV cache. This is the
-balanced profile for an RTX 4060 8 GB / 32 GB RAM machine: Qwen3 8B Q4_K_M
-stays fully GPU-resident while retaining useful context headroom. Select 16-bit
+Fresh installs default to an **Auto** context and an 8-bit KV cache. Auto
+takes the longest window — 8k, 16k or 32k — that keeps every layer the model
+had on the GPU, judged against the VRAM that is actually free when it loads
+(the desktop and the browser use some) and never past the window the model
+was trained on. On an RTX 4060 8 GB / 32 GB RAM machine that gives Qwen3 8B
+Q4_K_M 16k, fully GPU-resident, where it used to get 8k; 32k needs the card
+otherwise idle. A model that already spills to RAM stays at 8k rather than
+being pushed further off the card (mixture-of-experts models work
+differently; see below). Pick a size by hand under Parameters to
+override it. Select 16-bit
 KV under Parameters only when maximum cache precision matters more than VRAM.
 The selected cache precision is passed directly to `llama-server` for both
 manual loads and automatic startup; fit calculations and runtime flags therefore
@@ -61,7 +68,9 @@ Loading a model always uses the real hardware.
 2. **Models** lists models worth running here. Open one, read the fit column,
    download the quant you want — resumable, with progress.
 3. **Load** starts `llama-server` with `-ngl` set from the fit calculation, so
-   as many layers as will fit go on the GPU and no more.
+   as many layers as will fit go on the GPU and no more. A mixture-of-experts
+   model keeps every layer on the GPU and leaves the experts that don't fit
+   in system RAM instead (see *Big models on a small card*).
 4. Chat. Replies stream, and each one reports its measured tokens per second.
 
 Any GGUF repo can be checked by pasting `user/Model-GGUF` into the box on the
@@ -83,10 +92,55 @@ click; `-ngl` is recomputed on every switch. The smaller Gemma 4 E2B build
 is in the catalogue for manual download. "Set up later" skips the whole
 thing.
 
-Parameters (context, temperature, top-p, reply limit, KV cache precision) are in
-the prompt bar. Context and KV precision only take effect on reload — the button
-does the reload for you. Setting KV cache to q8 halves that 1.1 GB, which is
-often what moves a model from *tight* to *fits*.
+Parameters (context, sampling, temperature, top-p, reply limit, KV cache
+precision) are in the prompt bar. Context and KV precision only take effect on
+reload — the button does the reload for you. Setting KV cache to q8 halves that
+1.1 GB, which is often what moves a model from *tight* to *fits*.
+
+### Getting the model's full strength
+
+The models in the catalogue are tuned to be run a particular way, and running
+them any other way costs more quality than the quant does. Four things used to
+hold them back here, most of all on coding:
+
+- **Sampling comes from the model itself.** Each model's repo publishes the
+  temperature, top-k and top-p its authors tuned it for, in
+  `generation_config.json`. The app reads that file the way it reads
+  `config.json` and samples with it — Qwen3 8B at temperature 0.6, top-k 20,
+  top-p 0.95, min-p 0; Qwen3 Coder at 0.7 / 20 / 0.8 with a 1.05 repeat
+  penalty. The Code page used to force temperature 0.2, which is nearly
+  greedy decoding. Qwen's model card warns that greedy decoding "can lead to
+  performance degradation and endless repetitions" in thinking mode. That
+  override is gone. Parameters shows which numbers are in use and where they
+  came from; **Manual** hands control back to the sliders, and a model that
+  publishes nothing uses the sliders anyway.
+- **Thinking is visible and has room.** Qwen3 and GLM reason before they
+  answer, and llama.cpp returns that reasoning separately. The app used to
+  throw it away, so the page sat blank. In an 8k window the reasoning could
+  use all the room, and the code was never written. Now the reasoning streams
+  into a folded panel above the answer, and Auto context gives it room. The
+  reasoning is never sent back to the model (history is the answers only, as
+  these models ask). If the window still runs out mid-thought, **Continue**
+  asks for the answer directly. Every continuation runs with thinking
+  switched off, so it carries on from where the text stopped instead of
+  working the whole task out again.
+- **The system prompt carries only what applies.** The Excel / Word /
+  PowerPoint convention (~400 tokens about CSV sheets and slide templates)
+  used to ride with every request, coding questions included. Now it is sent
+  only when the conversation is about an Office file. Recalled excerpts from
+  earlier chats are marked as background to use only when relevant, so a
+  small model no longer copies an old answer that merely shares a few words
+  with the new question. On the Code page your own system prompt no longer
+  replaces the coding conventions (whole files, `path=` blocks); they are
+  added after it.
+- **The model's own chat template.** `llama-server` is started with
+  `--jinja`. Current builds do this by default, but an older build from the
+  Engine page does not, and without it a thinking model's template never
+  runs.
+
+Tokens per second is now llama.cpp's own measurement, and it counts the
+reasoning. It used to estimate from the visible answer over the whole wall
+clock, which made a thinking model look several times slower than it was.
 
 ### Replies that finish
 
@@ -121,6 +175,40 @@ quant — even Q2_K is ~10 GiB against 8 GB of VRAM, so roughly two thirds of th
 layers sit on the GPU and the rest stream from system RAM at a few tokens a
 second. The fit column says exactly how many layers land where, so the decision
 is yours rather than a surprise after a 10 GB download.
+
+### Mixture-of-experts models: experts in RAM, layers on the card
+
+A mixture-of-experts model like Qwen3 Coder 30B A3B or GLM 4.7 Flash is a
+different case. Most of its file is expert weights, and each token reads
+only a few of them: 8 of 128 per layer for Qwen3 Coder. So when it is bigger
+than the card, it is not split into whole layers. Every layer goes on the
+GPU, including attention and the KV cache, which every token reads in full.
+The expert weights that don't fit wait in system RAM (llama.cpp's
+`--n-cpu-moe`). Only the few experts a token uses are read from there, so
+far less comes from slow memory than when whole layers sit on the CPU.
+
+How many blocks' experts stay in RAM is measured, not guessed. The app reads
+the GGUF file's own tensor table (just the header, about 40 ms even with a
+150k-token vocabulary), adds up the expert tensors block by block, and fills
+the card from the last block backwards. It uses the VRAM that is actually
+free at load time. On an RTX 4060 8 GB, Qwen3 Coder Q4_K_M loads with all
+48 layers on the GPU and roughly three quarters of its blocks' experts in
+RAM. It used to get about 19 whole layers on the GPU and the other 29,
+attention included, on the CPU. Auto context reads differently for these
+models too: another 8k of window moves only about one more block of experts
+to RAM, so Auto takes the longest window (up to 32k) at which the attention
+and cache still fit on the card.
+
+If llama-server doesn't start that way (a llama.cpp build older than
+`--n-cpu-moe`, or not enough room), the app falls back to the whole-layer
+split it always used, re-picks an Auto window by the layer rule, and says so
+when the load finishes. Updating llama.cpp on the Engine page brings the
+faster placement back.
+
+One smaller fix for every model: when a model fits entirely, `-ngl` is now
+the layer count plus one. llama.cpp counts the output layer (a
+vocabulary-sized matrix read every token) as one layer past the last block,
+so passing exactly the layer count had left it on the CPU.
 
 Two details that model family exposes, both handled:
 

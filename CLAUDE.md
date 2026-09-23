@@ -49,6 +49,38 @@
    `/tokenize`, and old messages are dropped here with the count reported.
    Never leave llama.cpp to context-shift silently — it drops the system
    prompt first.
+16. **Sampling comes from the model's own `generation_config.json`**, read
+   like config.json (`fit.model_sampling`) and saved beside the architecture
+   as `last_model_sampling`. Keys it leaves out take transformers' defaults;
+   min-p is 0. Never a table of per-model numbers, and never a fixed
+   temperature forced by a page — the Code page's old 0.2 was near-greedy,
+   which thinking models are explicitly warned off. `sampling: "manual"` is
+   the person's override; a model with no profile uses the sliders.
+17. **Reasoning is shown, never sent back.** `chat_stream` yields
+   `{"think": …}` for `reasoning_content`; it is stored as `reasoning`, and
+   history is built from `content` only. Continuations run with
+   `chat_template_kwargs: {"enable_thinking": false}`. A reply that is only
+   reasoning (the window ran out mid-thought) is stored and carried on with
+   `ANSWER_NUDGE`, not dropped.
+18. **Context defaults to Auto (`ctx: 0`)**: `fit.auto_ctx` takes the longest
+   of 8k/16k/32k that costs no GPU layer, capped by the model's
+   `max_position_embeddings`, judged at load against free VRAM measured
+   after the old model is stopped. Auto stays the setting; the window it
+   resolved to is `last_ctx`. Never reintroduce a fixed 8k default — a
+   thinking model can spend all of it before writing any code.
+19. **The Office-file convention rides only with Office requests**
+   (`wants_documents`), never with every coding question.
+20. **A MoE model bigger than the card keeps every layer on the GPU** and
+   holds the experts that do not fit in RAM with `--n-cpu-moe N`. N comes
+   from `fit.moe_plan` over `fit.gguf_layout` — the file's own tensor table,
+   matched with llama.cpp's `LLM_FFN_EXPS_REGEX` — never a parameter-count
+   estimate. `launch` falls back to the plain layer split (and re-picks an
+   Auto window by the layer rule) when that does not come up, so the
+   speed-up can never cost a load. A manual gpu_layers always gets the
+   plain split.
+21. **`-ngl` is the layer count plus one when every layer fits**
+   (`ngl_flag`): llama.cpp counts the output head as a layer past the last
+   block, so exactly the layer count leaves it on the CPU.
 
 ## Validation gate
 
