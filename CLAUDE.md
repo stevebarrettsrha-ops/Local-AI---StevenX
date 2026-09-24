@@ -89,6 +89,14 @@
    speed, and `/slots` `n_decoded` for tokens that are not text. Never an
    ETA. Whenever the stream ends, the `finally:` calls `Server.abort`, so a
    Stop ends generation instead of leaving it running unseen to the limit.
+23. **A streaming reply is redrawn at most once per animation frame**, in
+   place: `streamInto` builds its pieces once and `soon()` coalesces
+   tokens. Never re-render per token. That is O(n²), and on a laptop a long
+   file froze every button for a minute after the model finished. Whether
+   a pane follows new text is `ui.follow` from `watchScroll`: the reader's
+   own moves, not a distance from the end. `.thread` keeps
+   `overflow-anchor: none`, or the browser drags a reader who scrolled up
+   along with the text.
 
 ## Validation gate
 

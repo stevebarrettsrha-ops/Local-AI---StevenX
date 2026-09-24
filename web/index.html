@@ -126,7 +126,9 @@
 
   /* ---------- chat + code panes ---------- */
   .chatpane{display:flex;flex-direction:column;flex:1;min-height:0}
-  .thread{flex:1;overflow-y:auto;padding:26px 22px 8px}
+  /* the page decides when to follow new text (watchScroll); the browser's
+     own scroll anchoring would carry a reader who scrolled up along with it */
+  .thread{flex:1;overflow-y:auto;padding:26px 22px 8px;overflow-anchor:none}
   .inner{max-width:780px;margin:0 auto}
   .msg{margin-bottom:24px;display:flex;flex-direction:column}
   .msg .body{font-size:14.5px;line-height:1.65;min-width:0}
@@ -168,6 +170,7 @@
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
          vertical-align:-2px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:0}}
+  .msg .body .ans{display:contents}
   .livestat{margin-top:8px;font-size:11.5px;color:var(--dim)}
   .livestat::before{content:"";display:inline-block;width:6px;height:6px;
          border-radius:50%;background:var(--accent);margin-right:7px;
@@ -1350,8 +1353,17 @@ function show(view) {
 }
 
 /* ========================= chat + code ========================= */
-function renderThread(mode) {
+/* Draw the conversation. `keep` is for redraws after a reply: a reader who
+   scrolled up to read stays where they are, and a thinking panel they had
+   open stays open, instead of the whole thread jumping to the bottom. */
+function renderThread(mode, keep) {
   var ui = PANES[mode], box = $(ui.inner), chat = S.cur[mode];
+  var scroller = $(ui.scroll), top = scroller.scrollTop;
+  var stay = keep && ui.follow === false, opened = [];
+  if (keep) box.querySelectorAll(".msg").forEach(function (el, i) {
+    var d = el.querySelector("details.think");
+    if (d && d.open) opened.push(i);
+  });
   box.innerHTML = "";
   if (!chat || !chat.messages.length) {
     var ready = S.status && S.status.ready;
@@ -1435,7 +1447,48 @@ function renderThread(mode) {
     }
     box.appendChild(el);
   });
-  $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
+  var msgs = box.querySelectorAll(".msg");
+  opened.forEach(function (i) {
+    var d = msgs[i] && msgs[i].querySelector("details.think");
+    if (d) d.open = true;
+  });
+  if (stay) scroller.scrollTop = top;
+  else { scroller.scrollTop = scroller.scrollHeight; ui.follow = true; }
+}
+function atEnd(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+}
+/* Whether a pane follows the newest text. It does while its reader is at
+   the end. Moving up and away from the end — wheel, keys, scrollbar,
+   finger — lets go, and scrolling back down to the end takes hold again.
+   Only a downward scroll can take hold: a smooth scroll up starts out
+   still near the end, and must not be caught back on its first frame. The
+   wheel lets go at once, so even a trackpad nudge too small to leave the
+   end is not snapped straight back by the next token. The thinking panel's
+   own scroll is followed the same way, on its own. */
+function watchScroll(ui) {
+  var box = $(ui.scroll);
+  ui.follow = true; ui.thinkFollow = true;
+  box.addEventListener("wheel", function (e) {
+    if (e.deltaY >= 0) return;
+    var tt = e.target.closest && e.target.closest(".thinktext");
+    if (tt && tt.scrollTop > 0) ui.thinkFollow = false;
+    else ui.follow = false;
+  }, { passive: true });
+  box.addEventListener("keydown", function (e) {
+    if (/^(ArrowUp|PageUp|Home)$/.test(e.key)) ui.follow = false;
+  });
+  // scroll does not bubble; caught on the way down it covers the panel too
+  box.addEventListener("scroll", function (e) {
+    var t = e.target;
+    var key = t === box ? "follow"
+      : t.classList && t.classList.contains("thinktext") ? "thinkFollow" : "";
+    if (!key) return;
+    var down = t.scrollTop >= (t.lastTop || 0);
+    t.lastTop = t.scrollTop;
+    if (atEnd(t)) { if (down) ui[key] = true; }
+    else if (!down) ui[key] = false;
+  }, true);
 }
 function chatIcon(mode) {
   return mode === "code"
@@ -1578,7 +1631,7 @@ async function sendMessage(mode, text) {
       reasoning: res.thought, tps: res.tps, seconds: res.seconds,
       stop: res.stop, stopped: res.aborted, unfinished: res.unfinished,
       continued: rounds, tokens: res.tokens, error: res.error });
-    renderThread(mode);
+    renderThread(mode, true);
     // The server merged any continuations into one stored message; take its
     // copy so the page and the file on disk say the same thing.
     if (rounds) await syncChat(mode);
@@ -1587,7 +1640,7 @@ async function sendMessage(mode, text) {
     if (e.name === "AbortError") {
       chat.messages.push({ role: "assistant", content: acc, stopped: true,
         stop: "aborted" });
-      renderThread(mode);
+      renderThread(mode, true);
     } else {
       body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
     }
@@ -1655,7 +1708,7 @@ async function syncChat(mode) {
     var fresh = await api("/api/chats/" + chat.id);
     if (fresh && fresh.messages) S.cur[mode] = fresh;
   } catch (e) { return; }
-  renderThread(mode);
+  renderThread(mode, true);
   loadChats();
 }
 /* One request, streamed into `body`. `seed` is the text already on screen —
@@ -1667,26 +1720,70 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
   var out = { tps: 0, seconds: 0, stop: "", unfinished: false,
     aborted: false, error: "", ctx: null, thought: think,
     thoughtOnly: false, tokens: 0 };
-  var tail = note ? '<span class="cont-note">' + esc(note) + "</span>" : "";
   // what the server last said the model is doing, and when it last spoke
   var lv = { t0: Date.now(), heard: 0, alive: null };
+  var box = $(ui.scroll);
+  ui.thinkFollow = true;
+  // The reply is built once and then updated in place: the thinking panel
+  // keeps its own scroll and the open/shut the reader gave it, and its
+  // summary stays clickable, instead of being rebuilt under the pointer.
+  body.innerHTML = '<details class="think" hidden><summary></summary>' +
+    '<div class="thinktext"></div></details><div class="ans"></div>' +
+    (note ? '<span class="cont-note">' + esc(note) + "</span>" : "") +
+    '<span class="caret"></span><div class="livestat"></div>';
+  var el = { think: body.querySelector("details.think"),
+    summary: body.querySelector("summary"),
+    text: body.querySelector(".thinktext"),
+    ans: body.querySelector(".ans"), stat: body.querySelector(".livestat") };
+  // open while only thinking arrives, folded once the answer starts —
+  // unless the reader has touched it, or is up in the thread reading
+  var touched = false, folded = !!acc.trim();
+  el.think.open = !folded;
+  el.summary.addEventListener("click", function () { touched = true; });
   function status() {
-    var el = body.querySelector(".livestat");
-    if (el) el.textContent = liveLine(lv);
+    el.stat.textContent = liveLine(lv);
+    if (ui.follow) box.scrollTop = box.scrollHeight;
   }
-  function paint(live) {
+  function paint() {
     var answering = !!acc.trim();
-    body.innerHTML = thinkBlock(think, live && !answering) +
-      renderBody(acc, true) +
-      (live ? tail + '<span class="caret"></span>' +
-        '<div class="livestat"></div>' : "");
-    var tt = body.querySelector(".thinktext");
-    if (tt && live && !answering) tt.scrollTop = tt.scrollHeight;
-    if (live) status();
+    if (think.trim()) {
+      if (answering && !folded) {
+        folded = true;
+        if (!touched && ui.follow && ui.thinkFollow) el.think.open = false;
+      }
+      el.think.hidden = false;
+      el.summary.textContent = (answering ? "Reasoning · " : "Thinking… ") +
+        think.trim().split(/\s+/).length + " words";
+      el.text.textContent = think.trim();
+      if (ui.thinkFollow) el.text.scrollTop = el.text.scrollHeight;
+    }
+    el.ans.innerHTML = renderBody(acc, true);
+    status();
   }
-  paint(true);
+  // One redraw per frame, however fast the tokens come. Redrawing on every
+  // token re-rendered the whole reply each time; once that took longer than
+  // a token takes to arrive, the page fell behind, and working through the
+  // backlog it let no click through — a long file left it frozen for a
+  // minute after the model had finished.
+  var frame = 0, over = false;
+  function soon() {
+    if (frame || over) return;
+    frame = requestAnimationFrame(function () {
+      frame = 0;
+      if (!over) paint();
+    });
+  }
+  // the settled reply: the live pieces go, the panel keeps its open/shut
+  function finish() {
+    if (over) return;
+    over = true;
+    if (frame) { cancelAnimationFrame(frame); frame = 0; }
+    body.innerHTML = thinkBlock(think, el.think.open) + renderBody(acc, true);
+    if (ui.follow) box.scrollTop = box.scrollHeight;
+  }
+  paint();
   // the page's own clock: it keeps moving, and says so, if the server stops
-  var tick = setInterval(status, 1000);
+  var tick = setInterval(function () { if (!over) status(); }, 1000);
   try {
     var ctrl = new AbortController();
     S.abort = ctrl;
@@ -1711,23 +1808,14 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
           var d;
           try { d = JSON.parse(p.slice(5).trim()); } catch (e) { return; }
           lv.heard = Date.now();
-          if (d.alive) { lv.alive = d.alive; status(); }
+          if (d.alive) { lv.alive = d.alive; if (!over) status(); }
           if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
           if (d.ctx) { out.ctx = d.ctx; showCtx(d.ctx); }
-          if (d.think) {
-            think += d.think;
-            paint(true);
-            $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
-          }
-          if (d.delta) {
-            acc += d.delta;
-            onText(acc);
-            paint(true);
-            $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
-          }
+          if (d.think) { think += d.think; soon(); }
+          if (d.delta) { acc += d.delta; onText(acc); soon(); }
           if (d.error) { out.error = d.error; toast(d.error, true); }
           if (d.done) {
-            paint(false);
+            finish();
             out.tps = d.tps; out.seconds = d.seconds;
             out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
             out.thoughtOnly = !!d.thought_only;
@@ -1737,13 +1825,18 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
           }
         });
       }
+      finish();
     } catch (e) {
       if (e.name !== "AbortError") throw e;
       out.aborted = true; out.stop = "aborted";
-      paint(false);
+      finish();
     }
   } finally {
     clearInterval(tick);
+    // an error is written into the body by the caller; no late frame may
+    // paint over it
+    over = true;
+    if (frame) cancelAnimationFrame(frame);
   }
   out.thought = think;
   onText(acc);
@@ -2230,6 +2323,7 @@ function wire() {
 
   ["chat", "code"].forEach(function (mode) {
     var ui = PANES[mode];
+    watchScroll(ui);
     $(ui.input).addEventListener("input", function (e) { grow(e.target); });
     $(ui.input).addEventListener("keydown", function (e) {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(mode); } });

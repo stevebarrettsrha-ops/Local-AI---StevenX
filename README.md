@@ -192,6 +192,20 @@ readable kept running, unseen, until the reply limit, and the next question
 waited behind it. The app now hears from the model every second and hangs
 up the moment the page goes, so llama-server stops at once.
 
+**The page stays responsive during a long reply.** It used to redraw the
+whole reply for every token. Once a reply grew long, a redraw took longer
+than a token takes to arrive, the page fell behind, and it handled no clicks
+until it caught up. On an ordinary laptop, a single-file game left every
+button and tab dead for about a minute after the model had finished. Now the
+reply is redrawn at most once per screen frame, however fast the tokens
+come.
+
+**You can scroll up while a reply is being written.** The thread follows the
+new text only while you are at the bottom. Scroll up, even slightly, and it
+stays where you put it. Scroll back to the bottom and it follows again. The
+thinking panel works the same way on its own, and clicking *Thinking…*
+folds it even while the reply is streaming.
+
 A question that never got an answer (Stop pressed before any text) is joined
 to your next message, because several chat templates, Gemma's among them,
 refuse two user turns in a row.
