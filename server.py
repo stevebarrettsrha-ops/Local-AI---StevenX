@@ -14,7 +14,9 @@ import math
 import os
 import queue
 import re
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -73,7 +75,9 @@ def load_config() -> dict:
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception:
-            pass
+            # The migrations below save straight away: without a copy, a
+            # damaged file would take the token and workspace with it.
+            keep_aside(CONFIG_PATH)
     if not cfg.get("reply_limit_migrated"):
         # The old 1024-token reply limit was a default nobody chose, and it
         # ended long answers mid-sentence with no explanation. Move that one
@@ -91,6 +95,16 @@ def load_config() -> dict:
         cfg["ctx_auto_migrated"] = True
         save_config(cfg)
     return cfg
+
+
+def keep_aside(path: Path) -> None:
+    """Move an unreadable data file out of the way, kept, before anything
+    writes a fresh one over it."""
+    try:
+        path.replace(path.with_name(
+            f"{path.name}.unreadable-{time.strftime('%Y%m%d-%H%M%S')}"))
+    except OSError:
+        pass
 
 
 def _atomic_json(path: Path, value) -> None:
@@ -121,14 +135,40 @@ cfg = load_config()
 # --------------------------------------------------------------------------- #
 # chats
 # --------------------------------------------------------------------------- #
-def read_chats() -> list[dict]:
+def load_chats() -> list[dict]:
+    """Every chat, for code that writes the file back. A file that cannot
+    be read is never taken for an empty history: that turned the next save
+    into a single chat, and the whole history was gone. A locked file (an
+    antivirus scan on Windows) is retried, then the write fails instead; a
+    damaged one is kept aside under another name."""
     with chats_lock:
-        if not CHATS_PATH.exists():
+        for attempt in range(5):
+            if not CHATS_PATH.exists():
+                return []
+            try:
+                raw = CHATS_PATH.read_text(encoding="utf-8")
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+                continue
+            try:
+                items = json.loads(raw)
+                if isinstance(items, list):
+                    return items
+            except ValueError:
+                pass
+            keep_aside(CHATS_PATH)
             return []
-        try:
-            return json.loads(CHATS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        return []
+
+
+def read_chats() -> list[dict]:
+    """Every chat, for code that only reads."""
+    try:
+        return load_chats()
+    except OSError:
+        return []
 
 
 def write_chats(items: list[dict]) -> None:
@@ -144,7 +184,7 @@ def put_chat(chat: dict) -> None:
     # Hold one re-entrant lock across the entire read/modify/write operation.
     # Separate locks let simultaneous streams overwrite one another's chats.
     with chats_lock:
-        items = read_chats()
+        items = load_chats()
         for i, c in enumerate(items):
             if c["id"] == chat["id"]:
                 items[i] = chat
@@ -165,6 +205,35 @@ def index():
 @app.get("/web/<path:name>")
 def web_asset(name: str):
     return send_from_directory(WEB_DIR, name)
+
+
+LOCAL_NAMES = ("127.0.0.1", "localhost", "[::1]")
+
+
+def _host_name(host: str) -> str:
+    host = (host or "").lower()
+    return host.split("]")[0] + "]" if host.startswith("[") \
+        else host.split(":")[0]
+
+
+@app.before_request
+def local_only():
+    """Only this machine's own page may drive the app. Any web page the
+    person visits can send requests to 127.0.0.1, and one that rebinds its
+    own hostname to 127.0.0.1 can read the answers too — with a workspace
+    endpoint that runs commands, that is code execution. So the Host must
+    be a loopback name (a rebinding page arrives under its own), and a
+    request that changes anything must not come from another site's page."""
+    if _host_name(request.host) not in LOCAL_NAMES:
+        return jsonify({"error": "Llama Studio only answers its own "
+                                 "page on this machine."}), 403
+    origin = request.headers.get("Origin")
+    if origin and request.method not in ("GET", "HEAD", "OPTIONS"):
+        if origin.rstrip("/").lower() not in {
+                f"http://{n}:{PORT}" for n in LOCAL_NAMES}:
+            return jsonify({"error": "Refused a request from another "
+                                     "site."}), 403
+    return None
 
 
 @app.after_request
@@ -291,15 +360,34 @@ def read_memory() -> str:
             return ""
 
 
-def write_memory(text: str) -> None:
+def newest_lines(text: str, limit: int) -> str:
+    """The newest whole lines of `text` that fit in `limit` characters.
+    Memory grows at the end, so the end is what matters: cutting at a
+    character count kept the oldest notes and dropped every new one."""
+    if len(text) <= limit:
+        return text
+    kept, size = [], 0
+    for line in reversed(text.splitlines()):
+        if size + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        size += len(line) + 1
+    return "\n".join(reversed(kept)) + ("\n" if kept else "")
+
+
+def write_memory(text: str) -> bool:
+    """Save the memory file; False when it had to drop its oldest lines
+    to stay within MEMORY_CAP."""
     with memory_lock:
         MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = MEMORY_PATH.with_name(MEMORY_PATH.name + ".tmp")
+        kept = newest_lines(text, MEMORY_CAP)
         try:
-            tmp.write_text(text[:MEMORY_CAP], encoding="utf-8")
+            tmp.write_text(kept, encoding="utf-8")
             os.replace(tmp, MEMORY_PATH)
         finally:
             tmp.unlink(missing_ok=True)
+        return kept == text
 
 
 def remember_lines(reply: str) -> int:
@@ -326,9 +414,13 @@ EMBED_DIR = "embed"
 EMBED_SIM_MIN = 0.5
 EMB_PATH = DATA_DIR / "embeddings.json"
 embedder = engine.EmbedServer(8082)
+# _emb_lock guards the index itself: recall reads it while indexing adds
+# to it on another thread, which used to fail the chat with "dictionary
+# changed size during iteration". _emb_run lets one indexing pass run at a
+# time; a second caller simply skips.
 _emb_lock = threading.Lock()
+_emb_run = threading.Lock()
 _emb_index: dict | None = None
-_emb_busy = False
 
 
 def embed_model_file() -> Path | None:
@@ -354,7 +446,26 @@ def emb_index() -> dict:
 
 def emb_save() -> None:
     with _emb_lock:
-        _atomic_json(EMB_PATH, _emb_index or {})
+        _atomic_json(EMB_PATH, dict(_emb_index or {}))
+
+
+def emb_entries() -> list[dict]:
+    """A snapshot of the index, safe to walk while indexing goes on."""
+    emb_index()
+    with _emb_lock:
+        return list((_emb_index or {}).values())
+
+
+def emb_forget(chat_id: str) -> None:
+    """Drop a deleted conversation from the index, so what it said is not
+    recalled into other conversations afterwards."""
+    idx = emb_index()
+    with _emb_lock:
+        gone = [k for k in idx if k.startswith(chat_id + ":")]
+        for k in gone:
+            del idx[k]
+    if gone:
+        emb_save()
 
 
 def ensure_embedder(wait: int = 15) -> bool:
@@ -365,7 +476,12 @@ def ensure_embedder(wait: int = 15) -> bool:
         return True
     if not embedder.alive():
         try:
-            embedder.start(str(model), 0, 2048, ["--embeddings"])
+            # An embedding model reads its whole input in one micro-batch,
+            # and llama-server refuses an input longer than that (512 by
+            # default): one long exchange, CJK above all, then failed the
+            # batch it sat in on every pass. -ub as large as the window.
+            embedder.start(str(model), 0, 2048,
+                           ["--embeddings", "-b", "2048", "-ub", "2048"])
         except Exception:
             return False
     return embedder.wait_ready(wait)
@@ -393,11 +509,11 @@ def index_exchanges() -> None:
     """Embed every stored exchange the index does not have yet. The
     nomic prefixes (search_document / search_query) are the model's own
     convention for asymmetric retrieval."""
-    global _emb_busy
-    if _emb_busy or not ensure_embedder():
+    if not _emb_run.acquire(blocking=False):
         return
-    _emb_busy = True
     try:
+        if not ensure_embedder():
+            return
         idx = emb_index()
         todo = []
         for c, i, um, am in _exchange_rows():
@@ -410,20 +526,33 @@ def index_exchanges() -> None:
             doc = "search_document: " + um[:300].replace("\n", " ") + \
                 " " + am[:500].replace("\n", " ")
             todo.append((key, c, um, am, doc))
+        added = 0
         for start in range(0, len(todo), 8):
             batch = todo[start:start + 8]
             try:
                 vecs = embedder.embed([t[4] for t in batch])
             except Exception:
-                return
-            for (key, c, um, am, _), v in zip(batch, vecs):
-                idx[key] = {"chat": c["id"], "title": c.get("title", ""),
-                            "q": um[:200].replace("\n", " "),
-                            "a": am[:400].replace("\n", " "), "v": v}
-        if todo:
+                # One input the server refuses must not stop the rest:
+                # try them one by one and leave out only the failure.
+                vecs = []
+                for t in batch:
+                    try:
+                        vecs.append(embedder.embed([t[4]])[0])
+                    except Exception:
+                        vecs.append(None)
+            with _emb_lock:
+                for (key, c, um, am, _), v in zip(batch, vecs):
+                    if v is None:
+                        continue
+                    idx[key] = {"chat": c["id"],
+                                "title": c.get("title", ""),
+                                "q": um[:200].replace("\n", " "),
+                                "a": am[:400].replace("\n", " "), "v": v}
+                    added += 1
+        if added:
             emb_save()
     finally:
-        _emb_busy = False
+        _emb_run.release()
 
 
 def semantic_recall(query: str, exclude_id: str,
@@ -437,8 +566,8 @@ def semantic_recall(query: str, exclude_id: str,
         qv = embedder.embed(["search_query: " + query[:1000]])[0]
     except Exception:
         return None
-    scored = sorted(((_cos(qv, e["v"]), e) for e in emb_index().values()
-                     if e.get("chat") != exclude_id),
+    scored = sorted(((_cos(qv, e["v"]), e) for e in emb_entries()
+                     if e.get("chat") != exclude_id and e.get("v")),
                     key=lambda t: -t[0])
     out = []
     for sim, e in scored[:limit]:
@@ -590,13 +719,25 @@ def _clear_slides(prs) -> None:
 
 
 def _pick_layout(prs):
-    """The first layout with a title placeholder (idx 0) and at least one
-    body placeholder — the shape of 'title and content' in any deck."""
-    for ly in prs.slide_layouts:
-        idxs = [ph.placeholder_format.idx for ph in ly.placeholders]
-        if 0 in idxs and any(i != 0 for i in idxs):
+    """The deck's 'title and content' layout: a title and a body (or
+    content) placeholder. Any title plus any second placeholder used to
+    do, and the Title Slide — title and subtitle — comes first in nearly
+    every deck, so every slide came out as a title slide, bullets centred
+    in the subtitle."""
+    from pptx.enum.shapes import PP_PLACEHOLDER as PH
+    titles = (PH.TITLE, PH.CENTER_TITLE)
+    bodies = (PH.BODY, PH.OBJECT)
+    layouts = list(prs.slide_layouts)
+    kinds = [[ph.placeholder_format.type for ph in ly.placeholders]
+             for ly in layouts]
+    for ly, k in zip(layouts, kinds):
+        if any(t in k for t in titles) and any(b in k for b in bodies):
             return ly
-    return prs.slide_layouts[0]
+    for ly, k in zip(layouts, kinds):
+        if any(t in k for t in titles) and \
+                any(x not in titles and x != PH.SUBTITLE for x in k):
+            return ly
+    return layouts[1] if len(layouts) > 1 else layouts[0]
 
 
 def build_xlsx(text: str) -> tuple[bytes, str]:
@@ -618,7 +759,10 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
         if m:
             if rows:
                 sheets.append((name, rows, chart))
-            name, rows, chart = m.group(1).strip()[:31], [], None
+            # Excel refuses : / \ ? * [ ] in a sheet name, and quotes at
+            # its ends; "Revenue: 2024" failed the whole export
+            name = re.sub(r"[\\/*?:\[\]]", "-", m.group(1).strip())
+            name, rows, chart = name.strip("'")[:31], [], None
         elif line.strip():
             rows.append(next(csv.reader([line])))
     if rows:
@@ -630,7 +774,10 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
         for r, row in enumerate(srows, 1):
             for c, val in enumerate(row, 1):
                 v = val.strip()
-                if v and re.fullmatch(r"-?\d+(\.\d+)?", v):
+                # a leading zero is an identifier (zip code, part no.),
+                # not a number: "02134" stays text, never 2134
+                if v and re.fullmatch(r"-?\d+(\.\d+)?", v) and \
+                        not re.fullmatch(r"-?0\d+(\.\d+)?", v):
                     v = float(v) if "." in v else int(v)
                 cell = ws.cell(row=r, column=c, value=v)
                 if r == 1:
@@ -676,6 +823,11 @@ def build_xlsx(text: str) -> tuple[bytes, str]:
                                             max_row=nrows))
             ch.title = ctitle or sname
             ch.height, ch.width = 8, 15
+            if ctype != "pie":
+                # openpyxl 3.1 leaves the axes' delete flag unset, and
+                # Excel then hides both axes: no labels, no scale
+                ch.x_axis.delete = False
+                ch.y_axis.delete = False
             ws.add_chart(ch, f"{get_column_letter(ncols + 2)}2")
     buf = io.BytesIO()
     wb.save(buf)
@@ -837,19 +989,32 @@ def build_pptx(text: str) -> tuple[bytes, str]:
                 int(sw * 0.55), int(sh * 0.6))
         frame = body_ph.text_frame
         if sl["images"]:
-            # bullets keep the left; pictures take the right, whatever
-            # the template's slide size
-            body_ph.width = int(sw * 0.48)
+            # Bullets keep the left, pictures take the right, whatever the
+            # template's slide size. The box keeps the position and height
+            # it inherits: setting the width alone wrote a box with no
+            # position and no height.
+            left, top, height = body_ph.left, body_ph.top, body_ph.height
+            body_ph.left, body_ph.top = left, top
+            body_ph.width, body_ph.height = int(sw * 0.48), height
         for i, btxt in enumerate(sl["bullets"][:12]):
             para = frame.paragraphs[0] if i == 0 else frame.add_paragraph()
             para.text = btxt[:200]
             for run in para.runs:
                 if fg is not None:
                     run.font.color.rgb = fg
-        for j, img in enumerate(sl["images"][:2]):
-            slide.shapes.add_picture(str(img), int(sw * 0.54),
-                                     int(sh * (0.22 + j * 0.37)),
-                                     width=int(sw * 0.41))
+        imgs = sl["images"][:2]
+        gap, top0 = int(sh * 0.03), int(sh * 0.2)
+        box_w = int(sw * 0.41)
+        box_h = (int(sh * 0.72) - gap * (len(imgs) - 1)) // max(1, len(imgs))
+        for j, img in enumerate(imgs):
+            # each picture scaled to fit its share of the right side, so a
+            # square one never runs off the bottom of the slide
+            pic = slide.shapes.add_picture(str(img), int(sw * 0.54),
+                                           top0 + j * (box_h + gap),
+                                           width=box_w)
+            if pic.height > box_h:
+                pic.width = int(pic.width * box_h / pic.height)
+                pic.height = box_h
     buf = io.BytesIO()
     prs.save(buf)
     return buf.getvalue(), ("application/vnd.openxmlformats-officedocument"
@@ -861,12 +1026,14 @@ DOC_BUILDERS = {"xlsx": build_xlsx, "docx": build_docx, "pptx": build_pptx}
 
 @app.post("/api/doc")
 def api_doc():
-    b = request.get_json(silent=True) or {}
-    kind = (b.get("kind") or "").lower()
+    b = request.get_json(silent=True)
+    b = b if isinstance(b, dict) else {}
+    kind = str(b.get("kind") or "").lower()
     if kind not in DOC_BUILDERS:
         return jsonify({"error": "Unknown document kind."}), 400
     title = re.sub(r"[^A-Za-z0-9 _-]+", "",
-                   b.get("title") or "document").strip()[:48] or "document"
+                   str(b.get("title") or "document")).strip()[:48] \
+        or "document"
     try:
         data, mime = DOC_BUILDERS[kind](b.get("content") or "")
     except ImportError as exc:
@@ -1116,31 +1283,43 @@ def recall_snippets(query: str, exclude_id: str, limit: int = 2) -> list[str]:
 
 
 def context_extra(query: str, chat_id: str) -> str:
-    """What rides along with the system prompt: remembered notes, and
-    (when enabled) excerpts from earlier conversations."""
-    parts = []
+    """What rides along with the system prompt: the remembered notes.
+
+    Only what stays the same from turn to turn belongs here. llama.cpp
+    keeps the prompt it has already read and reads again from the first
+    token that differs; anything that changes with each question at the
+    top made it re-read the whole conversation before every reply."""
     mem = read_memory().strip()
+    parts = []
     if mem:
         parts.append("Things to remember from earlier (persistent memory; "
-                     "the user can edit these):\n" + mem[:MEMORY_INJECT])
-    if cfg.get("recall", True):
-        snips = semantic_recall(query, chat_id)
-        mode = "meaning"
-        if snips is None:
-            snips = recall_snippets(query, chat_id)
-            mode = "keywords"
-        if snips:
-            # Background, not orders: a small model otherwise copies an old
-            # answer that merely shares a few words with the new question.
-            parts.append("Excerpts from earlier conversations (matched by " +
-                         mode + "). Use them only if they bear on the "
-                         "current question; otherwise ignore them:\n" +
-                         "\n".join(snips))
-    if parts:
+                     "the user can edit these):\n" +
+                     newest_lines(mem, MEMORY_INJECT))
+    if mem or cfg.get("recall", True):
         parts.append("To permanently remember a new important fact, put it "
                      "on its own line starting with remember: in your "
                      "reply.")
     return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+def recall_extra(query: str, chat_id: str) -> str:
+    """Excerpts from earlier conversations that bear on this question,
+    when recall is on. They change with every question, so they go with
+    the question itself, at the end of the prompt, not at its top."""
+    if not cfg.get("recall", True):
+        return ""
+    snips = semantic_recall(query, chat_id)
+    mode = "meaning"
+    if snips is None:
+        snips = recall_snippets(query, chat_id)
+        mode = "keywords"
+    if not snips:
+        return ""
+    # Background, not orders: a small model otherwise copies an old answer
+    # that merely shares a few words with the new question.
+    return ("Excerpts from earlier conversations (matched by " + mode +
+            "). Use them only if they bear on the question below; "
+            "otherwise ignore them:\n" + "\n".join(snips))
 
 
 @app.get("/api/memory")
@@ -1151,9 +1330,12 @@ def api_memory_get():
 
 @app.post("/api/memory")
 def api_memory_set():
-    b = request.get_json(silent=True) or {}
-    write_memory(str(b.get("text") or ""))
-    return jsonify({"ok": True})
+    b = request.get_json(silent=True)
+    if not isinstance(b, dict):
+        return jsonify({"error": "Send the memory as {\"text\": …}."}), 400
+    whole = write_memory(str(b.get("text") or ""))
+    return jsonify({"ok": True, "trimmed": not whole,
+                    "cap": MEMORY_CAP, "sent": MEMORY_INJECT})
 
 
 # --------------------------------------------------------------------------- #
@@ -1191,6 +1373,35 @@ def model_runtime_args(kv_bits: int) -> list[str]:
     if int(kv_bits) == 8:
         return ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
     return []
+
+
+# Only when nothing better can be read at all: flagged as estimated.
+GUESSED_SHAPE = {"layers": 32, "kv_layers": 32, "kv_heads": 8,
+                 "head_dim": 128, "exact": False, "hybrid": False,
+                 "moe": False, "max_ctx": 0}
+
+
+def model_shape(model: dict, online: bool = True) -> dict:
+    """The architecture a file on disk is judged and placed by.
+
+    config.json (the catalogue's, or the one saved at the last load when
+    `online` is off) when it describes this very file — same layer count
+    as the file's own header; otherwise the header itself, which is what
+    llama.cpp will read. A catalogue name can match a bigger sibling, and
+    a GGUF-only repo often has no config.json at all."""
+    own = None if model.get("partial") else \
+        fit.file_config(model.get("path") or "")
+    conf = None
+    if online:
+        entry = fit.catalogue_match(model["name"])
+        if entry:
+            conf = fit.model_config(cfg, entry.get("config_repo", ""))
+    else:
+        conf = saved_model_config(model["name"])
+    if conf and conf.get("exact") and (
+            not own or int(conf["layers"]) == own["layers"]):
+        return conf
+    return own or conf or dict(GUESSED_SHAPE)
 
 
 def saved_model_config(name: str) -> dict | None:
@@ -1260,7 +1471,10 @@ def launch(model: dict, conf: dict, hw: dict, ctx: int, bits: int,
     `auto` says ctx came from Auto: a window picked for the expert
     placement is picked again by the layer rule if that placement fails."""
     def split(ctx: int) -> tuple[dict, int]:
-        a = fit.assess(model["size"], conf, hw, ctx, bits)
+        # Judged on the VRAM free now, as the window and the expert plan
+        # are: on the whole card, a browser holding 1–2 GB made the split
+        # ask for more than there was, and the load failed or spilled.
+        a = fit.assess(model["size"], conf, free_vram_hw(hw), ctx, bits)
         requested = a["gpu_layers"] if gpu_layers is None \
             else int(gpu_layers)
         # A caller may deliberately offload fewer layers, but never exceed
@@ -1367,13 +1581,13 @@ def load_model_by_name(name: str, ctx: int | None = None,
             raise RuntimeError("That model is not on disk.")
         if model["partial"]:
             raise RuntimeError("That download has not finished.")
+        if model.get("companion"):
+            raise RuntimeError("That is a vision projector, a companion "
+                               "file, not a model to load on its own.")
         chosen = int(ctx or 0)
         if chosen and not 512 <= chosen <= 262_144:
             raise RuntimeError("Context must be between 512 and 262144.")
-        entry = fit.catalogue_match(name)
-        conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
-            if entry else {"layers": 32, "kv_layers": 32, "kv_heads": 8,
-                           "head_dim": 128, "exact": False, "max_ctx": 0}
+        conf = model_shape(model)
         # The model being replaced goes before the card is measured, so the
         # free VRAM Auto sees is what the new one really has.
         server.stop()
@@ -1382,8 +1596,12 @@ def load_model_by_name(name: str, ctx: int | None = None,
         hw = fit.hardware({})
         bits = int(cfg.get("kv_bits", 8))
         auto = not chosen and not int(cfg.get("ctx") or 0)
+        # A manual split gets the plain layer split, so its window is
+        # picked by the layer rule too, not for an expert placement that
+        # will not be used.
         ctx = resolve_ctx(model["size"], conf, hw, bits, chosen,
-                          fit.gguf_layout(model["path"]))
+                          fit.gguf_layout(model["path"])
+                          if gpu_layers is None else None)
         placed = launch(model, conf, hw, ctx, bits, gpu_layers, auto)
         ctx = placed["ctx"]
         with config_lock:
@@ -1554,8 +1772,13 @@ def api_fit():
     for f in files:
         a = assess_at(f["size"], conf, hw, ctx)
         out.append({**f, "fit": a, "why": fit.verdict_text(a, hw)})
-    best = next((f for f in out if f["fit"]["verdict"] == "fits"
-                 and not f["split"] and not f.get("companion")), None)
+    # Files come lowest quality first, so the best that fits is the last
+    # one that does — not the first, which named Q2_K on almost any card.
+    # Above Q8_0 is twice the size for no quality a reader would notice.
+    fits = [f for f in out if f["fit"]["verdict"] == "fits"
+            and not f["split"] and not f.get("companion")]
+    sane = [f for f in fits if f["quant"] not in ("BF16", "F16", "F32")]
+    best = (sane or fits or [None])[-1]
     return jsonify({"repo": repo, "ctx": ctx, "hardware": hw, "config": conf,
                     "files": out, "recommended": best["name"] if best else ""})
 
@@ -1569,10 +1792,12 @@ def api_fit_local():
     for m in engine.local_models():
         if m.get("folder") in (EMBED_DIR, IMAGE_DIR):
             continue
-        entry = fit.catalogue_match(m["name"])
-        conf = fit.model_config(cfg, (entry or {}).get("config_repo", "")) \
-            if entry else {"layers": 32, "kv_heads": 8, "head_dim": 128,
-                           "exact": False}
+        if m["companion"]:
+            out.append({**m, "fit": {}, "why": "vision projector — a "
+                        "companion file for its model, not a model to "
+                        "load on its own"})
+            continue
+        conf = model_shape(m)
         a = assess_at(m["size"], conf, hw, ctx,
                       "" if m["partial"] else m["path"])
         out.append({**m, "fit": a, "why": fit.verdict_text(a, hw)})
@@ -1617,11 +1842,20 @@ def assess_at(size: int, conf: dict, hw: dict, ctx: int,
 # --------------------------------------------------------------------------- #
 # engine control
 # --------------------------------------------------------------------------- #
+def stop_engines() -> None:
+    """Everything that runs from ./llama.cpp, stopped so a new build can
+    take its place (Windows will not replace a DLL that is in use)."""
+    with engine_lock:
+        server.stop()
+    embedder.stop()
+
+
 @app.post("/api/engine/install")
 def api_engine_install():
     try:
         return jsonify({"ok": True,
-                        "task": engine.install(fit.hardware({})).view()})
+                        "task": engine.install(fit.hardware({}),
+                                               stop_engines).view()})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -1785,7 +2019,9 @@ def ws_resolve(rel: str) -> Path:
         raise RuntimeError("No folder is open.")
     target = (root / rel).resolve()
     root = root.resolve()
-    if target != root and not str(target).startswith(str(root) + os.sep):
+    # by path parts, not a string prefix: a drive or filesystem root as
+    # the folder doubled its separator ("//") and refused every file
+    if target != root and root not in target.parents:
         raise RuntimeError("That path is outside the open folder.")
     return target
 
@@ -1864,12 +2100,22 @@ def api_workspace_write():
         if content is None:
             raise RuntimeError("Nothing to write.")
         backup = ""
+        crlf = False
         if target.exists():
+            old = target.read_bytes()
+            crlf = b"\r\n" in old
             bak = target.with_name(target.name + ".bak")
-            bak.write_bytes(target.read_bytes())
+            # a .bak that is a link would carry this write out of the folder
+            bak.unlink(missing_ok=True)
+            bak.write_bytes(old)
             backup = bak.name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        # The file keeps the line endings it had. Text mode turned every
+        # LF into CRLF on Windows, so one edit changed every line in git.
+        text = str(content).replace("\r\n", "\n")
+        if crlf:
+            text = text.replace("\n", "\r\n")
+        target.write_bytes(text.encode("utf-8"))
         return jsonify({"ok": True, "path": b.get("path"), "backup": backup})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
@@ -1890,19 +2136,58 @@ def api_workspace_run():
     cfg["run_command"] = cmd
     save_config(cfg)
     started = time.time()
+    posix = os.name != "nt"
+    # Its own process group, so what it started can be stopped with it (a
+    # server the program launched kept running, and on Windows kept the
+    # pipe open and the request hanging forever). Output goes to a file,
+    # not a pipe: the command's own exit ends the wait, even when a child
+    # it left behind still holds the output open. No stdin: a program
+    # waiting on input() fails fast instead of waiting for a keyboard that
+    # is not there. Read as UTF-8 whatever the console's code page.
+    with tempfile.TemporaryFile() as log:
+        try:
+            p = subprocess.Popen(
+                cmd, shell=True, cwd=str(root), stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                start_new_session=posix,
+                creationflags=0 if posix else
+                subprocess.CREATE_NEW_PROCESS_GROUP)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": str(exc)}), 400
+        try:
+            p.wait(timeout=60)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        kill_tree(p)          # all of it on a timeout, strays otherwise
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        log.seek(0)
+        out = log.read()[-64000:].decode("utf-8", "replace").strip()
+    if timed_out:
+        out = (out + "\n\n" if out else "") + "Timed out after 60 " \
+            "seconds — stopped, with everything it started."
+    return jsonify({"ok": True, "exit": -1 if timed_out else p.returncode,
+                    "output": out[-8000:],
+                    "seconds": round(time.time() - started, 1)})
+
+
+def kill_tree(p: subprocess.Popen) -> None:
+    """Stop a command and every process it started."""
     try:
-        p = subprocess.run(cmd, shell=True, cwd=str(root),
-                           capture_output=True, text=True, timeout=60)
-        out = ((p.stdout or "") + (p.stderr or "")).strip()
-        return jsonify({"ok": True, "exit": p.returncode,
-                        "output": out[-8000:],
-                        "seconds": round(time.time() - started, 1)})
-    except subprocess.TimeoutExpired:
-        return jsonify({"ok": True, "exit": -1,
-                        "output": "Timed out after 60 seconds.",
-                        "seconds": 60.0})
-    except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": str(exc)}), 400
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                           capture_output=True, timeout=15)
+        else:
+            os.killpg(p.pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1923,7 +2208,10 @@ def api_chat(chat_id: str):
 
 @app.delete("/api/chats/<chat_id>")
 def api_chat_delete(chat_id: str):
-    write_chats([c for c in read_chats() if c["id"] != chat_id])
+    with chats_lock:
+        write_chats([c for c in load_chats() if c["id"] != chat_id])
+    # what it said stops being recalled into other conversations
+    emb_forget(chat_id)
     return jsonify({"ok": True})
 
 
@@ -1975,7 +2263,8 @@ def turns(messages: list[dict]) -> list[dict]:
     return out
 
 
-def budget(system_text: str, history: list[dict], want: int) -> dict:
+def budget(system_text: str, history: list[dict], want: int,
+           keep: int = 1) -> dict:
     """Fit prompt and reply inside the context window the server really has.
 
     Handed more prompt than it can hold, llama.cpp either refuses the request
@@ -1984,6 +2273,14 @@ def budget(system_text: str, history: list[dict], want: int) -> dict:
     app forgetting the conversation mid-answer. So the trimming happens here
     instead: deliberate, counted with the model's own tokenizer, and
     reported back to the page.
+
+    The last `keep` messages are never dropped: the question being asked,
+    or for a continuation the question, the reply being carried on and the
+    nudge. A continuation that lost its own reply carried on from nothing
+    and appended unrelated text to the answer. If even those do not fit,
+    the start of the reply is cut, since the model continues from its end.
+    And what is sent always opens with the person: several chat templates
+    (Gemma, Mistral) refuse a conversation that opens with the model.
     """
     n_ctx = server.n_ctx() or int(cfg.get("ctx") or 8192)
     want = max(0, int(want or 0))
@@ -1996,11 +2293,24 @@ def budget(system_text: str, history: list[dict], want: int) -> dict:
     if prompt > n_ctx - REPLY_FLOOR and len(msgs) > 1:
         # Only the path that needs per-message counts pays for them.
         counts = [server.count_tokens(m["content"]) + PER_MSG for m in msgs]
-        # The newest turn is never dropped — it is the question being asked.
-        while len(msgs) > 1 and fixed + sum(counts) > n_ctx - REPLY_FLOOR:
+        keep = max(1, min(keep, len(msgs)))
+        while len(msgs) > keep and fixed + sum(counts) > n_ctx - REPLY_FLOOR:
             msgs.pop(0)
             counts.pop(0)
             dropped += 1
+        while len(msgs) > keep and msgs[0]["role"] != "user":
+            msgs.pop(0)
+            counts.pop(0)
+            dropped += 1
+        over = fixed + sum(counts) - (n_ctx - REPLY_FLOOR)
+        long_one = max(range(len(msgs)), key=lambda i: counts[i])
+        if over > 0 and msgs[long_one]["role"] == "assistant":
+            text = msgs[long_one]["content"]
+            per = len(text) / max(1, counts[long_one])
+            cut = min(len(text), int((over + 32) * per * 1.1) + 1)
+            msgs[long_one] = {**msgs[long_one], "content": "…" + text[cut:]}
+            counts[long_one] = server.count_tokens(
+                msgs[long_one]["content"]) + PER_MSG
         prompt = fixed + sum(counts)
     free = n_ctx - prompt
     cap = min(want, free) if want else free
@@ -2013,7 +2323,7 @@ def looks_unfinished(text: str, reason: str) -> bool:
     """Whether a reply stopped short of a whole answer. A token limit says so
     outright; an odd number of code fences says it just as plainly, since a
     block that was opened and never closed is a file that got cut in half."""
-    if reason == "length":
+    if reason in ("length", "error"):
         return True
     body = text.rstrip()
     if not body:
@@ -2072,15 +2382,26 @@ def api_chat_send():
                                  "at": time.time()})
         # Stored before a single token comes back: if the person presses Stop
         # or closes the tab mid-reply, their own message is not lost with it.
-        put_chat(chat)
+        try:
+            put_chat(chat)
+        except OSError as exc:
+            return jsonify({"error": "The conversation could not be saved "
+                                     f"({exc}); nothing was sent."}), 503
         history = turns(chat["messages"])
         query = text
 
     system_text = ((b.get("system", cfg.get("system")) or "") +
                    context_extra(query, chat["id"]) +
                    doc_howto(history)).strip()
+    if not resume:
+        # sent with the question, never stored with it
+        background = recall_extra(query, chat["id"])
+        if background:
+            history[-1] = {**history[-1], "content": background +
+                           "\n\n---\n\n" + history[-1]["content"]}
     plan = budget(system_text, history,
-                  b.get("max_tokens", cfg.get("max_tokens")))
+                  b.get("max_tokens", cfg.get("max_tokens")),
+                  keep=3 if resume else 1)
     params = {**sampling_params(b),
               "max_tokens": plan["max_tokens"], "system": system_text}
     if resume:
@@ -2092,6 +2413,7 @@ def api_chat_send():
         thoughts: list[str] = []
         finished = False
         reason = ""
+        failure = ""
         timings: dict = {}
 
         def rate(chars: int, seconds: float) -> float:
@@ -2187,6 +2509,7 @@ def api_chat_send():
                         reason = ev["stop"]
                         timings.update(ev.get("timings") or {})
                     elif "error" in ev:
+                        failure = ev["error"]
                         yield "data: " + json.dumps(
                             {"error": ev["error"]}) + "\n\n"
                     if time.time() - beat >= BEAT:
@@ -2194,6 +2517,10 @@ def api_chat_send():
                         yield "data: " + json.dumps(
                             alive(stage, prompt, heard)) + "\n\n"
             finished = True
+            if failure and not reason:
+                # The stream died under the reply (llama-server crashed,
+                # was unloaded, timed out): say so, as for any other end.
+                reason = "error"
             elapsed = max(time.time() - started, 0.001)
             reply = "".join(pieces)
             thought = "".join(thoughts)
@@ -2248,6 +2575,8 @@ def api_chat_send():
                     last["unfinished"] = looks_unfinished(
                         last["content"], stop)
                     last["continued"] = int(last.get("continued") or 0) + 1
+                    if failure:
+                        last["error"] = failure
                 else:
                     msg = {"role": "assistant", "content": reply,
                            "at": time.time(),
@@ -2257,6 +2586,8 @@ def api_chat_send():
                            "unfinished": looks_unfinished(reply, stop)}
                     if thought:
                         msg["reasoning"] = thought
+                    if failure:
+                        msg["error"] = failure
                     chat["messages"].append(msg)
                 chat["model"] = Path(server.model).name if server.model \
                     else chat.get("model")
@@ -2280,10 +2611,7 @@ def autostart(model: dict) -> None:
     with engine_lock:
         # Planning mode must never affect what is launched on this PC.
         hw = fit.hardware({})
-        conf = saved_model_config(model["name"]) or {
-            "layers": 32, "kv_layers": 32, "kv_heads": 8,
-            "head_dim": 128, "exact": False, "max_ctx": 0,
-        }
+        conf = model_shape(model, online=False)
         bits = int(cfg.get("kv_bits", 8))
         try:
             ctx = resolve_ctx(model["size"], conf, hw, bits, None,

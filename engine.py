@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -81,8 +82,16 @@ _tasks_lock = threading.Lock()
 
 
 def spawn(kind: str, title: str, fn, meta: dict | None = None) -> Task:
-    task = Task(kind, title, meta)
     with _tasks_lock:
+        if kind in ("download", "install", "setup"):
+            # A second click on an install that is already running gets
+            # that one back: two writers on one .part file corrupt it.
+            same = next((t for t in TASKS.values() if t.state == "running"
+                         and t.kind == kind and t.title == title
+                         and t.meta == (meta or {})), None)
+            if same:
+                return same
+        task = Task(kind, title, meta)
         TASKS[task.id] = task
         finished = sorted((t for t in TASKS.values() if t.state != "running"),
                           key=lambda t: t.created)
@@ -115,25 +124,46 @@ def asset_choices(hw: dict) -> list[tuple[list[str], str]]:
     Later entries are graceful fallbacks — a CPU build that runs beats a
     CUDA build that was never found."""
     system = platform.system()
+    # The processor's own architecture always rides along: "win-cpu"
+    # alone also matches win-cpu-arm64, which sorts first, and an x64 PC
+    # handed the ARM build cannot run it.
+    arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") \
+        else "x64"
     if system == "Windows":
-        cpu = [(["win", "cpu"], "CPU build"),
-               (["win", "avx2"], "CPU build")]
+        cpu = [(["win", "cpu", arch], "CPU build"),
+               (["win", "avx2", arch], "CPU build")]
         if hw.get("vendor") == "nvidia":
-            return [(["win", "cuda"],
+            return [(["win", "cuda", arch],
                      "CUDA build for your NVIDIA card")] + cpu
         if hw.get("vendor") == "amd":
-            return [(["win", "hip"], "HIP build for your AMD card"),
-                    (["win", "vulkan"], "Vulkan build for your AMD card")] \
-                + cpu
+            return [(["win", "hip", arch], "HIP build for your AMD card"),
+                    (["win", "vulkan", arch],
+                     "Vulkan build for your AMD card")] + cpu
         return cpu
     if system == "Darwin":
-        return [(["macos", "arm64"], "Apple Silicon build with Metal")]
-    cpu = [(["ubuntu", "x64"], "CPU build"),
-           (["linux", "x64"], "CPU build")]
+        return [(["macos", arch], "Apple Silicon build with Metal"
+                 if arch == "arm64" else "Intel Mac build")]
+    cpu = [(["ubuntu", arch], "CPU build"),
+           (["linux", arch], "CPU build")]
     if hw.get("vendor") == "nvidia":
-        return [(["ubuntu", "cuda"], "CUDA build for your NVIDIA card"),
-                (["linux", "cuda"], "CUDA build for your NVIDIA card")] + cpu
+        return [(["ubuntu", "cuda", arch], "CUDA build for your NVIDIA card"),
+                (["linux", "cuda", arch],
+                 "CUDA build for your NVIDIA card")] + cpu
     return cpu
+
+
+# Backends a build name can carry. A choice that names none of them wants
+# the plain CPU build, not ubuntu-vulkan-x64 because it also says "x64".
+BACKENDS = ("cuda", "hip", "vulkan", "sycl", "opencl", "rocm", "kompute",
+            "musa", "cann", "openvino")
+
+
+def is_archive(name: str) -> bool:
+    """Release builds come as .zip on Windows and, since late 2025, as
+    .tar.gz for Linux and macOS."""
+    low = name.lower()
+    return low.endswith(".zip") or low.endswith(".tar.gz") or \
+        low.endswith(".tgz")
 
 
 def _pick_asset(assets: list[dict],
@@ -143,8 +173,10 @@ def _pick_asset(assets: list[dict],
     for tokens, why in choices:
         for a in assets:
             low = (a.get("name") or "").lower()
-            if (low.endswith(".zip") and "cudart" not in low
-                    and all(t in low for t in tokens)):
+            if (is_archive(low) and "cudart" not in low
+                    and all(t in low for t in tokens)
+                    and not any(b in low for b in BACKENDS
+                                if b not in tokens)):
                 return a, why
     return None
 
@@ -309,9 +341,36 @@ def sd_install_sync(task: Task, hw: dict) -> None:
                            "the archive.")
 
 
-def install(hw: dict) -> Task:
+def install(hw: dict, before_swap=None) -> Task:
     """Download an official release build and unpack it into ./llama.cpp."""
-    return spawn("install", "llama.cpp", lambda t: install_sync(t, hw))
+    return spawn("install", "llama.cpp",
+                 lambda t: install_sync(t, hw, before_swap))
+
+
+def _unpack(archive: Path, dest_dir: Path) -> None:
+    """A release archive, unpacked inside dest_dir and nowhere else."""
+    if archive.name.lower().endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(dest_dir)            # zipfile strips ../ itself
+        return
+    with tarfile.open(archive, "r:*") as t:
+        if hasattr(tarfile, "data_filter"):
+            t.extractall(dest_dir, filter="data")
+            return
+        # Python without extraction filters: check each member by hand
+        root = dest_dir.resolve()
+        for m in t.getmembers():
+            target = (dest_dir / m.name).resolve()
+            link = (target.parent / m.linkname).resolve() \
+                if (m.issym() or m.islnk()) else target
+            for path in (target, link):
+                if path != root and root not in path.parents:
+                    raise RuntimeError(f"{archive.name} would write "
+                                       f"outside its folder: {m.name}")
+            if not (m.isfile() or m.isdir() or m.issym() or m.islnk()):
+                raise RuntimeError(f"{archive.name} holds a special file: "
+                                   f"{m.name}")
+        t.extractall(dest_dir)
 
 
 def _fetch_zip(task: Task, asset: dict, pct_from: float,
@@ -331,34 +390,62 @@ def _fetch_zip(task: Task, asset: dict, pct_from: float,
         archive.unlink(missing_ok=True)
         return False
     task.set(detail=f"Unpacking {asset['name']}…")
-    with zipfile.ZipFile(archive) as z:
-        z.extractall(dest_dir)
+    _unpack(archive, dest_dir)
     archive.unlink(missing_ok=True)
     return True
 
 
-def install_sync(task: Task, hw: dict) -> None:
-    """The install itself, runnable inside another task (first-run setup)."""
+def install_sync(task: Task, hw: dict, before_swap=None) -> None:
+    """The install itself, runnable inside another task (first-run setup).
+
+    The new build is unpacked into a folder of its own and swapped in
+    whole. Unpacked over the old one, a running llama-server's DLLs are
+    locked on Windows (the update failed) and its binary busy on Linux,
+    and an old build left beside a new one could still be the one found.
+    `before_swap` stops whatever runs from ./llama.cpp, at the last
+    moment, so the model stays usable while the download runs."""
     task.set(detail="Asking GitHub for the latest release…")
     release, match, why = _resolve_release(asset_choices(hw), task)
     task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
-    BIN_DIR.mkdir(parents=True, exist_ok=True)
-    if not _fetch_zip(task, match, 0, 80):
+    staging = BIN_DIR.with_name(BIN_DIR.name + ".new")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    if not _fetch_zip(task, match, 0, 80, staging):
+        shutil.rmtree(staging, ignore_errors=True)
         task.set(state="cancelled", detail="Cancelled")
         return
     # A CUDA build on Windows needs the CUDA runtime DLLs too, shipped as
     # a separate cudart zip beside it — without them llama-server.exe
     # only starts on machines that happen to have the CUDA toolkit.
     if "cuda" in match["name"].lower() and platform.system() == "Windows":
+        # the runtime for the same CUDA version as the build
+        version = re.search(r"cuda-[\d.]+", match["name"].lower())
         runtime = next((a for a in release.get("assets", [])
                         if "cudart" in (a.get("name") or "").lower()
-                        and (a.get("name") or "").lower().endswith(".zip")),
-                       None)
+                        and (a.get("name") or "").lower().endswith(".zip")
+                        and (not version or version.group(0) in
+                             (a.get("name") or "").lower())), None)
         if runtime:
             task.set(pct=80, detail="Fetching the CUDA runtime DLLs…")
-            if not _fetch_zip(task, runtime, 80, 95):
+            if not _fetch_zip(task, runtime, 80, 95, staging):
+                shutil.rmtree(staging, ignore_errors=True)
                 task.set(state="cancelled", detail="Cancelled")
                 return
+    name = "llama-server.exe" if platform.system() == "Windows" \
+        else "llama-server"
+    if not next(staging.rglob(name), None):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Unpacked, but no llama-server binary was found "
+                           "inside the archive.")
+    task.set(pct=96, detail="Swapping in the new build…")
+    if before_swap:
+        before_swap()
+    old = BIN_DIR.with_name(BIN_DIR.name + ".old")
+    shutil.rmtree(old, ignore_errors=True)
+    if BIN_DIR.exists():
+        BIN_DIR.replace(old)
+    staging.replace(BIN_DIR)
+    shutil.rmtree(old, ignore_errors=True)
     binary = server_binary()
     if not binary:
         raise RuntimeError("Unpacked, but no llama-server binary was found "
@@ -386,6 +473,9 @@ def local_models() -> list[dict]:
                         "folder": rel.parts[0] if len(rel.parts) > 1 else "",
                         "size": f.stat().st_size,
                         "quant": fit.quant_of(f.name),
+                        # a vision projector: loads with --mmproj beside
+                        # its model, never as a model of its own
+                        "companion": "mmproj" in f.name.lower(),
                         "partial": f.suffix.lower() == ".part"})
     return out
 
@@ -565,6 +655,25 @@ def _stream(url: str, dest: Path, headers: dict, on_progress, should_cancel):
 # --------------------------------------------------------------------------- #
 # llama-server
 # --------------------------------------------------------------------------- #
+def free_port() -> int:
+    """A port nothing on this machine is listening on."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _has_console() -> bool:
+    """Whether this process runs in a console window (run.bat does). A
+    llama-server started with CREATE_NO_WINDOW is not attached to it, so
+    closing that window left the server running, holding its port and the
+    VRAM, for every later session to trip over. Started without the flag
+    it shares the console silently and closes with it; the flag is only
+    needed when there is no console, where a new window would pop up."""
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:  # noqa: BLE001
+        return False
 class Server:
     """One llama-server process, and the chat calls that go to it."""
 
@@ -586,9 +695,21 @@ class Server:
         return self.proc is not None and self.proc.poll() is None
 
     def ready(self) -> bool:
+        # Only our own process counts. A llama-server orphaned by an earlier
+        # session can still be answering on the port, with another model
+        # and the VRAM it holds; taking it for ours sent chats to it.
+        if not self.alive():
+            return False
         try:
             r = requests.get(f"{self.url}/health", timeout=2)
             return r.status_code == 200
+        except Exception:
+            return False
+
+    def _port_taken(self) -> bool:
+        try:
+            requests.get(f"{self.url}/health", timeout=1)
+            return True
         except Exception:
             return False
 
@@ -601,6 +722,11 @@ class Server:
         if not Path(model_path).exists():
             raise RuntimeError(f"No such model file: {model_path}")
         self.stop()
+        if self._port_taken():
+            # Something else holds the port — most often a llama-server left
+            # running by an earlier session. Ours would fail to bind and
+            # the load would fail with it; take a free port instead.
+            self.port = free_port()
         # --jinja: the model's own chat template, not llama.cpp's built-in
         # approximation of it. Current builds default to it; an older build
         # installed months ago does not, and without it a thinking model's
@@ -622,9 +748,10 @@ class Server:
             lib = str(Path(cmd[0]).parent)
             env["LD_LIBRARY_PATH"] = lib + ":" + env.get("LD_LIBRARY_PATH", "")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
-            if platform.system() == "Windows" else 0
+            if platform.system() == "Windows" and not _has_console() else 0
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True,
+                                     encoding="utf-8", errors="replace",
                                      bufsize=1, env=env, creationflags=flags)
         self.model, self.flags = model_path, cmd
         threading.Thread(target=self._pump, daemon=True).start()
@@ -639,12 +766,16 @@ class Server:
 
     def wait_ready(self, timeout: int = 600) -> bool:
         deadline = time.time() + timeout
+        proc = self.proc
         while time.time() < deadline:
             # Death first: if OUR process has exited, a healthy /health can
             # only be an impostor already squatting on the port (say, an
             # orphaned llama-server from a crashed session) — that is a
-            # failure to report, not a success to claim.
-            if self.proc and self.proc.poll() is not None:
+            # failure to report, not a success to claim. Unloaded or
+            # replaced while loading counts too: waiting on regardless held
+            # the engine lock for the full ten minutes.
+            if proc is None or self.proc is not proc or \
+                    proc.poll() is not None:
                 return False
             if self.ready():
                 return True
@@ -756,6 +887,11 @@ class Server:
         with requests.post(f"{self.url}/v1/chat/completions", json=body,
                            stream=True, timeout=600) as r:
             live["response"] = r
+            # The stream is UTF-8, but llama-server's text/event-stream
+            # names no charset, and for text/* requests then assumes
+            # Latin-1: every em-dash, curly quote, accent and emoji in a
+            # reply arrived as mojibake ("café" as "cafÃ©").
+            r.encoding = "utf-8"
             if r.status_code >= 400:
                 raise RuntimeError(f"llama-server said: {r.text[:300]}")
             for raw in r.iter_lines(decode_unicode=True):
