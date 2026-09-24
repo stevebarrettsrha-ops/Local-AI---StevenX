@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -706,10 +707,12 @@ class Server:
         return max(1, len(text) // 4)
 
     # -------------------------------------------------------------- chat --- #
-    def chat_stream(self, messages: list[dict], params: dict):
+    def chat_stream(self, messages: list[dict], params: dict,
+                    handle: dict | None = None):
         """Yields events from llama-server's OpenAI-compatible endpoint:
-        {"think": text} for each piece of a thinking model's reasoning,
-        {"delta": text} for each piece of the answer, then one
+        {"prompt": {"processed", "total", "cache"}} while it reads the
+        prompt, {"think": text} for each piece of a thinking model's
+        reasoning, {"delta": text} for each piece of the answer, then one
         {"stop": reason, "timings": {...}} — "length" when the reply hit the
         token limit, "stop" when the model finished of its own accord.
         Without that last event a cut-off reply is indistinguishable from a
@@ -718,11 +721,22 @@ class Server:
 
         The reasoning arrives in its own field (reasoning_content) and used to
         be dropped here unseen: a thinking model looked frozen for a minute,
-        and when the window ran out mid-thought there was no answer at all."""
+        and when the window ran out mid-thought there was no answer at all.
+
+        `handle`, when given, is how the caller watches and ends the reply
+        from another thread: the open response lands in it as "response",
+        llama.cpp's latest measured timings as "timings", and setting
+        "cancel" (see abort) hangs up, which is what makes llama-server stop
+        generating."""
         body = {"messages": messages, "stream": True,
                 "temperature": float(params.get("temperature", 0.7)),
                 "top_p": float(params.get("top_p", 0.95)),
-                "max_tokens": int(params.get("max_tokens", 1024))}
+                "max_tokens": int(params.get("max_tokens", 1024)),
+                # Reading a long prompt, and every token that is not text,
+                # used to send nothing at all: the page could not tell a
+                # working model from a stuck one. llama.cpp counts both for
+                # us when asked; an older build ignores the two keys.
+                "return_progress": True, "timings_per_token": True}
         # The rest of a model's published sampling rides along only when
         # there is one; otherwise llama-server's own defaults stand.
         for key in ("top_k", "min_p", "repeat_penalty"):
@@ -736,11 +750,17 @@ class Server:
             body["messages"] = [{"role": "system",
                                  "content": sys_full}] + messages
         reason, timings = "", {}
+        live = handle if handle is not None else {}
+        if live.get("cancel"):
+            return
         with requests.post(f"{self.url}/v1/chat/completions", json=body,
                            stream=True, timeout=600) as r:
+            live["response"] = r
             if r.status_code >= 400:
                 raise RuntimeError(f"llama-server said: {r.text[:300]}")
             for raw in r.iter_lines(decode_unicode=True):
+                if live.get("cancel"):
+                    return
                 if not raw or not raw.startswith("data:"):
                     continue
                 payload = raw[5:].strip()
@@ -751,7 +771,12 @@ class Server:
                 except ValueError:
                     continue
                 if isinstance(chunk.get("timings"), dict):
-                    timings = chunk["timings"]
+                    timings = live["timings"] = chunk["timings"]
+                progress = chunk.get("prompt_progress")
+                if isinstance(progress, dict):
+                    yield {"prompt": {
+                        key: int(progress.get(key) or 0)
+                        for key in ("processed", "total", "cache")}}
                 for choice in chunk.get("choices", []):
                     if choice.get("finish_reason"):
                         reason = str(choice["finish_reason"])
@@ -763,6 +788,58 @@ class Server:
                     if delta:
                         yield {"delta": delta}
         yield {"stop": reason or "stop", "timings": timings}
+
+    @staticmethod
+    def abort(handle: dict) -> None:
+        """Hang up on a reply from another thread. llama-server stops a
+        task only when its client goes away, and a reader blocked on a
+        model that is producing nothing visible would otherwise hold the
+        connection — and the model — until the token limit, long after
+        Stop was pressed. Shutting the socket for reading wakes that
+        reader; leaving the `with` block then closes the connection."""
+        handle["cancel"] = True
+        r = handle.get("response")
+        if r is None:
+            return
+        try:
+            r.raw.shutdown()  # urllib3 2.3+
+            return
+        except Exception:
+            pass
+        try:  # older urllib3: the same thing by hand
+            r.raw._connection.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+    def activity(self) -> dict:
+        """What the model is doing right now, from llama-server's /slots:
+        whether it is working on a reply, and how many tokens of it are
+        generated. That count moves even when none of the tokens is text,
+        which the stream itself never shows — a model emitting only
+        padding looks exactly like a frozen page otherwise. {} when the
+        server does not answer in time (it replies between batches, so a
+        long prompt batch holds it up) or runs with --no-slots."""
+        try:
+            r = requests.get(f"{self.url}/slots", timeout=1)
+            slots = r.json() if r.status_code < 400 else None
+        except Exception:
+            return {}
+        if not isinstance(slots, list):
+            return {}
+        busy = [s for s in slots
+                if isinstance(s, dict) and s.get("is_processing")]
+        if not busy:
+            return {"processing": False, "decoded": 0}
+        # the newest task is the reply being streamed now
+        slot = max(busy, key=lambda s: int(s.get("id_task") or 0))
+        nxt = slot.get("next_token")
+        if isinstance(nxt, list):
+            nxt = nxt[0] if nxt else {}
+        try:
+            decoded = int((nxt or {}).get("n_decoded") or 0)
+        except (TypeError, ValueError):
+            decoded = 0
+        return {"processing": True, "decoded": decoded}
 
     def props(self) -> dict:
         try:

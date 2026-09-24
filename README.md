@@ -166,6 +166,40 @@ deliberately, and it says how many — llama.cpp left to itself slides its
 window along and quietly drops the system prompt with them, which is what
 "it forgot everything halfway through" actually was.
 
+### Knowing it is working
+
+Until the first word arrived, the reply area was blank apart from a small
+blinking cursor, and a working model looked no different from a stuck one.
+Now a line under the reply says what the model is doing, in llama.cpp's own
+counts. It never shows a guess at how long is left.
+
+- *Reading the prompt · 512 of 1,007 tokens*: llama.cpp is still reading
+  the prompt. On a slow card, or with part of the model in RAM, this is the
+  long wait.
+- *Thinking · … · Writing · 268 tokens · 24.3 tok/s*: text is arriving, with
+  llama.cpp's measured speed.
+- *Generating · 812 tokens, none of them text yet*: the model is producing
+  tokens but none of them are text. A broken or badly quantised model can
+  emit padding or other special tokens forever, which used to leave a blank
+  page up to the reply limit. If the count keeps climbing, press Stop and
+  try another quant.
+- *no word from the server for 12 s*: the page has heard nothing at all,
+  so the problem is between the page and the app, not in the model.
+
+**Stop really stops the model now.** The app used to notice that the page
+had gone only when it next had text to send. A model producing nothing
+readable kept running, unseen, until the reply limit, and the next question
+waited behind it. The app now hears from the model every second and hangs
+up the moment the page goes, so llama-server stops at once.
+
+A question that never got an answer (Stop pressed before any text) is joined
+to your next message, because several chat templates, Gemma's among them,
+refuse two user turns in a row.
+
+Not every model shows thoughts. Qwen3 and GLM think before every answer.
+Gemma thinks only when its template is asked to, so a Gemma reply has no
+Thinking panel. It goes straight to *Writing*.
+
 ---
 
 ## Big models on a small card

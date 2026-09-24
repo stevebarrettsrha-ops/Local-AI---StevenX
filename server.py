@@ -12,6 +12,7 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -1951,6 +1952,27 @@ ANSWER_NUDGE = (
 # with thinking off. Left on, a thinking model re-deliberates the whole task
 # from scratch in the little room left and patches in something different.
 NO_THINK = {"enable_thinking": False}
+# While a reply is being worked on the page hears from the server at least
+# this often, text or no text, so a model that is reading a long prompt, or
+# generating tokens that are not text, never looks like a frozen page. After
+# QUIET seconds with no text, llama-server's /slots is asked what it is doing.
+BEAT = 1.0
+QUIET = 2.0
+
+
+def turns(messages: list[dict]) -> list[dict]:
+    """The stored conversation as the model is shown it: content only, with
+    a question that never got an answer (Stop pressed before any text)
+    folded into the next one, so the roles still alternate — several chat
+    templates refuse two user turns in a row."""
+    out: list[dict] = []
+    for m in messages:
+        if out and m["role"] == "user" and out[-1]["role"] == "user":
+            out[-1] = {"role": "user", "content":
+                       out[-1]["content"] + "\n\n" + m["content"]}
+        else:
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
 
 
 def budget(system_text: str, history: list[dict], want: int) -> dict:
@@ -2025,8 +2047,7 @@ def api_chat_send():
                 written or (last.get("reasoning") or "").strip()):
             return jsonify({"error": "There is no cut-off reply to "
                                      "continue."}), 400
-        history = [{"role": m["role"], "content": m["content"]}
-                   for m in chat["messages"]]
+        history = turns(chat["messages"])
         history.append({"role": "user",
                         "content": CONTINUE_NUDGE if written
                         else ANSWER_NUDGE})
@@ -2052,8 +2073,7 @@ def api_chat_send():
         # Stored before a single token comes back: if the person presses Stop
         # or closes the tab mid-reply, their own message is not lost with it.
         put_chat(chat)
-        history = [{"role": m["role"], "content": m["content"]}
-                   for m in chat["messages"]]
+        history = turns(chat["messages"])
         query = text
 
     system_text = ((b.get("system", cfg.get("system")) or "") +
@@ -2081,7 +2101,51 @@ def api_chat_send():
             if isinstance(measured, (int, float)) and measured > 0:
                 return round(float(measured), 1)
             return round((chars / 4) / max(seconds, 0.001), 1)
+
+        # llama-server is read on a thread of its own, so this generator can
+        # speak every BEAT seconds even while the model sends nothing — and
+        # by speaking, find out when the page has gone (Stop, a closed tab)
+        # and hang up, which is what makes llama-server stop generating.
+        handle: dict = {}
+        events: queue.Queue = queue.Queue()
+
+        def pump() -> None:
+            try:
+                for ev in server.chat_stream(plan["history"], params,
+                                             handle=handle):
+                    events.put(ev)
+            except Exception as exc:  # noqa: BLE001
+                if not handle.get("cancel"):
+                    events.put({"error": str(exc)})
+            finally:
+                events.put(None)
+
+        def alive(stage: str, prompt: dict, heard: float) -> dict:
+            """What the model is doing, measured: llama.cpp's own prompt
+            progress and token counts, never a guess at how long is left."""
+            now = time.time()
+            measured = handle.get("timings") or {}
+            tokens = int(measured.get("predicted_n") or 0)
+            tps = measured.get("predicted_per_second")
+            if now - heard >= QUIET:
+                slot = server.activity()
+                tokens = max(tokens, int(slot.get("decoded") or 0))
+                if stage == "wait" and slot.get("processing"):
+                    stage = "prompt"
+            if stage in ("wait", "prompt") and tokens:
+                # generating, and not one of the tokens has been text
+                stage = "hidden"
+            out = {"stage": stage, "seconds": round(now - started),
+                   "tokens": tokens, "quiet": round(now - heard)}
+            if isinstance(tps, (int, float)) and tps > 0 and tokens:
+                out["tps"] = round(float(tps), 1)
+            if prompt.get("total"):
+                out["prompt"] = [prompt["processed"], prompt["total"]]
+            return {"alive": out}
+
         try:
+            if not plan["overflow"]:
+                threading.Thread(target=pump, daemon=True).start()
             yield "data: " + json.dumps(
                 {"chat": chat["id"], "title": chat["title"],
                  "ctx": {"n_ctx": plan["n_ctx"],
@@ -2096,37 +2160,67 @@ def api_chat_send():
                               "the context size or start a new chat."}) \
                     + "\n\n"
             else:
-                try:
-                    for ev in server.chat_stream(plan["history"], params):
-                        if "delta" in ev:
-                            pieces.append(ev["delta"])
-                            yield "data: " + json.dumps(
-                                {"delta": ev["delta"]}) + "\n\n"
-                        elif "think" in ev:
-                            thoughts.append(ev["think"])
-                            yield "data: " + json.dumps(
-                                {"think": ev["think"]}) + "\n\n"
-                        elif "stop" in ev:
-                            reason = ev["stop"]
-                            timings.update(ev.get("timings") or {})
-                except Exception as exc:  # noqa: BLE001
-                    yield "data: " + json.dumps({"error": str(exc)}) + "\n\n"
+                stage, prompt = "wait", {}
+                heard = beat = started
+                while True:
+                    try:
+                        ev = events.get(timeout=BEAT)
+                    except queue.Empty:
+                        ev = {}
+                    if ev is None:
+                        break
+                    if "delta" in ev:
+                        pieces.append(ev["delta"])
+                        stage, heard = "write", time.time()
+                        yield "data: " + json.dumps(
+                            {"delta": ev["delta"]}) + "\n\n"
+                    elif "think" in ev:
+                        thoughts.append(ev["think"])
+                        stage, heard = "think", time.time()
+                        yield "data: " + json.dumps(
+                            {"think": ev["think"]}) + "\n\n"
+                    elif "prompt" in ev:
+                        prompt = ev["prompt"]
+                        if stage == "wait":
+                            stage = "prompt"
+                    elif "stop" in ev:
+                        reason = ev["stop"]
+                        timings.update(ev.get("timings") or {})
+                    elif "error" in ev:
+                        yield "data: " + json.dumps(
+                            {"error": ev["error"]}) + "\n\n"
+                    if time.time() - beat >= BEAT:
+                        beat = time.time()
+                        yield "data: " + json.dumps(
+                            alive(stage, prompt, heard)) + "\n\n"
             finished = True
             elapsed = max(time.time() - started, 0.001)
             reply = "".join(pieces)
             thought = "".join(thoughts)
+            produced = bool((prior + reply).strip() or thought.strip())
             yield "data: " + json.dumps(
                 {"done": True,
                  "tps": rate(len(reply) + len(thought), elapsed),
                  "seconds": round(elapsed, 1),
                  "stop": reason,
+                 "tokens": int(timings.get("predicted_n") or 0),
                  # all of the room went on thinking and none on the answer
                  "thought_only": bool(thought.strip() and not reply.strip()),
-                 "unfinished": looks_unfinished(prior + reply,
-                                                reason)}) + "\n\n"
+                 # no text at all came back, answer or reasoning
+                 "empty": not produced,
+                 # nothing written means nothing to carry on from
+                 "unfinished": produced and looks_unfinished(
+                     prior + reply, reason)}) + "\n\n"
         finally:
+            # Page gone or reply over: hang up on llama-server either way,
+            # so a Stop really stops the model instead of leaving it to
+            # generate unseen up to the token limit.
+            server.abort(handle)
             # Runs on a clean finish AND on GeneratorExit when the client goes
             # away, so a half-written reply is kept rather than thrown out.
+            # One cut short still has llama.cpp's own speed to report.
+            if not timings:
+                timings.update(handle.get("timings") or {})
             reply = "".join(pieces)
             thought = "".join(thoughts)
             # Reasoning is kept for the reader but never sent back to the

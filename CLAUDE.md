@@ -82,6 +82,14 @@
    (`ngl_flag`): llama.cpp counts the output head as a layer past the last
    block, so exactly the layer count leaves it on the CPU.
 
+22. **A reply on its way always says what the model is doing.** llama-server
+   is read on a thread, so `/api/chat` emits an `alive` event every `BEAT`
+   even while the model sends nothing. Its stage and counts come from
+   llama.cpp: `return_progress` for the prompt, `timings_per_token` for
+   speed, and `/slots` `n_decoded` for tokens that are not text. Never an
+   ETA. Whenever the stream ends, the `finally:` calls `Server.abort`, so a
+   Stop ends generation instead of leaving it running unseen to the limit.
+
 ## Validation gate
 
 ```bash

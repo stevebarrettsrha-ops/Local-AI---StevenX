@@ -168,6 +168,10 @@
   .caret{display:inline-block;width:7px;height:15px;background:var(--accent);
          vertical-align:-2px;animation:blink 1s steps(2) infinite}
   @keyframes blink{50%{opacity:0}}
+  .livestat{margin-top:8px;font-size:11.5px;color:var(--dim)}
+  .livestat::before{content:"";display:inline-block;width:6px;height:6px;
+         border-radius:50%;background:var(--accent);margin-right:7px;
+         vertical-align:1px;animation:pulse 1.2s infinite}
   .mic{padding:7px 12px;border-radius:9px;background:#3a3935;color:var(--muted)}
   .mic:hover{color:var(--text)}
   .mic svg{width:16px;height:16px;display:block}
@@ -1573,7 +1577,7 @@ async function sendMessage(mode, text) {
     chat.messages.push({ role: "assistant", content: acc,
       reasoning: res.thought, tps: res.tps, seconds: res.seconds,
       stop: res.stop, stopped: res.aborted, unfinished: res.unfinished,
-      continued: rounds });
+      continued: rounds, tokens: res.tokens, error: res.error });
     renderThread(mode);
     // The server merged any continuations into one stored message; take its
     // copy so the page and the file on disk say the same thing.
@@ -1596,6 +1600,12 @@ async function sendMessage(mode, text) {
 /* Why a reply ended, in the words the reader needs — the difference between
    "the model finished" and "it ran out of room" used to be invisible. */
 function stopReason(m) {
+  if (m.role === "assistant" && m.error && !(m.content || "").trim())
+    return m.error;
+  if (m.role === "assistant" && !(m.content || "").trim() && !m.reasoning &&
+      m.stop !== "aborted" && !m.stopped)
+    return "the model returned no text" + (m.tokens ? " — " +
+      m.tokens.toLocaleString() + " tokens, none of them readable" : "");
   if (m.reasoning && !(m.content || "").trim() && m.stop !== "aborted")
     return "ran out of room while thinking — Continue asks for the answer";
   if (m.stop === "aborted" || (m.stopped && !m.stop)) return "you pressed Stop";
@@ -1656,71 +1666,115 @@ async function streamInto(payload, chat, body, ui, onText, seed, note,
   var acc = seed || "", think = seedThink || "";
   var out = { tps: 0, seconds: 0, stop: "", unfinished: false,
     aborted: false, error: "", ctx: null, thought: think,
-    thoughtOnly: false };
+    thoughtOnly: false, tokens: 0 };
   var tail = note ? '<span class="cont-note">' + esc(note) + "</span>" : "";
+  // what the server last said the model is doing, and when it last spoke
+  var lv = { t0: Date.now(), heard: 0, alive: null };
+  function status() {
+    var el = body.querySelector(".livestat");
+    if (el) el.textContent = liveLine(lv);
+  }
   function paint(live) {
     var answering = !!acc.trim();
     body.innerHTML = thinkBlock(think, live && !answering) +
       renderBody(acc, true) +
-      (live ? tail + '<span class="caret"></span>' : "");
+      (live ? tail + '<span class="caret"></span>' +
+        '<div class="livestat"></div>' : "");
     var tt = body.querySelector(".thinktext");
     if (tt && live && !answering) tt.scrollTop = tt.scrollHeight;
+    if (live) status();
   }
   paint(true);
-  var ctrl = new AbortController();
-  S.abort = ctrl;
-  var res = await fetch("/api/chat", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    signal: ctrl.signal, body: JSON.stringify(payload)
-  });
-  if (!res.ok) {
-    var err = await res.json().catch(function () { return {}; });
-    throw new Error(err.error || ("Request failed: " + res.status));
-  }
-  var reader = res.body.getReader(), dec = new TextDecoder(), buf = "";
+  // the page's own clock: it keeps moving, and says so, if the server stops
+  var tick = setInterval(status, 1000);
   try {
-    while (true) {
-      var r = await reader.read();
-      if (r.done) break;
-      buf += dec.decode(r.value, { stream: true });
-      var parts = buf.split("\n\n");
-      buf = parts.pop();
-      parts.forEach(function (p) {
-        if (p.indexOf("data:") !== 0) return;
-        var d;
-        try { d = JSON.parse(p.slice(5).trim()); } catch (e) { return; }
-        if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
-        if (d.ctx) { out.ctx = d.ctx; showCtx(d.ctx); }
-        if (d.think) {
-          think += d.think;
-          paint(true);
-          $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
-        }
-        if (d.delta) {
-          acc += d.delta;
-          onText(acc);
-          paint(true);
-          $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
-        }
-        if (d.error) { out.error = d.error; toast(d.error, true); }
-        if (d.done) {
-          paint(false);
-          out.tps = d.tps; out.seconds = d.seconds;
-          out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
-          out.thoughtOnly = !!d.thought_only;
-          $("speedPill").hidden = false;
-          $("speedPill").textContent = d.tps + " tok/s";
-        }
-      });
+    var ctrl = new AbortController();
+    S.abort = ctrl;
+    var res = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal, body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      var err = await res.json().catch(function () { return {}; });
+      throw new Error(err.error || ("Request failed: " + res.status));
     }
-  } catch (e) {
-    if (e.name !== "AbortError") throw e;
-    out.aborted = true; out.stop = "aborted";
-    paint(false);
+    var reader = res.body.getReader(), dec = new TextDecoder(), buf = "";
+    try {
+      while (true) {
+        var r = await reader.read();
+        if (r.done) break;
+        buf += dec.decode(r.value, { stream: true });
+        var parts = buf.split("\n\n");
+        buf = parts.pop();
+        parts.forEach(function (p) {
+          if (p.indexOf("data:") !== 0) return;
+          var d;
+          try { d = JSON.parse(p.slice(5).trim()); } catch (e) { return; }
+          lv.heard = Date.now();
+          if (d.alive) { lv.alive = d.alive; status(); }
+          if (d.chat) { chat.id = d.chat; chat.title = d.title; updateTitle(); }
+          if (d.ctx) { out.ctx = d.ctx; showCtx(d.ctx); }
+          if (d.think) {
+            think += d.think;
+            paint(true);
+            $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
+          }
+          if (d.delta) {
+            acc += d.delta;
+            onText(acc);
+            paint(true);
+            $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
+          }
+          if (d.error) { out.error = d.error; toast(d.error, true); }
+          if (d.done) {
+            paint(false);
+            out.tps = d.tps; out.seconds = d.seconds;
+            out.stop = d.stop || ""; out.unfinished = !!d.unfinished;
+            out.thoughtOnly = !!d.thought_only;
+            out.tokens = d.tokens || 0;
+            $("speedPill").hidden = false;
+            $("speedPill").textContent = d.tps + " tok/s";
+          }
+        });
+      }
+    } catch (e) {
+      if (e.name !== "AbortError") throw e;
+      out.aborted = true; out.stop = "aborted";
+      paint(false);
+    }
+  } finally {
+    clearInterval(tick);
   }
   out.thought = think;
   onText(acc);
   return out;
+}
+/* The line under a reply on its way: what the model is doing, in
+   llama.cpp's own counts (prompt tokens read, tokens generated, its measured
+   speed) — never a guess at time left. A model that is generating tokens
+   none of which are text says so, instead of leaving a blank page that
+   could be working or could be stuck. */
+function liveLine(lv) {
+  var a = lv.alive || {}, now = Date.now();
+  var said = { wait: "Waiting for the model", prompt: "Reading the prompt",
+    think: "Thinking", write: "Writing", hidden: "Generating" };
+  var bits = [lv.heard ? said[a.stage] || said.wait : "Sending"];
+  var n = a.tokens || 0;
+  if (a.stage === "prompt" && a.prompt)
+    bits.push(a.prompt[0].toLocaleString() + " of " +
+      a.prompt[1].toLocaleString() + " tokens");
+  else if (a.stage === "hidden")
+    bits.push(n.toLocaleString() + (n === 1 ? " token" : " tokens") +
+      ", none of them text yet" +
+      (n >= 500 ? " — press Stop if this keeps climbing" : ""));
+  else if (n) bits.push(n.toLocaleString() + " tokens");
+  if (a.tps) bits.push(a.tps + " tok/s");
+  bits.push(Math.round((now - lv.t0) / 1000) + " s");
+  var silent = lv.heard ? Math.round((now - lv.heard) / 1000) : 0;
+  if (silent >= 5) bits.push("no word from the server for " + silent + " s");
+  else if (a.quiet >= 10 && (a.stage === "think" || a.stage === "write"))
+    bits.push("no new text for " + a.quiet + " s");
+  return bits.join(" · ");
 }
 /* A thinking model's reasoning, folded above its answer. Open while it is
    the only thing arriving, so a long think never looks like a frozen page;
