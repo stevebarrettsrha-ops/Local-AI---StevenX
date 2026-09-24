@@ -12,6 +12,7 @@ import io
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import signal
@@ -25,9 +26,10 @@ import webbrowser
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import requests
-from flask import (Flask, Response, jsonify, request, send_file,
+from flask import (Flask, Response, jsonify, redirect, request, send_file,
                    send_from_directory)
 
+import agent
 import engine
 import fit
 
@@ -310,6 +312,10 @@ def api_status():
         "presets": fit.presets(),
         "setup_complete": bool(cfg.get("setup_complete")),
         "tail": server.tail(12),
+        "preview": (f"http://127.0.0.1:{PREVIEW_PORT}/{PREVIEW_TOKEN}/"
+                    if preview_on else ""),
+        "agent_running": bool(AGENT.running and AGENT.running.state in
+                              ("running", "waiting")) and AGENT.running.id,
     })
 
 
@@ -2071,8 +2077,17 @@ def api_workspace_open():
         save_config(cfg)
         return jsonify({"ok": True, "path": ""})
     p = Path(raw).expanduser()
+    if not p.is_dir() and b.get("create") is True:
+        # A new project starts as an empty folder the agent builds in.
+        try:
+            if not p.is_absolute():
+                raise RuntimeError("Give the full path of the new folder.")
+            p.mkdir(parents=True, exist_ok=True)
+        except (OSError, RuntimeError) as exc:
+            return jsonify({"error": f"Could not create {raw}: {exc}"}), 400
     if not p.is_dir():
-        return jsonify({"error": f"No such folder: {raw}"}), 400
+        return jsonify({"error": f"No such folder: {raw}",
+                        "missing": True}), 400
     cfg["workspace"] = str(p)
     save_config(cfg)
     return jsonify({"ok": True, "path": str(p)})
@@ -2125,43 +2140,50 @@ def api_workspace_read():
         return jsonify({"error": str(exc)}), 400
 
 
+def ws_write(rel: str, content: str, keep_backup: bool = False) -> dict:
+    """Write a file into the open folder: the Code page's Apply and the
+    agent both come through here. The previous version is kept beside it
+    as .bak — an edit is undoable, never silent loss."""
+    target = ws_resolve(rel or "")
+    if not isinstance(content, str):
+        raise RuntimeError("Nothing to write.")
+    # .git holds hooks git itself executes: a model-written file there
+    # would run on the person's next commit. The tree never shows it.
+    if any(part.lower() == ".git" for part in
+           target.relative_to(workspace_root().resolve()).parts):
+        raise RuntimeError("Files inside .git are not written.")
+    backup, old, existed = "", b"", target.exists()
+    if existed:
+        old = target.read_bytes()
+        bak = target.with_name(target.name + ".bak")
+        # Run & fix rewrites a file round after round; its first .bak is
+        # the person's own version, which later rounds must not replace.
+        if not (keep_backup and bak.exists()):
+            # A .bak that is a link would carry the old contents to
+            # wherever it points: replace the link, never write through.
+            if bak.is_symlink():
+                bak.unlink()
+            bak.write_bytes(old)
+        backup = bak.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # The file keeps its own line endings: text mode on Windows would
+    # turn every LF file (shell scripts, most repos) into CRLF.
+    text = content.replace("\r\n", "\n")
+    if b"\r\n" in old:
+        text = text.replace("\n", "\r\n")
+    with open(target, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    return {"path": rel, "backup": backup, "existed": existed}
+
+
 @app.post("/api/workspace/file")
 def api_workspace_write():
-    """Write model output back into the folder. The previous version is
-    kept beside it as .bak — an edit is undoable, never silent loss."""
     b = request.get_json(silent=True) or {}
     try:
-        target = ws_resolve(b.get("path") or "")
-        content = b.get("content")
-        if not isinstance(content, str):
-            raise RuntimeError("Nothing to write.")
-        # .git holds hooks git itself executes: a model-written file there
-        # would run on the person's next commit. The tree never shows it.
-        if any(part.lower() == ".git" for part in
-               target.relative_to(workspace_root().resolve()).parts):
-            raise RuntimeError("Files inside .git are not written.")
-        backup, old = "", b""
-        if target.exists():
-            old = target.read_bytes()
-            bak = target.with_name(target.name + ".bak")
-            # Run & fix rewrites a file round after round; its first .bak is
-            # the person's own version, which later rounds must not replace.
-            if not (b.get("keep_backup") and bak.exists()):
-                # A .bak that is a link would carry the old contents to
-                # wherever it points: replace the link, never write through.
-                if bak.is_symlink():
-                    bak.unlink()
-                bak.write_bytes(old)
-            backup = bak.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # The file keeps its own line endings: text mode on Windows would
-        # turn every LF file (shell scripts, most repos) into CRLF.
-        text = content.replace("\r\n", "\n")
-        if b"\r\n" in old:
-            text = text.replace("\n", "\r\n")
-        with open(target, "w", encoding="utf-8", newline="") as fh:
-            fh.write(text)
-        return jsonify({"ok": True, "path": b.get("path"), "backup": backup})
+        out = ws_write(b.get("path") or "", b.get("content"),
+                       bool(b.get("keep_backup")))
+        return jsonify({"ok": True, "path": out["path"],
+                        "backup": out["backup"]})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
 
@@ -2183,13 +2205,47 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def ws_run(cmd: str, timeout: int = RUN_TIMEOUT) -> dict:
+    """Run a command inside the open folder; exit code, output tail and time.
+    Output goes to a file, not memory: a runaway print loop cannot fill RAM,
+    and a child that keeps the pipe open cannot hang the request. On a
+    timeout the command goes with everything it started."""
+    root = workspace_root()
+    if not root:
+        raise RuntimeError("No folder is open.")
+    started = time.time()
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+             if os.name == "nt" else {"start_new_session": True})
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(cmd, shell=True, cwd=str(root),
+                                stdout=out, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, **group)
+        try:
+            code = proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
+                pass
+            code = -1
+        size = out.seek(0, os.SEEK_END)
+        out.seek(max(0, size - RUN_TAIL * 4))
+        text = out.read().decode("utf-8", errors="replace")
+    text = text.strip()[-RUN_TAIL:]
+    if code == -1:
+        text = (text + f"\n\nTimed out after {timeout} seconds — "
+                "stopped, with everything it started.").strip()
+    return {"exit": code, "output": text,
+            "seconds": round(time.time() - started, 1)}
+
+
 @app.post("/api/workspace/run")
 def api_workspace_run():
     """Run the user's own command inside the open folder and hand back
     exit code plus output. The command is always the one the person typed
     — model output never chooses what runs."""
-    root = workspace_root()
-    if not root:
+    if not workspace_root():
         return jsonify({"error": "No folder is open."}), 400
     b = request.get_json(silent=True)
     # Named in the request every time, never taken from the saved setting:
@@ -2200,36 +2256,336 @@ def api_workspace_run():
         return jsonify({"error": "No run command given."}), 400
     cfg["run_command"] = cmd
     save_config(cfg)
-    started = time.time()
-    # Output goes to a file, not memory: a runaway print loop cannot fill
-    # RAM, and a child that keeps the pipe open cannot hang the request.
-    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-             if os.name == "nt" else {"start_new_session": True})
     try:
-        with tempfile.TemporaryFile() as out:
-            proc = subprocess.Popen(cmd, shell=True, cwd=str(root),
-                                    stdout=out, stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL, **group)
-            try:
-                code = proc.wait(RUN_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                try:
-                    proc.wait(10)
-                except subprocess.TimeoutExpired:
-                    pass
-                code = -1
-            size = out.seek(0, os.SEEK_END)
-            out.seek(max(0, size - RUN_TAIL * 4))
-            text = out.read().decode("utf-8", errors="replace")
-        text = text.strip()[-RUN_TAIL:]
-        if code == -1:
-            text = (text + f"\n\nTimed out after {RUN_TIMEOUT} seconds — "
-                    "stopped, with everything it started.").strip()
-        return jsonify({"ok": True, "exit": code, "output": text,
-                        "seconds": round(time.time() - started, 1)})
+        return jsonify({"ok": True, **ws_run(cmd, RUN_TIMEOUT)})
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 400
+
+
+# --------------------------------------------------------------------------- #
+# agent (the model builds in the open folder, step after step)
+# --------------------------------------------------------------------------- #
+AGENTS_DIR = DATA_DIR / "agents"
+agent_sessions: dict[str, agent.Session] = {}
+_agent_lock = threading.Lock()
+_sys_info = ""
+
+
+def machine_summary() -> str:
+    """What the agent's commands run on: the OS, the shell, and which of
+    the usual tools are installed — measured once, so it writes commands
+    that work here (dir on Windows, python not python3) instead of
+    guessing."""
+    global _sys_info
+    if _sys_info:
+        return _sys_info
+    parts = [f"{platform.system()} {platform.release()}",
+             "commands run in cmd.exe — use Windows commands" if os.name ==
+             "nt" else "commands run in sh"]
+    for tool in ("python", "node", "npm", "git"):
+        exe = shutil.which(tool)
+        if not exe:
+            parts.append(f"{tool}: not installed")
+            continue
+        try:
+            out = subprocess.run([exe, "--version"], capture_output=True,
+                                 text=True, timeout=8)
+            ver = (out.stdout or out.stderr).strip().splitlines()[0]
+            parts.append(f"{tool}: {ver}")
+        except Exception:  # noqa: BLE001
+            parts.append(f"{tool}: installed")
+    _sys_info = "; ".join(parts)
+    return _sys_info
+
+
+class AgentHost:
+    """Everything the agent may touch — the Code page's own guarded paths
+    into the open folder, and the loaded model — and nothing more."""
+
+    def root(self) -> str:
+        return str(workspace_root() or "")
+
+    def resolve(self, rel: str) -> Path:
+        return ws_resolve(rel)
+
+    def write(self, rel: str, content: str, keep_backup: bool = False):
+        return ws_write(rel, content, keep_backup)
+
+    def run(self, cmd: str, timeout: int) -> dict:
+        return ws_run(cmd, timeout)
+
+    def stream(self, messages, params, hook):
+        return server.chat_stream(messages, params, hook)
+
+    def count(self, text: str) -> int:
+        return server.count_tokens(text) if text else 0
+
+    def n_ctx(self) -> int:
+        return server.n_ctx() or int(cfg.get("last_ctx") or 8192)
+
+    def sampling(self) -> dict:
+        return sampling_params({})
+
+    def system_info(self) -> str:
+        return machine_summary()
+
+    def listing(self) -> str:
+        root = workspace_root()
+        if not root:
+            return "(no folder)"
+        rows = []
+        for p in sorted(root.iterdir(), key=lambda x: (x.is_file(), x.name)):
+            if p.name.startswith(".") or p.name in WS_SKIP or \
+                    p.name.endswith(".bak"):
+                continue
+            rows.append(p.name + ("/" if p.is_dir() else ""))
+            if len(rows) >= 60:
+                rows.append("…")
+                break
+        return "\n".join(rows) if rows else "(empty — a new project)"
+
+
+def save_agent(sess: agent.Session) -> None:
+    # A run's last save can land after the person deleted the task; it
+    # must not bring the file back.
+    with sess.save_lock:
+        if not sess.forgotten:
+            _atomic_json(AGENTS_DIR / f"{sess.id}.json", sess.to_json())
+
+
+def agent_session(sid: str) -> agent.Session | None:
+    if not re.fullmatch(r"[0-9a-f]{12}", sid or ""):
+        return None
+    with _agent_lock:
+        if sid not in agent_sessions:
+            path = AGENTS_DIR / f"{sid}.json"
+            if not path.exists():
+                return None
+            try:
+                agent_sessions[sid] = agent.Session.from_json(
+                    json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, KeyError):
+                return None
+        return agent_sessions[sid]
+
+
+AGENT = agent.Agent(AgentHost(), save_agent)
+
+
+@app.post("/api/agent")
+def api_agent_start():
+    """Start a task, or give a session its next instruction."""
+    b = request.get_json(silent=True) or {}
+    text = (b.get("instruction") or "").strip()
+    if not text:
+        return jsonify({"error": "Say what to build or change."}), 400
+    if not server.ready():
+        return jsonify({"error": "No model is loaded. Pick one on the Models "
+                                 "page."}), 503
+    root = workspace_root()
+    if not root:
+        return jsonify({"error": "Open or create a folder first — the agent "
+                                 "works inside it."}), 400
+    sid = b.get("session") or ""
+    if sid:
+        sess = agent_session(sid)
+        if not sess:
+            return jsonify({"error": "That task no longer exists."}), 404
+        if Path(sess.root).resolve() != root.resolve():
+            return jsonify({"error": f"This task worked in {sess.root}. "
+                                     "Open that folder to carry it on."}), 400
+    else:
+        sess = agent.Session(uuid.uuid4().hex[:12],
+                             " ".join(text.split()[:8])[:60] or "Task",
+                             str(root))
+        with _agent_lock:
+            agent_sessions[sess.id] = sess
+        # Listed in Recents beside the chats; its steps live in data/agents.
+        put_chat({"id": sess.id, "title": sess.title,
+                  "created": sess.created, "mode": "agent",
+                  "model": Path(server.model).name if server.model else "",
+                  "messages": []})
+    try:
+        AGENT.start(sess, text, auto_run=b.get("auto_run") is True)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    save_agent(sess)
+    return jsonify({"ok": True, "session": sess.view()})
+
+
+@app.get("/api/agent/<sid>")
+def api_agent_view(sid: str):
+    sess = agent_session(sid)
+    return jsonify(sess.view()) if sess else \
+        (jsonify({"error": "No such task."}), 404)
+
+
+@app.get("/api/agent/<sid>/events")
+def api_agent_events(sid: str):
+    """The session's changes as they happen, from ?since= on. A page that
+    reconnects after missing some is told to reload the whole view."""
+    sess = agent_session(sid)
+    if not sess:
+        return jsonify({"error": "No such task."}), 404
+    try:
+        since = int(request.args.get("since") or 0)
+    except ValueError:
+        since = 0
+
+    def stream():
+        seen = since
+        while True:
+            evs = sess.events_since(seen, wait=15)
+            if evs and seen and evs[0]["seq"] > seen + 1:
+                yield "data: " + json.dumps({"type": "reload"}) + "\n\n"
+            for e in evs:
+                yield "data: " + json.dumps(e) + "\n\n"
+                seen = e["seq"]
+            if not evs:
+                if sess.state not in ("running", "waiting"):
+                    yield "data: " + json.dumps({"type": "end"}) + "\n\n"
+                    return
+                yield ": still working\n\n"
+
+    return Response(stream(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/agent/<sid>/approve")
+def api_agent_approve(sid: str):
+    sess = agent_session(sid)
+    if not sess:
+        return jsonify({"error": "No such task."}), 404
+    b = request.get_json(silent=True) or {}
+    try:
+        AGENT.decide(sess, str(b.get("id") or ""), b.get("allow") is True,
+                     b.get("all") is True)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 409
+    return jsonify({"ok": True})
+
+
+@app.post("/api/agent/<sid>/stop")
+def api_agent_stop(sid: str):
+    sess = agent_session(sid)
+    if not sess:
+        return jsonify({"error": "No such task."}), 404
+    AGENT.stop(sess)
+    return jsonify({"ok": True})
+
+
+def forget_agent(sid: str) -> None:
+    sess = agent_session(sid)
+    if sess:
+        with sess.save_lock:        # a save under way finishes first
+            sess.forgotten = True
+        AGENT.stop(sess)
+    with _agent_lock:
+        agent_sessions.pop(sid, None)
+    if re.fullmatch(r"[0-9a-f]{12}", sid or ""):
+        (AGENTS_DIR / f"{sid}.json").unlink(missing_ok=True)
+
+
+# ---- live preview: the open folder served as a web site of its own ---- #
+# Web apps and games the agent builds are opened from here, on a port of
+# their own: a different origin from the app, so their scripts cannot call
+# its API (cross-origin reads are blocked, and writes are refused by
+# same_machine_only's Origin check), while localStorage, modules and
+# relative paths work as they would on any web server. Read-only, dotfiles
+# refused, and the path carries a token made at start-up, so no other page
+# can go fetching files from it.
+PREVIEW_PORT = int(os.environ.get("LLAMA_STUDIO_PREVIEW_PORT", PORT + 1))
+PREVIEW_TOKEN = uuid.uuid4().hex
+preview_app = Flask("preview", static_folder=None)
+preview_on = False
+WEB_TYPES = {
+    ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8", ".json": "application/json",
+    ".map": "application/json", ".svg": "image/svg+xml",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon",
+    ".bmp": "image/bmp", ".wav": "audio/wav", ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".mp4": "video/mp4",
+    ".webm": "video/webm", ".wasm": "application/wasm",
+    ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8", ".xml": "application/xml",
+    ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+    ".otf": "font/otf", ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json"}
+
+
+@preview_app.before_request
+def preview_same_machine_only():
+    raw = request.host or ""
+    host = raw.split("]")[0] + "]" if raw.startswith("[") \
+        else raw.rsplit(":", 1)[0]
+    if host.lower() not in LOOPBACK_HOSTS or request.method != "GET":
+        return "Not here.", 403
+    return None
+
+
+def preview_entry(folder: Path) -> str:
+    """index.html if there is one, else the shallowest page in the folder."""
+    root = workspace_root().resolve()
+    if (folder / "index.html").is_file():
+        return (folder / "index.html").relative_to(root).as_posix()
+    pages = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if d not in WS_SKIP
+                       and not d.startswith(".")]
+        pages += [Path(dirpath) / n for n in filenames
+                  if n.lower().endswith((".html", ".htm"))]
+    if not pages:
+        return ""
+    best = min(pages, key=lambda f: (len(f.relative_to(root).parts),
+                                     f.name != "index.html", str(f)))
+    return best.relative_to(root).as_posix()
+
+
+@preview_app.get("/<token>/")
+@preview_app.get("/<token>/<path:rel>")
+def preview_file(token: str, rel: str = ""):
+    if token != PREVIEW_TOKEN or not workspace_root():
+        return "Not found.", 404
+    try:
+        target = ws_resolve(rel or ".")
+    except RuntimeError:
+        return "Not found.", 404
+    root = workspace_root().resolve()
+    if any(part.startswith(".") for part in
+           target.relative_to(root).parts):
+        return "Not found.", 404
+    if target.is_dir():
+        entry = preview_entry(target)
+        if not entry:
+            return ("No web page in this folder yet — nothing to preview.",
+                    404)
+        return redirect(f"/{token}/{entry}")
+    if not target.is_file():
+        return "Not found.", 404
+    resp = send_file(target, mimetype=WEB_TYPES.get(
+        target.suffix.lower(), "application/octet-stream"),
+        conditional=False, max_age=0)
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    return resp
+
+
+def start_preview() -> None:
+    global preview_on
+    from werkzeug.serving import make_server
+    try:
+        srv = make_server("127.0.0.1", PREVIEW_PORT, preview_app,
+                          threaded=True)
+    except OSError as exc:
+        print(f"  live preview off: port {PREVIEW_PORT} is taken ({exc})")
+        return
+    preview_on = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -2252,6 +2608,7 @@ def api_chat(chat_id: str):
 def api_chat_delete(chat_id: str):
     # One lock across the read and the write, so a reply being saved at
     # the same moment is not lost to this rewrite (or this to it).
+    forget_agent(chat_id)
     with chats_lock:
         write_chats([c for c in read_chats() if c["id"] != chat_id])
     # Its exchanges leave the recall index now, not at the next indexing.
@@ -2679,6 +3036,7 @@ def main() -> None:
                     target=lambda: remember_sampling(
                         model["name"], local_conf(model)[1]),
                     daemon=True).start()
+    start_preview()
     url = f"http://127.0.0.1:{PORT}"
     print(f"\n  Llama Studio  →  {url}\n")
     if os.environ.get("LLAMA_STUDIO_NO_BROWSER") != "1":

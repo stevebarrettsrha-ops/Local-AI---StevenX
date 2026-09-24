@@ -325,6 +325,61 @@ one you typed. The model chooses no command, only the files the command
 runs, so open projects you trust. A command still running after 60 seconds
 is stopped along with everything it started (a dev server, a test runner).
 
+## The agent: building apps and games
+
+The **Agent** switch on the Code page (on by default) turns the model from
+something that answers with code into something that builds. Open a folder,
+or type the path of one that doesn't exist yet and let the app create it.
+Then describe the app or game. The agent works on its own, step after step:
+
+- it looks at what is there (list, read and search files), and never edits
+  code it hasn't read;
+- it keeps a plan, shown as a checklist at the top of the task;
+- it writes files whole, or changes part of one with an exact-match edit, and
+  writes a very large file in parts rather than running out of room halfway;
+- it runs the project or its tests, reads the errors, fixes them, and runs
+  again;
+- when the task is done and checked, it stops and says what it built and how
+  to run it.
+
+Every step appears as it happens: the reasoning (folded), each file it wrote
+(open the card to see the code), each command and its output. A task isn't
+limited to one reply: it runs for up to 80 steps, then pauses; "keep going"
+carries it on. Give it the next instruction ("now add a high score table")
+and it continues in the same folder with the same history.
+
+**Commands need your OK.** Each command the agent wants to run waits for you:
+**Run it**, **Run it, and every command in this task**, or **Don't run it**.
+A declined command is reported back to the agent, which carries on another
+way. File changes need no OK, but they can only land inside the open folder,
+never in `.git`, and the first change to each file keeps your version as
+`.bak`.
+
+**The run lives in the app, not the page.** Reload, go to another page, close
+the tab: the agent carries on, and the task in Recents shows where it has got
+to. It stops only when it finishes, when you press **Stop**, or when the app
+closes (then it is marked paused, and an instruction carries it on).
+
+**Long runs fit the context window.** A task can outgrow the window many times
+over. Old tool output and old file contents are cut to a line first, then the
+oldest steps go, whole. Your instructions and the newest steps always stay,
+and the agent is told to re-read files rather than trust its memory of them.
+
+**Preview.** Web apps and games are opened with **Preview**, on the task or
+under the file list. The folder is served as a web site of its own, on the
+next port (7807): pages, scripts, modules, images, sound and
+`localStorage` all work as they would on any web server. It is a different
+origin from the app, so a page the model wrote can't call the app's API.
+
+**Which model.** Qwen3 Coder 30B A3B was trained for exactly this: long
+tool-using coding sessions. With its experts in system RAM (see *Big models
+on a small card*) it runs on an 8 GB card, at around 15–25 tokens a second,
+so a few-hundred-line game takes minutes and a long task can take an hour.
+Qwen3 8B manages small apps; GLM 4.7 Flash is a strong alternative. Any model
+works through llama.cpp's tool calling (`--jinja`). If a model writes its tool
+calls as text instead (Hermes or Qwen3-Coder XML format), the agent picks
+them up anyway.
+
 ## Documents and files
 
 Everything the model writes can leave the chat as a real file, entirely in
@@ -393,6 +448,7 @@ app's Coder engine does.
 
 ```
 server.py       Flask API — chat streaming, fit, downloads, engine control
+agent.py        The coding agent — tools, the step loop, fitting long runs
 fit.py          Hardware detection, model catalogue, the fit calculator
 engine.py       llama.cpp release install, llama-server process, GGUF downloads
 web/index.html  The interface — one file, no build step

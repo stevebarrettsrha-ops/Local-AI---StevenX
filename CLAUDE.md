@@ -123,10 +123,26 @@
    process alive, `start()` refuses a taken port with a named reason, and on
    Windows the children die with the app (job object).
 
+31. **The agent runs a command only with the person's OK** (once, or for the
+   rest of that task), and every file it touches goes through the same
+   guarded workspace functions as the Code page (`ws_resolve`, `ws_write`,
+   `ws_run`) — `agent.py` reaches nothing except through `AgentHost`. The
+   run lives in the server; the page watches events and answers approvals.
+32. **A long run is fitted, never overflowed** (`agent.fit`): old tool output
+   and file contents are slimmed first, then whole assistant+tool groups go;
+   the person's instructions and the newest steps always stay, and roles
+   still alternate. A tool result never loses the call it answers.
+33. **Preview serves the folder from its own origin** (`PREVIEW_PORT`, token
+   in the path, read-only, dotfiles refused), so model-written pages run
+   like any site — localStorage, modules — but cannot drive the API.
+34. **Tool calls are llama.cpp's own** (`tools` + streamed `tool_calls`, with
+   `--jinja`); `parallel_tool_calls` is left to the template. Calls a model
+   writes as text (Hermes JSON, Qwen3-Coder XML) are still recognised.
+
 ## Validation gate
 
 ```bash
-python -m py_compile server.py engine.py fit.py
+python -m py_compile server.py engine.py fit.py agent.py
 python - <<'PY'
 import re, pathlib
 src = pathlib.Path('web/index.html').read_text()

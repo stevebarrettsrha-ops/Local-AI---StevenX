@@ -937,7 +937,7 @@ class Server:
         return max(1, len(text) // 4)
 
     # -------------------------------------------------------------- chat --- #
-    def chat_stream(self, messages: list[dict], params: dict):
+    def chat_stream(self, messages: list[dict], params: dict, hook=None):
         """Yields events from llama-server's OpenAI-compatible endpoint:
         {"think": text} for each piece of a thinking model's reasoning,
         {"delta": text} for each piece of the answer, then one
@@ -961,6 +961,16 @@ class Server:
                 body[key] = params[key]
         if params.get("chat_template_kwargs"):
             body["chat_template_kwargs"] = params["chat_template_kwargs"]
+        # The agent's tools. llama-server parses the model's calls out of its
+        # own chat format (--jinja) and streams them as tool_calls pieces.
+        if params.get("tools"):
+            body["tools"] = params["tools"]
+            body["tool_choice"] = "auto"
+            # Left out unless asked: llama-server then allows several calls
+            # at once exactly when the model's template supports them.
+            if "parallel_tool_calls" in params:
+                body["parallel_tool_calls"] = bool(
+                    params["parallel_tool_calls"])
         sys_full = ((params.get("system") or "") +
                     (params.get("system_extra") or "")).strip()
         if sys_full:
@@ -974,6 +984,8 @@ class Server:
             # dash, curly quote, accent and emoji arrived garbled, and was
             # fed back to the model that way. The bytes are UTF-8.
             r.encoding = "utf-8"
+            if hook:
+                hook(r)      # lets Stop close a read still waiting on it
             if r.status_code >= 400:
                 raise RuntimeError(f"llama-server said: {r.text[:300]}")
             for raw in r.iter_lines(decode_unicode=True):
@@ -1005,6 +1017,12 @@ class Server:
                     think = d.get("reasoning_content")
                     if think:
                         yield {"think": think}
+                    for tc in d.get("tool_calls") or []:
+                        fn = tc.get("function") or {}
+                        yield {"tool": {"index": tc.get("index", 0),
+                                        "id": tc.get("id") or "",
+                                        "name": fn.get("name") or "",
+                                        "args": fn.get("arguments") or ""}}
                     delta = d.get("content")
                     if delta:
                         yield {"delta": delta}

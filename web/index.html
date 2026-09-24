@@ -156,6 +156,37 @@
   .cont-note{display:inline-block;margin:0 6px 0 2px;font-size:11.5px;
           color:var(--accent);opacity:.85}
   .pill.warn{color:var(--accent);border-color:var(--accent)}
+  .agenthead{display:flex;align-items:center;justify-content:space-between;
+      gap:10px;padding:10px 12px;margin-bottom:14px;border:1px solid var(--line);
+      border-radius:12px;background:var(--panel);font-size:13px}
+  .agenthead b{margin-right:8px}
+  .agenthead .step{margin-left:8px;color:var(--dim);font-size:12px}
+  .agenthead .right{display:flex;gap:6px;flex:none}
+  .agentplan{margin:0 0 16px;padding:9px 14px;border:1px solid var(--hair);
+      border-radius:10px;font-size:13px}
+  .agentplan .pl{padding:2px 0;color:var(--muted)}
+  .agentplan .pl.done{color:var(--dim);text-decoration:line-through}
+  .agentplan .pl.in_progress{color:var(--text)}
+  .agentnote{font-size:12px;color:var(--dim);margin:4px 0 14px}
+  .msg.agentmsg{margin-bottom:12px}
+  .tcard{margin:0 0 10px;border:1px solid var(--hair);border-radius:10px;
+      background:#232220}
+  .tcard.waiting{border-color:rgba(224,164,88,.5)}
+  .tcard summary{cursor:pointer;padding:8px 12px;font-size:12.5px;
+      color:var(--muted);list-style:none;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap}
+  .tcard summary::-webkit-details-marker{display:none}
+  .tcard summary code{font-family:var(--mono);font-size:12px;color:var(--text)}
+  .tcard .tbody{padding:0 12px 10px}
+  .tcard .tbody .codeblock{margin:6px 0}
+  .tcard .tout{margin:6px 0 0;padding:8px 10px;background:#1c1b19;
+      border-radius:8px;font-family:var(--mono);font-size:12px;
+      white-space:pre-wrap;word-break:break-word;max-height:320px;
+      overflow:auto;color:#dcd9d0}
+  .tcard .state{margin-left:6px;padding:1px 7px}
+  .approve{display:flex;flex-wrap:wrap;align-items:center;gap:8px;
+      padding:9px 12px;border-top:1px solid var(--hair);font-size:12.5px}
+  .approve .q{flex:1 1 100%;color:var(--text)}
   .think{margin:0 0 10px;border-left:2px solid var(--line);padding:2px 0 2px 12px}
   .think summary{cursor:pointer;font-size:12px;color:var(--dim);list-style:none}
   .think summary::-webkit-details-marker{display:none}
@@ -390,6 +421,8 @@ system's own voice">
           <div class="wsroot" id="wsRoot"></div>
           <div style="padding:2px 10px 6px">
             <button class="btn thin" id="btnWsAll" hidden>Attach all files</button>
+            <button class="btn thin" id="btnWsPreview" hidden
+              title="Open the folder's web page (index.html) in a new tab, served as a site of its own">Preview app</button>
           </div>
           <div class="wslist" id="wsList">
             <div class="note" style="padding:4px 8px">Open a folder on this
@@ -417,6 +450,9 @@ files to the model, apply its fixes, and run again — up to 3 rounds.">
                 placeholder="Describe the code you need, or paste code to fix…"></textarea>
               <div class="crow">
                 <span class="pill" id="ctxPillCode" title="Context length">8k ctx</span>
+                <button class="pill" id="agentPill"
+                  title="Agent: the model builds in the open folder — it writes the files, runs them with your OK, reads the errors and fixes them, step after step until the task is done.">
+                  Agent</button>
                 <span class="mlab" id="codeModelLab"></span>
                 <button class="mic" id="btnCodeMic"
                   title="Speak instead of typing">
@@ -657,7 +693,8 @@ var S = { view: "chat", status: null, chats: [], streaming: false,
           abort: null, catalogue: [], openModel: "", fitCache: {},
           setupKicked: false, cur: { chat: null, code: null }, webOn: false,
           ws: { path: "", attached: [], lastFile: "" }, ctxUse: null,
-          live: null, thinkOpen: null };
+          live: null, thinkOpen: null,
+          agentOn: true, agentES: null, agentOpen: {} };
 
 // Per-pane element ids: the chat page and the code page are the same
 // machinery pointed at different containers and conversations.
@@ -894,6 +931,7 @@ async function loadTree() {
   try {
     var d = await api("/api/workspace/tree");
     $("wsRoot").textContent = d.path || "";
+    $("btnWsPreview").hidden = !d.path || !(S.status && S.status.preview);
     if (!d.path) return;
     box.innerHTML = "";
     if (!d.files.length) {
@@ -1128,6 +1166,299 @@ async function applyToFile(codeText, file) {
       (d.backup ? " — previous version kept as " + d.backup : "."));
     loadTree();
   } catch (e) { toast(e.message, true); }
+}
+
+/* ========================= agent ========================= */
+/* The model building in the open folder, step after step. The run lives in
+   the server, so a reload or another page does not end it; this page only
+   watches it (events) and answers its questions (approvals). Everything the
+   model wrote reaches the page as text, and is escaped before it is shown. */
+var TOOL_DONE = { list_files: "Listed", read_file: "Read", search: "Searched",
+  write_file: "Wrote", append_file: "Added to", edit_file: "Edited",
+  run_command: "Ran", update_plan: "Updated the plan" };
+var TOOL_DOING = { list_files: "Listing", read_file: "Reading",
+  search: "Searching", write_file: "Writing", append_file: "Adding to",
+  edit_file: "Editing", run_command: "Running", update_plan: "Planning" };
+var AGENT_CHIPS = [
+  "Build a snake game in index.html with a score, speed-up and a restart key.",
+  "Make a to-do app (index.html, app.js, style.css) that keeps its list in localStorage.",
+  "Build a Tetris clone on an HTML5 canvas with levels and a next-piece preview."
+];
+var LIVE_STATES = ["running", "waiting"];
+function setAgentPill() {
+  $("agentPill").classList.toggle("on", !!S.agentOn);
+  $("codeInput").placeholder = S.agentOn
+    ? "Describe the app or game to build, or what to change — the agent works in the open folder…"
+    : "Describe the code you need, or paste code to fix…";
+}
+function agentLive(v) { return !!v && LIVE_STATES.indexOf(v.state) >= 0; }
+/* Starts a task, or gives the session on screen its next instruction.
+   Resolves true when the agent took it. */
+async function startAgent(text) {
+  if (!S.ws.path) {
+    toast("Open or create a folder first — the agent builds inside it.", true);
+    $("wsPath").focus();
+    return false;
+  }
+  if (!S.status || !S.status.ready) {
+    toast("Load a model first — Qwen3 Coder 30B A3B is the one built for " +
+      "this.", true);
+    show("models");
+    return false;
+  }
+  var cur = S.cur.code, body = { instruction: text };
+  if (cur && cur.mode === "agent") {
+    if (agentLive(cur.agent)) {
+      toast("The agent is still working — wait, or press Stop.", true);
+      return false;
+    }
+    body.session = cur.id;
+  }
+  try {
+    var d = await api("/api/agent", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) });
+    showAgent(d.session);
+    loadChats();
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+function showAgent(view) {
+  if (S.agentES) { S.agentES.close(); S.agentES = null; }
+  S.cur.code = { id: view.id, title: view.title, mode: "agent",
+                 messages: [], agent: view };
+  S.agentOpen = {};
+  renderThread("code"); updateTitle();
+  if (agentLive(view)) watchAgent(view);
+}
+async function openAgent(id) {
+  var v;
+  try { v = await api("/api/agent/" + id); }
+  catch (e) { toast(e.message, true); return; }
+  show("code"); showAgent(v); loadChats();
+}
+function watchAgent(view) {
+  if (S.agentES) S.agentES.close();
+  var es = new EventSource("/api/agent/" + view.id + "/events?since=" +
+    (view.seq || 0));
+  S.agentES = es;
+  es.onmessage = function (e) {
+    var d;
+    try { d = JSON.parse(e.data); } catch (x) { return; }
+    if (d.type === "end") {
+      es.close();
+      if (S.agentES === es) S.agentES = null;
+      paintAgent(view);
+      return;
+    }
+    if (d.type === "reload") { es.close(); reloadAgent(view.id); return; }
+    applyAgentEvent(view, d);
+  };
+  es.onerror = function () {
+    // EventSource would reconnect from the URL's old cursor and replay what
+    // is already on screen; reconnect from where this view has got to.
+    es.close();
+    if (S.agentES !== es) return;
+    S.agentES = null;
+    setTimeout(function () {
+      if (S.cur.code && S.cur.code.agent === view && !S.agentES)
+        watchAgent(view);
+    }, 2000);
+  };
+}
+async function reloadAgent(id) {
+  try {
+    var v = await api("/api/agent/" + id);
+    if (S.cur.code && S.cur.code.id === id) showAgent(v);
+  } catch (e) { /* the next event or a click will try again */ }
+}
+function applyAgentEvent(v, d) {
+  if (d.seq) v.seq = d.seq;
+  var st;
+  if (d.type === "add") v.steps[d.index] = d.step;
+  else if (d.type === "patch") {
+    st = v.steps[d.index] || (v.steps[d.index] = {});
+    Object.keys(d.fields).forEach(function (k) { st[k] = d.fields[k]; });
+    if (d.fields.status === "waiting")
+      v.pending = { id: st.id, command: (st.args || {}).command };
+    if (d.fields.status === "done" &&
+        /^(write_file|append_file|edit_file)$/.test(st.name || "")) {
+      if (/\.html?$/i.test((st.args || {}).path || ""))
+        v.last_html = st.args.path;
+      treeSoon();
+    }
+  } else if (d.type === "delta") {
+    st = v.steps[d.index] || (v.steps[d.index] = {});
+    st[d.field] = (st[d.field] || "") + d.text;
+  } else if (d.type === "plan") v.plan = d.items;
+  else if (d.type === "state") {
+    v.state = d.state; v.note = d.note;
+    v.step = d.step; v.max_steps = d.max_steps;
+    if (d.state !== "waiting") v.pending = null;
+    if (d.state === "done") toast("The agent finished: " + v.title);
+    if (d.state === "waiting" && document.hidden)
+      toast("The agent is waiting for your OK to run a command.");
+  }
+  paintAgentSoon(v);
+}
+function paintAgentSoon(v) {
+  if (v.paintTimer) return;
+  v.paintTimer = setTimeout(function () {
+    v.paintTimer = 0; paintAgent(v); }, 120);
+}
+function paintAgent(v) {
+  if (S.view === "code" && S.cur.code && S.cur.code.agent === v)
+    renderThread("code");
+  else syncAgentButtons();
+}
+var treeTimer = 0;
+function treeSoon() {
+  clearTimeout(treeTimer);
+  treeTimer = setTimeout(loadTree, 400);
+}
+function syncAgentButtons() {
+  var cur = S.cur.code, live = cur && cur.mode === "agent" &&
+    agentLive(cur.agent);
+  if (S.streaming) return;           // a chat reply owns the buttons then
+  $("btnCodeSend").hidden = !!live;
+  $("btnCodeStop").hidden = !live;
+}
+function renderAgentInto(box, ui, v) {
+  var sc = $(ui.scroll);
+  var atEnd = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 80;
+  box.innerHTML = agentHtml(v);
+  if (atEnd) sc.scrollTop = sc.scrollHeight;
+  syncAgentButtons();
+}
+function agentHtml(v) {
+  var live = agentLive(v);
+  var badge = { running: ["working", ""], waiting: ["needs your OK", "tight"],
+    done: ["done", "ok"], paused: ["paused", ""], stopped: ["stopped", ""],
+    error: ["failed", "spills"] }[v.state] || [v.state || "", ""];
+  var h = '<div class="agenthead"><div><b>' + esc(v.title) + "</b>" +
+    '<span class="state ' + badge[1] + '">' + esc(badge[0]) + "</span>" +
+    (live ? '<span class="step">step ' + v.step + " of " + v.max_steps +
+      "</span>" : "") + '</div><div class="right">' +
+    (S.status && S.status.preview ? '<button class="btn thin" ' +
+      'data-agent="preview" title="Open the web page it built in a new tab">' +
+      "Preview</button>" : "") +
+    (live ? '<button class="btn thin" data-agent="stop">Stop</button>' : "") +
+    "</div></div>";
+  if (v.plan && v.plan.length) {
+    h += '<div class="agentplan">' + v.plan.map(function (p) {
+      return '<div class="pl ' + esc(p.status) + '">' +
+        (p.status === "done" ? "✓ " : p.status === "in_progress" ? "▸ "
+          : "○ ") + esc(p.step) + "</div>";
+    }).join("") + "</div>";
+  }
+  var last = v.steps.length - 1;
+  v.steps.forEach(function (st, i) {
+    if (st) h += agentStepHtml(v, st, i, live && i === last);
+  });
+  if (!live && v.note && v.state !== "done")
+    h += '<div class="agentnote">' + esc(v.note) + "</div>";
+  if (!live && v.state === "done")
+    h += '<div class="agentnote">Give it the next instruction below — ' +
+      "it carries on in the same folder, with the same history.</div>";
+  return h;
+}
+function agentStepHtml(v, st, i, last) {
+  if (st.kind === "user")
+    return '<div class="msg me"><div class="body">' +
+      renderBody(st.text, false) + "</div></div>";
+  if (st.kind === "note")
+    return '<div class="agentnote">' + esc(st.text) + "</div>";
+  if (st.kind === "tool") return toolHtml(v, st, i);
+  var h = "";
+  if ((st.reasoning || "").trim()) {
+    var key = "r" + i, open = S.agentOpen[key] != null ? S.agentOpen[key]
+      : last && !(st.text || "").trim();
+    h += '<details class="think" data-key="' + key + '"' +
+      (open ? " open" : "") + "><summary>" +
+      esc((last && !(st.text || "").trim() ? "Thinking… " : "Reasoning · ") +
+        st.reasoning.trim().split(/\s+/).length + " words") +
+      '</summary><div class="thinktext">' + esc(st.reasoning.trim()) +
+      "</div></details>";
+  }
+  if ((st.text || "").trim()) h += renderBody(st.text, false);
+  if (st.writing && st.writing.name)
+    h += '<div class="agentnote">' + esc((TOOL_DOING[st.writing.name] ||
+      st.writing.name) + "… " + Number(st.writing.chars).toLocaleString() +
+      " characters so far") + "</div>";
+  if (st.trimmed)
+    h += '<div class="agentnote">Earlier steps were shortened to fit the ' +
+      "context window.</div>";
+  if (last) h += '<span class="caret"></span>';
+  return h ? '<div class="msg agentmsg"><div class="body">' + h +
+    "</div></div>" : "";
+}
+function codeFence(text, path) {
+  var f = fenceFor(text || "");
+  return renderBody(f + fenceLang(path || "") + "\n" + (text || "") + "\n" +
+    f, false);
+}
+function toolHtml(v, st, i) {
+  var a = st.args || {}, n = st.name || "";
+  var status = st.status || "running";
+  var what = n === "run_command" ? a.command : n === "search" ? a.pattern
+    : n === "update_plan" ? "" : (a.path || a.raw || ".");
+  var verb = status === "running" || status === "waiting"
+    ? (TOOL_DOING[n] || n) : (TOOL_DONE[n] || n);
+  var chip = { waiting: ["waiting for you", "tight"],
+    error: ["failed", "spills"], denied: ["declined", "spills"],
+    stopped: ["stopped", ""] }[status];
+  var detail = "";
+  if ((n === "write_file" || n === "append_file") && a.content != null)
+    detail += codeFence(a.content, a.path);
+  else if (n === "edit_file" && a.old_text != null)
+    detail += '<div class="agentnote">Replaced</div>' +
+      codeFence(a.old_text, a.path) + '<div class="agentnote">with</div>' +
+      codeFence(a.new_text, a.path);
+  if (st.result && n !== "update_plan")
+    detail += '<pre class="tout">' + esc(st.result) + "</pre>";
+  var key = "t" + i, open = S.agentOpen[key] != null ? S.agentOpen[key]
+    : n === "run_command" && status !== "running" && status !== "waiting";
+  var h = '<div class="tcard ' + esc(status) + '"><details data-key="' +
+    key + '"' + (open ? " open" : "") + "><summary>" + esc(verb) +
+    (what ? " <code>" + esc(what) + "</code>" : "") +
+    (chip ? ' <span class="state ' + chip[1] + '">' + esc(chip[0]) +
+      "</span>" : "") + '</summary><div class="tbody">' +
+    (detail || '<div class="agentnote">…</div>') + "</div></details>";
+  if (status === "waiting" && v.pending && v.pending.id === st.id)
+    h += '<div class="approve"><span class="q">Run this command in ' +
+      esc(v.root) + "?</span>" +
+      '<button class="btn thin go" data-agent="allow" data-id="' +
+      esc(st.id) + '">Run it</button>' +
+      '<button class="btn thin" data-agent="allowall" data-id="' +
+      esc(st.id) + '">Run it, and every command in this task</button>' +
+      '<button class="btn thin" data-agent="deny" data-id="' + esc(st.id) +
+      '">Don’t run it</button></div>';
+  return h + "</div>";
+}
+async function agentDecide(sid, id, allow, all) {
+  try {
+    await api("/api/agent/" + sid + "/approve", { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: id, allow: allow, all: all }) });
+  } catch (e) { toast(e.message, true); }
+}
+async function stopAgent() {
+  var cur = S.cur.code;
+  if (!cur || cur.mode !== "agent") return;
+  try { await api("/api/agent/" + cur.id + "/stop", { method: "POST" }); }
+  catch (e) { toast(e.message, true); }
+}
+/* The folder's web page, from the preview server: a site of its own, on
+   another port, so what the model wrote cannot reach this app. */
+function openPreview(path) {
+  var base = S.status && S.status.preview;
+  if (!base) {
+    toast("Live preview is off — its port was taken when the app started.",
+      true);
+    return;
+  }
+  window.open(base + (path ? path.split("/").map(encodeURIComponent)
+    .join("/") : ""), "_blank", "noopener");
 }
 
 /* ========================= images ========================= */
@@ -1410,11 +1741,24 @@ function show(view) {
 /* ========================= chat + code ========================= */
 function renderThread(mode) {
   var ui = PANES[mode], box = $(ui.inner), chat = S.cur[mode];
+  if (mode === "code" && chat && chat.mode === "agent") {
+    renderAgentInto(box, ui, chat.agent);
+    return;
+  }
+  if (mode === "code") syncAgentButtons();
   box.innerHTML = "";
   if (!chat || !chat.messages.length) {
     var ready = S.status && S.status.ready;
     var head, sub;
-    if (mode === "code") {
+    if (mode === "code" && S.agentOn) {
+      head = ready ? "Build it with the agent" : "No model loaded";
+      sub = ready ? "Open or create a folder on the left, then describe the "
+                    + "app or game. The agent writes the files, runs them "
+                    + "with your OK, reads the errors and fixes them — step "
+                    + "after step until it is done."
+                  : "Pick one on the Models page — Qwen3 Coder 30B A3B is "
+                    + "the one built for agent work.";
+    } else if (mode === "code") {
       head = ready ? "Write code with a local model" : "No model loaded";
       sub = ready ? "Answers lead with fenced, copyable code, sampled the "
                     + "way the model's authors tuned it."
@@ -1427,7 +1771,8 @@ function renderThread(mode) {
                     + "which quant your card can hold.";
     }
     var chips = mode === "code" && ready
-      ? '<div class="chiprow">' + CODE_CHIPS.map(function (c) {
+      ? '<div class="chiprow">' + (S.agentOn ? AGENT_CHIPS : CODE_CHIPS)
+        .map(function (c) {
           return '<button class="chip" data-fill="' + esc(c) + '">' +
             esc(c.length > 46 ? c.slice(0, 43) + "…" : c) + "</button>";
         }).join("") + "</div>" : "";
@@ -1500,6 +1845,8 @@ function renderThread(mode) {
   $(ui.scroll).scrollTop = $(ui.scroll).scrollHeight;
 }
 function chatIcon(mode) {
+  if (mode === "agent")
+    return '<svg viewBox="0 0 24 24"><path d="M12 3v3M5 9h14v10H5zM9 13h.01M15 13h.01M9 17h6"/></svg>';
   return mode === "code"
     ? '<svg viewBox="0 0 24 24"><path d="m8 7-5 5 5 5M16 7l5 5-5 5"/></svg>'
     : '<svg viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z"/></svg>';
@@ -1512,11 +1859,12 @@ async function loadChats() {
     box.innerHTML = '<div class="note" style="padding:0 12px">Nothing yet.</div>';
   }
   S.chats.forEach(function (c) {
-    var mode = c.mode === "code" ? "code" : "chat";
+    var mode = c.mode === "code" || c.mode === "agent" ? "code" : "chat";
     var on = S.cur[mode] && S.cur[mode].id === c.id;
     var row = document.createElement("button");
     row.className = "chatrow" + (on ? " on" : "");
-    row.innerHTML = chatIcon(mode) + '<span class="t">' + esc(c.title) +
+    row.innerHTML = chatIcon(c.mode === "agent" ? "agent" : mode) +
+      '<span class="t">' + esc(c.title) +
       '</span><span class="x">×</span>';
     row.addEventListener("click", function (e) {
       if (e.target.classList.contains("x")) { deleteChat(c.id, mode); return; }
@@ -1529,6 +1877,7 @@ async function openChat(id) {
   var chat;
   try { chat = await api("/api/chats/" + id); }
   catch (e) { return; }
+  if (chat.mode === "agent") { openAgent(id); return; }
   var mode = chat.mode === "code" ? "code" : "chat";
   // The conversation a reply is streaming into stays the one on screen:
   // a fresh copy from disk would not have the reply, and never would.
@@ -1549,6 +1898,7 @@ async function deleteChat(id, mode) {
 }
 function newSession() {
   var mode = S.view === "code" ? "code" : "chat";
+  if (mode === "code" && S.agentES) { S.agentES.close(); S.agentES = null; }
   S.cur[mode] = null;
   S.ctxUse = null;
   show(mode); renderThread(mode); loadChats();
@@ -1558,6 +1908,11 @@ async function send(mode) {
   var ui = PANES[mode];
   var text = $(ui.input).value.trim();
   if (!text || S.streaming) return;
+  if (mode === "code" && S.agentOn) {
+    // The text stays in the box until the agent has taken it.
+    if (await startAgent(text)) { $(ui.input).value = ""; grow($(ui.input)); }
+    return;
+  }
   $(ui.input).value = ""; grow($(ui.input));
   await sendMessage(mode, text);
 }
@@ -1572,6 +1927,7 @@ async function sendMessage(mode, text) {
     show("models");
     return null;
   }
+  if (S.cur[mode] && S.cur[mode].mode === "agent") S.cur[mode] = null;
   if (!S.cur[mode])
     S.cur[mode] = { id: "", title: text.slice(0, 60), mode: mode, messages: [] };
   var chat = S.cur[mode];
@@ -2317,6 +2673,8 @@ function wire() {
       if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(mode); } });
     $(ui.send).addEventListener("click", function () { send(mode); });
     $(ui.stop).addEventListener("click", function () {
+      if (mode === "code" && S.cur.code && S.cur.code.mode === "agent" &&
+          agentLive(S.cur.code.agent)) { stopAgent(); return; }
       if (S.abort) S.abort.abort(); });
   });
 
@@ -2473,14 +2831,63 @@ function wire() {
   });
 
   $("btnWsOpen").addEventListener("click", async function () {
-    try {
-      var d = await api("/api/workspace", { method: "POST",
+    var path = $("wsPath").value.trim();
+    var open = function (create) {
+      return api("/api/workspace", { method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: $("wsPath").value.trim() }) });
+        body: JSON.stringify({ path: path, create: create }) });
+    };
+    try {
+      var d;
+      try { d = await open(false); }
+      catch (e) {
+        // A new project starts as a folder that does not exist yet.
+        if (!/No such folder/.test(e.message) ||
+            !confirm(path + " does not exist.\n\nCreate it as a new, " +
+                     "empty project folder?")) throw e;
+        d = await open(true);
+      }
       S.ws.path = d.path; S.ws.attached = []; S.ws.lastFile = "";
-      renderAttach(); loadTree();
+      $("wsList").innerHTML = "";
+      renderAttach(); loadTree(); refresh();
       toast(d.path ? "Opened " + d.path : "Folder closed.");
     } catch (e) { toast(e.message, true); }
+  });
+  $("btnWsPreview").addEventListener("click", function () {
+    var cur = S.cur.code;
+    openPreview(cur && cur.mode === "agent" && cur.agent.last_html || "");
+  });
+  $("agentPill").addEventListener("click", function () {
+    S.agentOn = !S.agentOn;
+    try { localStorage.setItem("ls.agent", S.agentOn ? "1" : "0"); }
+    catch (e) { /* private browsing: for this visit only */ }
+    setAgentPill();
+    if (!S.cur.code) renderThread("code");
+    toast(S.agentOn ? "Agent on — the model builds in the open folder."
+      : "Agent off — the model answers with code for you to apply.");
+  });
+  try { S.agentOn = localStorage.getItem("ls.agent") !== "0"; }
+  catch (e) { /* private browsing: agent on */ }
+  setAgentPill();
+  $("codeInner").addEventListener("click", function (e) {
+    var b = e.target.closest ? e.target.closest("[data-agent]") : null;
+    var cur = S.cur.code;
+    if (!b || !cur || cur.mode !== "agent") return;
+    var act = b.dataset.agent;
+    if (act === "stop") stopAgent();
+    else if (act === "preview") openPreview(cur.agent.last_html || "");
+    else {
+      b.disabled = true;
+      agentDecide(cur.id, b.dataset.id, act !== "deny", act === "allowall");
+    }
+  });
+  // Folded or open, a step card stays how the reader left it through the
+  // re-renders a running task makes. Clicks, not toggle events: a panel
+  // drawn open fires one too, and would be remembered as the reader's.
+  $("codeInner").addEventListener("click", function (e) {
+    var sum = e.target.closest ? e.target.closest("summary") : null;
+    var d = sum && sum.parentNode;
+    if (d && d.dataset && d.dataset.key) S.agentOpen[d.dataset.key] = !d.open;
   });
   $("wsPath").addEventListener("keydown", function (e) {
     if (e.key === "Enter") $("btnWsOpen").click(); });
