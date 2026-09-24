@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -223,6 +224,90 @@ class ChatStreamTests(unittest.TestCase):
                     "chat_template_kwargs"):
             self.assertNotIn(key, sent)
 
+    def test_prompt_progress_and_live_timings_are_asked_for_and_surfaced(
+            self) -> None:
+        lines = [
+            'data: {"choices":[{"delta":{"role":"assistant","content":null}}],'
+            '"prompt_progress":{"total":1007,"cache":0,"processed":512,'
+            '"time_ms":900}}',
+            'data: {"choices":[{"delta":{"content":"Hi"}}],'
+            '"timings":{"predicted_n":1,"predicted_per_second":20.5}}',
+            "data: [DONE]",
+        ]
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.iter_lines.return_value = lines
+        resp.__enter__.return_value = resp
+        handle: dict = {}
+        with mock.patch.object(engine.requests, "post",
+                               return_value=resp) as post:
+            events = list(engine.Server().chat_stream(
+                [], {"max_tokens": 10}, handle=handle))
+        self.assertEqual(events[0], {"prompt": {
+            "processed": 512, "total": 1007, "cache": 0}})
+        self.assertIn({"delta": "Hi"}, events)
+        self.assertIs(handle["response"], resp)
+        self.assertEqual(handle["timings"]["predicted_n"], 1)
+        sent = post.call_args.kwargs["json"]
+        self.assertTrue(sent["return_progress"])
+        self.assertTrue(sent["timings_per_token"])
+
+    def test_cancel_ends_the_reply_at_the_next_chunk(self) -> None:
+        handle: dict = {}
+
+        def lines():
+            yield 'data: {"choices":[{"delta":{"content":"a"}}]}'
+            handle["cancel"] = True
+            yield 'data: {"choices":[{"delta":{"content":"b"}}]}'
+        resp = mock.MagicMock()
+        resp.status_code = 200
+        resp.iter_lines.return_value = lines()
+        resp.__enter__.return_value = resp
+        with mock.patch.object(engine.requests, "post", return_value=resp):
+            events = list(engine.Server().chat_stream([], {},
+                                                      handle=handle))
+        self.assertEqual(events, [{"delta": "a"}])
+        resp.__exit__.assert_called()
+
+    def test_abort_shuts_the_socket_under_a_blocked_reader(self) -> None:
+        resp = mock.MagicMock()
+        handle = {"response": resp}
+        engine.Server.abort(handle)
+        self.assertTrue(handle["cancel"])
+        resp.raw.shutdown.assert_called_once()
+        # older urllib3 without shutdown(): the socket by hand
+        resp = mock.MagicMock()
+        resp.raw.shutdown.side_effect = AttributeError
+        engine.Server.abort({"response": resp})
+        resp.raw._connection.sock.shutdown.assert_called_once()
+        engine.Server.abort({})  # nothing open yet: just marks it
+
+    def test_activity_reads_tokens_generated_from_slots(self) -> None:
+        slots = [
+            {"id": 0, "is_processing": False},
+            {"id": 1, "is_processing": True, "id_task": 7,
+             "next_token": [{"n_decoded": 812}]},
+            {"id": 2, "is_processing": True, "id_task": 3,
+             "next_token": {"n_decoded": 5}},
+        ]
+        srv = engine.Server()
+        with mock.patch.object(engine.requests, "get",
+                               return_value=_response(200, slots)):
+            self.assertEqual(srv.activity(),
+                             {"processing": True, "decoded": 812})
+        with mock.patch.object(engine.requests, "get",
+                               return_value=_response(200, [
+                                   {"id": 0, "is_processing": False}])):
+            self.assertEqual(srv.activity(),
+                             {"processing": False, "decoded": 0})
+        # --no-slots, or a server busy with a long prompt batch
+        with mock.patch.object(engine.requests, "get",
+                               return_value=_response(501, {"error": {}})):
+            self.assertEqual(srv.activity(), {})
+        with mock.patch.object(engine.requests, "get",
+                               side_effect=engine.requests.Timeout):
+            self.assertEqual(srv.activity(), {})
+
     def test_server_is_started_with_the_models_own_template(self) -> None:
         srv = engine.Server()
         with tempfile.NamedTemporaryFile(suffix=".gguf") as f, \
@@ -363,7 +448,7 @@ class ChatReasoningTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_chat(self, body: dict, events: list[dict]) -> list[dict]:
-        def fake(history, params):
+        def fake(history, params, **_):
             self.sent.append((history, params))
             yield from events
         with mock.patch.object(server.server, "chat_stream",
@@ -425,6 +510,93 @@ class ChatReasoningTests(unittest.TestCase):
         self.assertEqual(params["chat_template_kwargs"],
                          {"enable_thinking": False})
         self.assertNotIn("chat_template_kwargs", self.sent[0][1])
+
+    def run_live(self, body: dict, fake, slot=None) -> list[dict]:
+        with mock.patch.object(server, "BEAT", 0.05), \
+                mock.patch.object(server, "QUIET", 0.05), \
+                mock.patch.object(server.server, "activity",
+                                  return_value=slot or {}), \
+                mock.patch.object(server.server, "chat_stream",
+                                  side_effect=fake):
+            raw = self.client.post("/api/chat", json=body).get_data(
+                as_text=True)
+        return [json.loads(chunk[5:]) for chunk in raw.split("\n\n")
+                if chunk.startswith("data:")]
+
+    def test_a_silent_model_still_reports_what_it_is_doing(self) -> None:
+        def fake(history, params, handle=None):
+            yield {"prompt": {"processed": 512, "total": 1007, "cache": 0}}
+            time.sleep(0.2)
+            handle["timings"] = {"predicted_n": 40,
+                                 "predicted_per_second": 21.0}
+            yield {"delta": "Hello"}
+            time.sleep(0.2)
+            yield {"stop": "stop", "timings": {"predicted_n": 41}}
+        out = self.run_live({"message": "hi"}, fake)
+        stages = [e["alive"] for e in out if "alive" in e]
+        self.assertTrue(stages)
+        self.assertEqual(stages[0]["stage"], "prompt")
+        self.assertEqual(stages[0]["prompt"], [512, 1007])
+        self.assertEqual(stages[-1]["stage"], "write")
+        self.assertEqual(stages[-1]["tokens"], 40)
+        self.assertEqual(stages[-1]["tps"], 21.0)
+        done = next(e for e in out if e.get("done"))
+        self.assertEqual(done["tokens"], 41)
+        self.assertFalse(done["empty"])
+
+    def test_tokens_that_are_not_text_are_said_to_be_so(self) -> None:
+        def fake(history, params, handle=None):
+            time.sleep(0.25)
+            yield {"stop": "length", "timings": {"predicted_n": 900}}
+        out = self.run_live({"message": "hi"}, fake,
+                            slot={"processing": True, "decoded": 900})
+        stages = [e["alive"] for e in out if "alive" in e]
+        self.assertEqual(stages[-1]["stage"], "hidden")
+        self.assertEqual(stages[-1]["tokens"], 900)
+        done = next(e for e in out if e.get("done"))
+        self.assertTrue(done["empty"])
+        self.assertEqual(done["tokens"], 900)
+        # nothing written is nothing to carry on from
+        self.assertFalse(done["unfinished"])
+
+    def test_the_model_is_hung_up_on_when_the_reply_ends(self) -> None:
+        with mock.patch.object(server.server, "abort") as abort:
+            self.run_chat({"message": "hi"},
+                          [{"delta": "ok"}, {"stop": "stop"}])
+        abort.assert_called_once()
+        self.assertIsInstance(abort.call_args.args[0], dict)
+
+    def test_page_leaving_mid_reply_keeps_the_text_and_hangs_up(
+            self) -> None:
+        def fake(history, params, handle=None):
+            yield {"delta": "partial "}
+            while not handle.get("cancel"):
+                time.sleep(0.01)
+        with mock.patch.object(server, "BEAT", 0.05), \
+                mock.patch.object(server.server, "activity",
+                                  return_value={}), \
+                mock.patch.object(server.server, "chat_stream",
+                                  side_effect=fake):
+            r = self.client.post("/api/chat", json={"message": "hi"},
+                                 buffered=False)
+            chunks = iter(r.response)
+            seen = ""
+            while "partial" not in seen:
+                seen += next(chunks).decode()
+            r.close()  # what werkzeug does when the page goes away
+        reply = server.read_chats()[0]["messages"][-1]
+        self.assertEqual(reply["content"], "partial ")
+        self.assertEqual(reply["stop"], "aborted")
+
+    def test_an_unanswered_question_is_folded_into_the_next(self) -> None:
+        self.assertEqual(server.turns([
+            {"role": "user", "content": "first", "at": 1},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": "answer", "reasoning": "x"},
+            {"role": "user", "content": "next"}]), [
+            {"role": "user", "content": "first\n\nagain"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"}])
 
 
 if __name__ == "__main__":
