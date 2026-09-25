@@ -264,12 +264,20 @@ def ram_bytes() -> int:
 
 
 def bandwidth_of(name: str) -> int:
+    """The card's published bandwidth, or 0 when it is not in GPUS.
+
+    Names are matched as whole words: as plain substrings "RTX A1000" was
+    read as an A100 (1555 GB/s) and "T400" as a T4. A laptop part shares
+    its desktop name but not its bandwidth — the 4090 Laptop has about
+    half — so it gets no number rather than the desktop card's."""
     low = (name or "").lower()
-    if "apple" in low or "unified" in low:
+    if "apple" in low or "unified" in low or \
+            re.search(r"laptop|mobile|max-q|notebook", low):
         return 0
     best, best_len = 0, 0
     for key, value in BANDWIDTH.items():
-        if key in low and len(key) > best_len:
+        if len(key) > best_len and re.search(
+                r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])", low):
             best, best_len = value, len(key)
     return best
 
@@ -480,9 +488,13 @@ def _read_layout(path: str, size: int) -> dict | None:
             if kind == 9:
                 inner, count = struct.unpack_from("<IQ", mm, at)
                 at += 12
-                if inner in _GGUF_FIXED:          # skipped in one step
-                    return None, at + count * struct.calcsize(
-                        _GGUF_FIXED[inner])
+                if inner in _GGUF_FIXED:
+                    step = struct.calcsize(_GGUF_FIXED[inner])
+                    if count <= 4096:             # per-layer values: kept
+                        return [struct.unpack_from(_GGUF_FIXED[inner], mm,
+                                                   at + i * step)[0]
+                                for i in range(count)], at + count * step
+                    return None, at + count * step  # skipped in one step
                 for _ in range(count):            # the vocabulary: 150k+
                     if inner == 8:
                         at += 8 + struct.unpack_from("<Q", mm, at)[0]
@@ -524,6 +536,7 @@ def _read_layout(path: str, size: int) -> dict | None:
     blocks = max(int(meta.get(f"{arch}.block_count") or 0),
                  max(experts) + 1 if experts else 0)
     return {"arch": arch, "blocks": blocks,
+            "conf": _conf_from_meta(meta, arch, bool(experts)),
             # expert bytes per block, blk.0 first; [] for a dense model
             "experts": [experts.get(i, 0) for i in range(blocks)]
             if experts else [],
@@ -532,6 +545,74 @@ def _read_layout(path: str, size: int) -> dict | None:
             "other": other,
             "expert_count": int(meta.get(f"{arch}.expert_count") or 0),
             "expert_used": int(meta.get(f"{arch}.expert_used_count") or 0)}
+
+
+def _conf_from_meta(meta: dict, arch: str, has_experts: bool) -> dict | None:
+    """The architecture from the file's own header, in model_config's
+    shape: what llama.cpp itself will read when it loads the file. Used
+    when config.json cannot be read, or describes some other model — a
+    GGUF-only repo usually has none, and a catalogue name can match a
+    bigger sibling ("Qwen3-32B" against the Qwen3 8B entry). Guessing 32
+    layers instead put 33 on the GPU of a 42-layer model and left the rest
+    on the CPU."""
+    def get(key):
+        return meta.get(f"{arch}.{key}")
+
+    def ints(v):
+        return [int(x) for x in v] if isinstance(v, list) else None
+    try:
+        layers = int(get("block_count") or 0)
+        heads = ints(get("attention.head_count"))
+        n_heads = max(heads) if heads else int(get("attention.head_count")
+                                               or 0)
+        kv = ints(get("attention.head_count_kv"))
+        if kv:
+            # per-layer counts: a hybrid model lists 0 for the layers that
+            # keep no KV cache (recurrent or convolution blocks)
+            kv_layers = sum(1 for x in kv if x > 0)
+            kv_heads = max(kv)
+        else:
+            kv_heads = int(get("attention.head_count_kv") or n_heads or 0)
+            kv_layers = layers
+        embd = int(get("embedding_length") or 0)
+        k_len = int(get("attention.key_length") or 0)
+        v_len = int(get("attention.value_length") or 0)
+        head_dim = (k_len + (v_len or k_len)) // 2 if k_len else \
+            (embd // n_heads if n_heads else 0)
+        rank = int(get("attention.kv_lora_rank") or 0)
+        if rank:
+            # compressed (MLA) attention caches one latent per token and
+            # layer, not a key and value per head
+            kv_heads = 1
+            head_dim = max(1, (rank + int(get("rope.dimension_count")
+                                          or 0)) // 2)
+        interval = int(get("full_attention_interval") or 0)
+        if not kv and interval > 1:
+            kv_layers = max(1, layers // interval)
+        swa = get("attention.sliding_window_pattern")
+        if isinstance(swa, list) and swa:
+            # true marks a sliding-window layer: only the rest keep a
+            # cache the size of the whole context
+            kv_layers = max(1, sum(1 for x in swa if not x))
+        elif isinstance(swa, int) and swa > 1:
+            kv_layers = max(1, layers // swa)
+    except (TypeError, ValueError):
+        return None
+    if not (layers and kv_heads and head_dim):
+        return None
+    experts = int(get("expert_count") or 0)
+    return {"layers": layers, "kv_layers": min(layers, kv_layers),
+            "kv_heads": kv_heads, "head_dim": head_dim,
+            "exact": True, "hybrid": kv_layers < layers,
+            "moe": has_experts or experts > 1,
+            "max_ctx": int(get("context_length") or 0),
+            "source": "file"}
+
+
+def file_config(path: str) -> dict | None:
+    """The architecture read from a GGUF file's own header, or None."""
+    layout = gguf_layout(path) if path else None
+    return (layout or {}).get("conf")
 
 
 def kv_bytes(conf: dict, ctx: int, kv_bits: int = 16) -> int:

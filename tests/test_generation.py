@@ -429,6 +429,7 @@ class ChatReasoningTests(unittest.TestCase):
             mock.patch.object(server, "MEMORY_PATH", base / "memory.md"),
             mock.patch.object(server, "CONFIG_PATH", base / "config.json"),
             mock.patch.object(server, "context_extra", return_value=""),
+            mock.patch.object(server, "recall_extra", return_value=""),
             mock.patch.object(server, "index_exchanges"),
             mock.patch.object(server.server, "ready", return_value=True),
             mock.patch.object(server.server, "n_ctx", return_value=32768),

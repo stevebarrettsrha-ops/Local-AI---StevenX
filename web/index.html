@@ -633,7 +633,8 @@ snowy forest at dusk, warm light in the windows, oil painting"></textarea>
   <textarea id="memoryText" rows="8" spellcheck="false"
     placeholder="- Facts worth keeping across conversations, one per line.
 The model adds lines here itself when a reply contains remember: …"></textarea>
-  <p class="note">Sent with every conversation, in every chat. The model can
+  <p class="note">Sent with every conversation, in every chat — the newest
+    4,000 characters when it grows longer than that. The model can
     add to it by writing a line starting with <b>remember:</b> — edit or
     delete anything here, it is just a text file
     (<span style="font-family:var(--mono)">data/memory.md</span>).</p>
@@ -660,8 +661,9 @@ The model adds lines here itself when a reply contains remember: …"></textarea
 <script>
 "use strict";
 
-var S = { view: "chat", status: null, chats: [], streaming: false,
+var S = { view: "chat", status: null, chats: [], streaming: false, live: null,
           abort: null, catalogue: [], openModel: "", fitCache: {},
+          fitLoading: {},
           setupKicked: false, cur: { chat: null, code: null }, webOn: false,
           ws: { path: "", attached: [], lastFile: "" }, ctxUse: null };
 
@@ -854,7 +856,7 @@ async function loadTree() {
   try {
     var d = await api("/api/workspace/tree");
     $("wsRoot").textContent = d.path || "";
-    if (!d.path) return;
+    if (!d.path) { box.innerHTML = ""; return; }   // folder closed
     box.innerHTML = "";
     if (!d.files.length) {
       box.innerHTML = '<div class="note" style="padding:4px 8px">' +
@@ -935,9 +937,12 @@ function renderAttach() {
   });
 }
 // Every fenced block in a reply that names its own file via path=.
+/* The whole files in a reply. A block with no closing fence is a file cut
+   off half-way — by Stop or the token limit — and is never one of them:
+   written to disk it replaced a working file with its first half. */
 function pathBlocks(content) {
   var parts = String(content == null ? "" : content).split("```"), out = [];
-  for (var i = 1; i < parts.length; i += 2) {
+  for (var i = 1; i + 1 < parts.length; i += 2) {
     var seg = parts[i], nl = seg.indexOf("\n");
     var info = nl === -1 ? "" : seg.slice(0, nl).trim();
     var m = /(?:^|\s)path=(\S+)/.exec(info);
@@ -1042,6 +1047,12 @@ async function autoFix() {
         "files.");
       var msgs = (S.cur.code && S.cur.code.messages) || [];
       var last = msgs[msgs.length - 1] || {};
+      if (last.role === "assistant" && (last.stopped || last.unfinished)) {
+        toast(last.stopped ? "Stopped — nothing was applied."
+          : "The reply was cut off before its files were whole — nothing "
+          + "was applied.", true);
+        return;
+      }
       var jobs = last.role === "assistant" ? pathBlocks(last.content) : [];
       if (!jobs.length) {
         toast("The model returned no file changes — stopping so nothing "
@@ -1290,6 +1301,7 @@ async function switchEngine(e) {
     var d = await api("/api/engine/switch", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ family: e.family }) });
+    S.ctxUse = null;            // measured against the old model's window
     await refresh();
     toast(d.already ? d.model + " was already loaded."
       : d.model + " loaded: " + d.gpu_layers + " of " + d.fit.layers +
@@ -1416,9 +1428,14 @@ function renderThread(mode, keep) {
       acts.className = "acts";
       if (hasText) {
         acts.appendChild(mkBtn("Copy reply", function () {
-          if (navigator.clipboard && navigator.clipboard.writeText)
-            navigator.clipboard.writeText(m.content);
-          toast("Reply copied.");
+          // said "copied" even when the browser refused the clipboard
+          if (!navigator.clipboard || !navigator.clipboard.writeText)
+            return toast("This browser gives no clipboard access here.", true);
+          navigator.clipboard.writeText(m.content).then(function () {
+            toast("Reply copied.");
+          }, function () {
+            toast("The browser refused the clipboard — use Save .md.", true);
+          });
         }, "miniBtn"));
         acts.appendChild(mkBtn("Save .md", function () {
           saveBlob(fileSlug() + ".md", m.content, "text/markdown");
@@ -1437,7 +1454,8 @@ function renderThread(mode, keep) {
       // Only the newest reply can be carried on: a continuation appends to
       // the end of the conversation, so an older one cannot be resumed
       // without rewriting everything after it.
-      if ((m.unfinished || m.stopped) &&
+      if ((m.unfinished || m.stopped ||
+           (m.reasoning && !(m.content || "").trim())) &&
           m === chat.messages[chat.messages.length - 1]) {
         acts.appendChild(mkBtn("Continue", function () {
           continueReply(mode);
@@ -1448,6 +1466,16 @@ function renderThread(mode, keep) {
     box.appendChild(el);
   });
   var msgs = box.querySelectorAll(".msg");
+  // A reply still being written is not in chat.messages yet (or is being
+  // added to): redrawing without it detached it, and the text and its
+  // status line vanished until generation ended.
+  var live = S.live;
+  if (live && live.mode === mode && live.chat === chat) {
+    if (live.replace && msgs.length) box.replaceChild(live.el,
+      msgs[msgs.length - 1]);
+    else if (!live.replace) box.appendChild(live.el);
+    msgs = box.querySelectorAll(".msg");
+  }
   opened.forEach(function (i) {
     var d = msgs[i] && msgs[i].querySelector("details.think");
     if (d) d.open = true;
@@ -1518,8 +1546,13 @@ async function loadChats() {
 }
 async function openChat(id) {
   var chat;
-  try { chat = await api("/api/chats/" + id); }
-  catch (e) { return; }
+  // the conversation being written to is the one object the reply lands
+  // in; a fresh copy from disk would not show the reply when it finished
+  if (S.live && S.live.chat.id === id) chat = S.live.chat;
+  else {
+    try { chat = await api("/api/chats/" + id); }
+    catch (e) { return; }
+  }
   var mode = chat.mode === "code" ? "code" : "chat";
   S.cur[mode] = chat;
   show(mode); renderThread(mode); loadChats();
@@ -1542,6 +1575,12 @@ async function send(mode) {
   var ui = PANES[mode];
   var text = $(ui.input).value.trim();
   if (!text || S.streaming) return;
+  // checked before the box is cleared, so the message is not lost
+  if (!S.status || !S.status.ready) {
+    toast("Load a model first — the Models page shows which ones fit.", true);
+    show("models");
+    return;
+  }
   $(ui.input).value = ""; grow($(ui.input));
   await sendMessage(mode, text);
 }
@@ -1565,6 +1604,8 @@ async function sendMessage(mode, text) {
   $(ui.inner).appendChild(el);
   var body = el.querySelector(".body");
   body.innerHTML = '<span class="caret"></span>';
+  // the reply being written, so a redraw of this thread keeps it
+  S.live = { mode: mode, chat: chat, el: el };
 
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
@@ -1603,14 +1644,8 @@ async function sendMessage(mode, text) {
     body.innerHTML = '<span class="caret"></span>';
   }
   var payload = { chat: chat.id || "", message: outgoing, mode: mode };
-  if (mode === "code") {
-    // The coding conventions ride after the person's own prompt instead of
-    // being replaced by it: path= blocks are what Apply and Run & fix need.
-    // No temperature of its own any more — a fixed 0.2 is near-greedy,
-    // which the thinking models warn degrades and loops their output.
-    var own = ($("systemText").value || "").trim();
-    payload.system = (own ? own + "\n\n" : "") + CODE_SYSTEM;
-  }
+  var sys = systemFor(mode);
+  if (sys !== undefined) payload.system = sys;
   try {
     var res = await streamInto(payload, chat, body, ui, function (t) {
       acc = t;
@@ -1622,11 +1657,12 @@ async function sendMessage(mode, text) {
     while (res.unfinished && !res.aborted && !res.error &&
            $("autoCont").checked && rounds < MAX_CONTINUE) {
       rounds++;
-      res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
+      res = await streamInto(carryOn(chat, mode), chat, body,
         ui, function (t) { acc = t; }, acc,
         "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…", res.thought);
     }
     doneMeta = res;
+    S.live = null;
     chat.messages.push({ role: "assistant", content: acc,
       reasoning: res.thought, tps: res.tps, seconds: res.seconds,
       stop: res.stop, stopped: res.aborted, unfinished: res.unfinished,
@@ -1634,17 +1670,22 @@ async function sendMessage(mode, text) {
     renderThread(mode, true);
     // The server merged any continuations into one stored message; take its
     // copy so the page and the file on disk say the same thing.
-    if (rounds) await syncChat(mode);
+    if (rounds) syncSoon(mode, res.aborted);
     if (S.speakOn) speak(acc);
   } catch (e) {
+    S.live = null;
     if (e.name === "AbortError") {
       chat.messages.push({ role: "assistant", content: acc, stopped: true,
         stop: "aborted" });
-      renderThread(mode, true);
     } else {
-      body.innerHTML = '<span class="bad-text">' + esc(e.message) + "</span>";
+      // what was already written stays on screen, with the reason it ended
+      chat.messages.push({ role: "assistant", content: acc, stop: "error",
+        error: e.message, unfinished: !!acc.trim() });
+      toast(e.message, true);
     }
+    renderThread(mode, true);
   } finally {
+    S.live = null;
     S.streaming = false; S.abort = null;
     $(ui.send).hidden = false; $(ui.stop).hidden = true;
     loadChats();
@@ -1676,15 +1717,16 @@ async function continueReply(mode) {
   var els = $(ui.inner).querySelectorAll(".msg");
   var el = els[els.length - 1], body = el && el.querySelector(".body");
   if (!body) return;
+  S.live = { mode: mode, chat: chat, el: el, replace: true };
   S.streaming = true;
   $(ui.send).hidden = true; $(ui.stop).hidden = false;
   var acc = last.content, rounds = 0;
+  var res = { unfinished: true, aborted: false, error: "",
+              thought: last.reasoning || "" };
   try {
-    var res = { unfinished: true, aborted: false, error: "",
-                thought: last.reasoning || "" };
     do {
       rounds++;
-      res = await streamInto({ chat: chat.id, "continue": true }, chat, body,
+      res = await streamInto(carryOn(chat, mode), chat, body,
         ui, function (t) { acc = t; }, acc,
         rounds > 1 ? "carrying on (" + rounds + " of " + MAX_CONTINUE + ")…"
           : "carrying on…", res.thought);
@@ -1693,12 +1735,44 @@ async function continueReply(mode) {
   } catch (e) {
     if (e.name !== "AbortError") toast(e.message, true);
   } finally {
+    S.live = null;
     S.streaming = false; S.abort = null;
     $(ui.send).hidden = false; $(ui.stop).hidden = true;
+    // Until the server's copy arrives, the page's own: after Stop the
+    // server saves the partial text only once it notices the page has gone,
+    // and fetching straight away brought back the copy without it.
+    last.content = acc;
+    if (res.aborted) { last.stopped = true; last.stop = "aborted"; }
+    renderThread(mode, true);
     // The server merged the continuation into the stored message, so its
     // copy is the true one — take it back rather than keep a second tally.
-    await syncChat(mode);
+    syncSoon(mode, res.aborted);
   }
+}
+/* A continuation request, carrying the same system prompt as the reply it
+   continues. */
+function carryOn(chat, mode) {
+  var p = { chat: chat.id, "continue": true };
+  var sys = systemFor(mode);
+  if (sys !== undefined) p.system = sys;
+  return p;
+}
+/* The system prompt a page sends. On Code, the person's own followed by the
+   coding conventions (path= blocks are what Apply and Run & fix need); no
+   temperature of its own — a fixed 0.2 is near-greedy, which the thinking
+   models warn degrades their output. Sent with continuations too: without
+   it a carried-on file lost the whole-file rule half-way, and the changed
+   prompt made llama.cpp read the whole conversation again. */
+function systemFor(mode) {
+  if (mode !== "code") return undefined;
+  var own = ($("systemText").value || "").trim();
+  return (own ? own + "\n\n" : "") + CODE_SYSTEM;
+}
+/* Take the server's copy of the chat — straight away, or after Stop a
+   moment later, once the server has saved what was written. */
+function syncSoon(mode, afterStop) {
+  if (!afterStop) return syncChat(mode);
+  setTimeout(function () { if (!S.streaming) syncChat(mode); }, 3000);
 }
 /* Replace the open conversation with what is actually on disk. */
 async function syncChat(mode) {
@@ -1895,8 +1969,15 @@ function renderSampling(st) {
   var temp = locked ? p.temperature : c.temperature;
   var topp = locked ? p.top_p : c.top_p;
   $("tempSl").disabled = locked; $("toppSl").disabled = locked;
-  $("tempSl").value = temp; $("tempVal").textContent = Number(temp).toFixed(2);
-  $("toppSl").value = topp; $("toppVal").textContent = Number(topp).toFixed(2);
+  // a slider being dragged keeps the value under the pointer
+  if (document.activeElement !== $("tempSl")) {
+    $("tempSl").value = temp;
+    $("tempVal").textContent = Number(temp).toFixed(2);
+  }
+  if (document.activeElement !== $("toppSl")) {
+    $("toppSl").value = topp;
+    $("toppVal").textContent = Number(topp).toFixed(2);
+  }
   var note;
   if (!useModel) note = "The sliders below apply to both pages.";
   else if (has) note = "From " + p.source + "'s generation_config.json: " +
@@ -1911,7 +1992,9 @@ function renderSampling(st) {
   $("sampNote").textContent = note;
 }
 /* Context use, measured by the model's own tokenizer, in the ctx pills. */
-function showCtx(c) {
+/* `quiet` for the status poll's redraw: the dropped-messages warning
+   belongs to the reply that dropped them, not to every five seconds. */
+function showCtx(c, quiet) {
   if (!c || !c.n_ctx) return;
   S.ctxUse = c;
   var label = Math.round(c.n_ctx / 1024) + "k ctx · " + c.prompt + " used";
@@ -1926,7 +2009,7 @@ function showCtx(c) {
     pill.title = tip;
     pill.classList.toggle("warn", c.prompt > c.n_ctx * 0.75 || !!c.dropped);
   });
-  if (c.dropped)
+  if (c.dropped && !quiet)
     toast(c.dropped + " older message" + (c.dropped > 1 ? "s" : "") +
       " dropped — the conversation no longer fits the context window.", true);
 }
@@ -1957,8 +2040,7 @@ async function renderCatalogue() {
     right.appendChild(mkBtn(S.openModel === m.id ? "Hide" : "Check fit",
       function () {
         S.openModel = S.openModel === m.id ? "" : m.id;
-        renderCatalogue();
-        if (S.openModel === m.id) loadFit(m.id);
+        renderCatalogue();          // an open card fetches what it lacks
       }));
     box.appendChild(card);
     if (S.openModel === m.id) {
@@ -1967,11 +2049,17 @@ async function renderCatalogue() {
       var slot = card.querySelector(".quants");
       var cached = S.fitCache[m.id];
       if (cached) renderQuants(slot, cached);
-      else slot.innerHTML = '<div class="note">Reading file sizes…</div>';
+      else {
+        slot.innerHTML = '<div class="note">Reading file sizes…</div>';
+        // nothing cached (a new card, or the cache was cleared by a
+        // settings change): fetch it, or the note stayed forever
+        if (!S.fitLoading[m.id]) loadFit(m.id);
+      }
     }
   });
 }
 async function loadFit(modelId, repo) {
+  if (modelId) S.fitLoading[modelId] = true;
   try {
     var d = await api("/api/fit?model=" + encodeURIComponent(modelId || "") +
       (repo ? "&repo=" + encodeURIComponent(repo) : "") +
@@ -1984,6 +2072,8 @@ async function loadFit(modelId, repo) {
       if (slot) slot.innerHTML = '<div class="note bad-text">' +
         esc(e.message) + "</div>";
     } else { throw e; }
+  } finally {
+    if (modelId) delete S.fitLoading[modelId];
   }
 }
 function renderQuants(slot, d) {
@@ -1999,7 +2089,7 @@ function renderQuants(slot, d) {
         mkBtn("Open the GGUF build", function () {
           var entry = (S.catalogue || []).filter(function (m) {
             return m.repo === d.alternative; })[0];
-          if (entry) { S.openModel = entry.id; renderCatalogue(); loadFit(entry.id); }
+          if (entry) { S.openModel = entry.id; renderCatalogue(); }
           else { $("repoInput").value = d.alternative; $("btnRepo").click(); }
         }, "btn thin go"));
     }
@@ -2010,7 +2100,8 @@ function renderQuants(slot, d) {
     slot.innerHTML = '<div class="note">No GGUF files in that repo.</div>';
     return;
   }
-  d.files.slice(0, 10).forEach(function (f) {
+  // every file: the recommended one is often past the tenth row
+  d.files.forEach(function (f) {
     var row = document.createElement("div");
     row.className = "quant";
     row.innerHTML = '<span class="q">' + esc(f.quant || "—") + "</span>" +
@@ -2072,10 +2163,11 @@ async function loadLocal() {
         gb(m.size) + " · " + esc(m.quant || "?") +
         (m.partial ? " · unfinished" : "") + " · " + esc(m.why) +
         (m.fit.speed ? " · ~" + m.fit.speed + " tok/s" : "") +
-        '</span></div><div class="right">' + fitBadge(m) +
+        '</span></div><div class="right">' +
+        (m.companion ? '<span class="state">companion</span>' : fitBadge(m)) +
         (loaded ? '<span class="state ok">loaded</span>' : "") + "</div>";
       var right = el.querySelector(".right");
-      if (!m.partial && !loaded) {
+      if (!m.partial && !loaded && !m.companion) {
         right.appendChild(mkBtn("Load", function () { loadModel(m.name); },
           "btn thin go"));
       }
@@ -2092,6 +2184,7 @@ async function loadModel(name) {
     var d = await api("/api/engine/load", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: name }) });
+    S.ctxUse = null;            // measured against the old model's window
     // A mixture-of-experts model keeps every layer on the card and parks
     // the experts that do not fit in RAM; say so rather than a layer count.
     var where = d.n_cpu_moe
@@ -2106,6 +2199,10 @@ async function loadModel(name) {
       d.moe_fallback);
     await refresh();
     show(S.view === "code" ? "code" : "chat");
+    // an empty thread said "No model loaded" until something redrew it
+    ["chat", "code"].forEach(function (m) {
+      if (!S.cur[m] || !S.cur[m].messages.length) renderThread(m);
+    });
   } catch (e) { toast(e.message, true); }
 }
 async function deleteModel(name) {
@@ -2269,7 +2366,7 @@ async function refresh() {
   // The last measured use outlives the five-second status poll: once the
   // real number is known, showing the nominal size again would be a step
   // backwards into guessing.
-  if (S.ctxUse) showCtx(S.ctxUse);
+  if (S.ctxUse) showCtx(S.ctxUse, true);
   else {
     // What the running server was started with (Auto resolved), else the
     // setting that the next load will use.
@@ -2288,7 +2385,9 @@ async function refresh() {
   }
   sel.value = mt;
   $("kvSel").value = String(c.kv_bits || 16);
-  $("systemText").value = c.system || "";
+  // Not while the box is open: this poll runs every five seconds, and
+  // wrote the saved text back over whatever was being typed.
+  if ($("systemPop").hidden) $("systemText").value = c.system || "";
   $("systemLabel").textContent = (c.system || "").trim()
     ? "System prompt · set" : "System prompt";
   $("btnSystem").classList.toggle("on", !!(c.system || "").trim());
@@ -2339,7 +2438,11 @@ function wire() {
     var block = t.closest ? t.closest(".codeblock") : null;
     if (!block) return;
     var pre = block.querySelector("pre");
-    var lang = (block.querySelector(".cbhead span") || {}).textContent || "";
+    // the header reads "lang" or "lang · path/of/file"
+    var head = (block.querySelector(".cbhead span") || {}).textContent || "";
+    var cut = head.indexOf(" · ");
+    var lang = cut > -1 ? head.slice(0, cut) : head;
+    var fpath = cut > -1 ? head.slice(cut + 3) : "";
     if (t.classList.contains("copy")) {
       var done = function () {
         t.textContent = "Copied";
@@ -2351,7 +2454,9 @@ function wire() {
       }
     } else if (t.classList.contains("dl")) {
       var ext = EXT[lang] || "txt";
-      saveBlob(fileSlug() + "." + ext, pre.textContent,
+      // a block that names its file is saved under that file's name
+      saveBlob(fpath ? fpath.split("/").pop() : fileSlug() + "." + ext,
+        pre.textContent,
         ext === "html" ? "text/html" : "text/plain");
       t.textContent = "Saved";
       setTimeout(function () { t.textContent = "Save"; }, 1400);
@@ -2416,12 +2521,16 @@ function wire() {
     } catch (e) { toast(e.message, true); }
   });
   $("btnSaveMemory").addEventListener("click", async function () {
-    await api("/api/memory", { method: "POST",
+    var saved = await api("/api/memory", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: $("memoryText").value }) });
     $("memoryLabel").textContent = $("memoryText").value.trim()
       ? "Memory · set" : "Memory";
-    closePops(); toast("Memory saved — it now rides with every chat.");
+    closePops();
+    if (saved && saved.trimmed)
+      toast("Memory is full: only the newest " +
+        saved.cap.toLocaleString() + " characters were kept.", true);
+    else toast("Memory saved — it now rides with every chat.");
   });
   $("btnClearMemory").addEventListener("click", async function () {
     $("memoryText").value = "";
@@ -2454,14 +2563,19 @@ function wire() {
       localStorage.getItem("ls.autoContinue") !== "0";
   } catch (e) { /* private browsing: leave it on */ }
   $("ctxSel").addEventListener("change", function () {
-    // A new context size makes the old measurement meaningless.
+    // A new context size makes the old measurement meaningless, and the
+    // fit verdicts judged at the old one.
     S.ctxUse = null;
+    S.fitCache = {};
     $("ctxPill").textContent = ctxLabel(Number($("ctxSel").value));
     $("ctxPillCode").textContent = ctxLabel(Number($("ctxSel").value));
     saveParams();
   });
   $("sampSel").addEventListener("change", saveParams);
-  $("kvSel").addEventListener("change", saveParams);
+  $("kvSel").addEventListener("change", function () {
+    S.fitCache = {};            // verdicts were judged at the old cache size
+    saveParams();
+  });
   $("btnApplyCtx").addEventListener("click", async function () {
     await saveParams();
     if (S.status && S.status.model) { closePops(); loadModel(S.status.model); }
@@ -2533,6 +2647,14 @@ function wire() {
   });
   $("btnSetupRetry").addEventListener("click", startSetup);
   $("btnSetupSkip").addEventListener("click", async function () {
+    // Later means now stop: the multi-GB download used to carry on, and
+    // its bar came straight back.
+    try {
+      (await api("/api/tasks")).forEach(function (t) {
+        if (t.kind === "setup" && t.state === "running")
+          api("/api/tasks/" + t.id + "/cancel", { method: "POST" });
+      });
+    } catch (e) { /* nothing running */ }
     await api("/api/config", { method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ setup_complete: true }) });

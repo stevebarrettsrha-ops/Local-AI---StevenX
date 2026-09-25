@@ -32,7 +32,8 @@ def write_gguf(path: Path, meta: list, tensors: list, align: int = 32) -> None:
             inner, items = value
             out += struct.pack("<IQ", inner, len(items))
             for item in items:
-                out += s(item) if inner == 8 else struct.pack("<i", item)
+                out += s(item) if inner == 8 else struct.pack(
+                    "<?" if inner == 7 else "<i", item)
     offset = 0
     for name, size in tensors:
         out += s(name) + struct.pack("<I", 2) + struct.pack("<QQ", size, 1)
@@ -126,6 +127,86 @@ CODER_LAYOUT = {"arch": "qwen3moe", "blocks": 48,
                 "expert_count": 128, "expert_used": 8}
 CODER_SIZE = 1 * GB + 48 * int(0.34 * GB)
 CARD = {"vram": 8 * GB, "ram": 32 * GB, "bandwidth": 272}
+
+
+class FileShapeTests(unittest.TestCase):
+    """The architecture read from the file's own header, used whenever
+    config.json is missing or describes another model."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        fit._LAYOUT_CACHE.clear()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def shape(self, arch: str, extra: list, layers: int = 36) -> dict:
+        path = self.dir / f"{arch}-{len(extra)}.gguf"
+        write_gguf(path, [("general.architecture", 8, arch),
+                          (f"{arch}.block_count", 4, layers),
+                          (f"{arch}.embedding_length", 4, 4096),
+                          (f"{arch}.attention.head_count", 4, 32),
+                          (f"{arch}.context_length", 4, 40960)] + extra,
+                   [("token_embd.weight", 4096)])
+        return fit.file_config(str(path))
+
+    def test_dense_model(self) -> None:
+        conf = self.shape("qwen3", [("qwen3.attention.head_count_kv", 4, 8),
+                                    ("qwen3.attention.key_length", 4, 128)])
+        self.assertEqual(conf, {"layers": 36, "kv_layers": 36, "kv_heads": 8,
+                                "head_dim": 128, "exact": True,
+                                "hybrid": False, "moe": False,
+                                "max_ctx": 40960, "source": "file"})
+
+    def test_per_layer_kv_heads_mark_the_layers_without_a_cache(self) -> None:
+        conf = self.shape("lfm2", [("lfm2.attention.head_count_kv", 9,
+                                    (5, [0, 0, 8] * 4))], layers=12)
+        self.assertEqual((conf["kv_layers"], conf["kv_heads"]), (4, 8))
+        self.assertTrue(conf["hybrid"])
+
+    def test_sliding_window_layers_are_not_counted_as_full(self) -> None:
+        conf = self.shape("gemma3", [
+            ("gemma3.attention.head_count_kv", 4, 8),
+            ("gemma3.attention.sliding_window_pattern", 9,
+             (7, [True] * 5 + [False]))], layers=6)
+        self.assertEqual(conf["kv_layers"], 1)
+
+    def test_compressed_attention_caches_one_latent(self) -> None:
+        conf = self.shape("deepseek2", [
+            ("deepseek2.attention.head_count_kv", 4, 32),
+            ("deepseek2.attention.kv_lora_rank", 4, 512),
+            ("deepseek2.rope.dimension_count", 4, 64)])
+        self.assertEqual((conf["kv_heads"], conf["head_dim"]), (1, 288))
+
+    def test_server_prefers_config_json_only_for_the_same_model(self) -> None:
+        path = self.dir / "Qwen3-32B-Q4_K_M.gguf"
+        write_gguf(path, [("general.architecture", 8, "qwen3"),
+                          ("qwen3.block_count", 4, 64),
+                          ("qwen3.embedding_length", 4, 5120),
+                          ("qwen3.attention.head_count", 4, 64),
+                          ("qwen3.attention.head_count_kv", 4, 8),
+                          ("qwen3.attention.key_length", 4, 128),
+                          ("qwen3.context_length", 4, 40960)],
+                   [("token_embd.weight", 4096)])
+        model = {"name": path.name, "path": str(path), "partial": False}
+        eight_b = {"layers": 36, "kv_layers": 36, "kv_heads": 8,
+                   "head_dim": 128, "exact": True, "hybrid": False,
+                   "moe": False, "max_ctx": 40960}
+        with mock.patch.object(fit, "model_config", return_value=eight_b):
+            # "Qwen3-32B" matches the Qwen3 8B catalogue entry by name
+            self.assertEqual(server.model_shape(model)["layers"], 64)
+        with mock.patch.object(fit, "model_config",
+                               return_value={**eight_b, "layers": 64,
+                                             "hybrid": True}):
+            self.assertTrue(server.model_shape(model)["hybrid"])
+        with mock.patch.object(fit, "model_config",
+                               return_value=dict(server.GUESSED_SHAPE)):
+            self.assertEqual(server.model_shape(model)["source"], "file")
+        # nothing readable at all: the guess, flagged as one
+        self.assertFalse(server.model_shape(
+            {"name": "x.gguf", "path": str(self.dir / "missing.gguf"),
+             "partial": False})["exact"])
 
 
 class PlanTests(unittest.TestCase):

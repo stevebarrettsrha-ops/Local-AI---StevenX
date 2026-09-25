@@ -31,14 +31,31 @@ The same job the canirun.ai page does with dropdowns, except nothing is assumed:
 | What | Where it comes from |
 |---|---|
 | Weights | the real GGUF byte size, read from the HuggingFace API |
-| KV cache | the model's own `config.json` — layers × KV heads × head dim × context |
+| KV cache | the model's own `config.json` — layers × KV heads × head dim × context; for a file on disk, checked against the file's own header |
 | Fit | weights + KV + ~0.6 GB working space against your measured VRAM |
 | Speed | memory bandwidth ÷ bytes read per token, at 80% efficiency |
 
 That last one is why quant choice matters: a token reads the whole weight file
 once, so halving the file roughly doubles the speed. It is an estimate and the
 app says so; where your card is not in the bandwidth table, no number is shown
-rather than a guessed one.
+rather than a guessed one. GPU names are matched as whole words, and a laptop
+part gets no number: the RTX 4090 Laptop has about half the desktop card's
+bandwidth, and "RTX A1000" used to be read as an A100.
+
+**A file on disk is judged by its own header.** A GGUF file records its
+layer count, KV heads, head size and trained context. llama.cpp reads the
+same header when it loads the file. When `config.json` cannot be read (a
+GGUF-only repo often has none, or you are offline), or when it describes a
+different model, those header values are used. A catalogue name can match
+a bigger sibling: `Qwen3-32B` used to be judged by the Qwen3 8B entry. The
+app used to fall back to 32 layers, so a 42-layer model got `-ngl 33` and
+ran its last blocks on the CPU. The split is judged against the VRAM that is
+free right now, because a browser can hold 1–2 GB of it.
+
+**Best here** is the highest-quality quant that fits, up to Q8_0. It used to
+be the first one that fit, which meant Q2_K on almost any card. Vision
+projectors (`mmproj` files) are shown as companions, with no verdict and no
+Load button.
 
 On an **RTX 4060 8 GB at 8k context**, Qwen3 8B comes out:
 
@@ -284,6 +301,9 @@ Two kinds, both plain files you can read and edit:
   every conversation. Edit it from the **Memory** pill in the top bar, or
   let the model add to it: any reply line starting with `remember:` is
   appended (de-duplicated, size-capped). Delete lines you don't want kept.
+  When it outgrows its limits, the newest lines are kept and sent (16,000
+  characters stored, the newest 4,000 sent). It used to keep the oldest, so
+  a new `remember:` line was saved but never reached the model.
 - **Recall**: excerpts of earlier conversations that match the new
   question ride along as context, so "how did we fix that bug last
   week?" actually works. With the tiny **semantic recall** model
@@ -293,7 +313,11 @@ Two kinds, both plain files you can read and edit:
   exchange is embedded into `data/embeddings.json`, and questions are
   matched by cosine similarity. Without it, plain keyword overlap over
   `data/chats.json` is used instead. Either way it is local,
-  inspectable, and switched off by one toggle.
+  inspectable, and switched off by one toggle. The excerpts go with the new
+  question, not into the system prompt. llama.cpp re-reads the prompt from
+  the first token that changed. When the excerpts changed at the top every
+  turn, a long conversation was read again in full before each reply. A
+  deleted chat is removed from the recall index too.
 
 ## Images
 
@@ -355,6 +379,14 @@ rounds, stopping the moment the command passes, the model returns no
 file changes, or the rounds run out. The command is always the one you
 typed; model output never chooses what gets executed.
 
+A reply that was stopped or cut off is never applied. A file block with no
+closing fence is half a file, and applying it used to replace a working
+file with its first half. A command runs with no keyboard input, gets 60
+seconds, and is then stopped together with everything it started; output
+is read as UTF-8 whatever the console's code page. An applied file keeps
+the line endings it had, and a `.bak` that is a link is replaced rather
+than followed.
+
 ## Documents and files
 
 Everything the model writes can leave the chat as a real file, entirely in
@@ -397,6 +429,13 @@ company template" just works. Missing packages
 degrade to a clear "pip install -r requirements.txt" message rather than
 a broken button.
 
+Slides use the template's own Title and Content layout. They used to get
+the Title Slide, with the bullets centred in the subtitle. Pictures are
+scaled to fit beside the bullets. Sheet names lose the characters Excel
+refuses (`: / \ ? * [ ]`), a value with a leading zero (a zip code, a part
+number) stays text, and chart axes are written explicitly, since Excel
+hides axes that openpyxl 3.1 leaves unmarked.
+
 ## Using other agent tools with the engine
 
 The loaded engine is an ordinary OpenAI-compatible server on
@@ -417,6 +456,16 @@ app's Coder engine does.
 - Split GGUF files (`-of-` in the name) are listed but not auto-downloaded;
   they need joining by hand.
 - Nothing leaves the machine except the model downloads themselves.
+- A `chats.json` or `config.json` that cannot be read is renamed aside
+  (`…unreadable-<time>`) and never written over. A damaged or locked file
+  used to be read as empty, and the next save replaced the whole history
+  with one chat.
+- The Engine page installs the official build for your processor: `.zip`
+  on Windows, `.tar.gz` on Linux and macOS (the only format those builds
+  ship in now), x64 or ARM. It downloads first, then stops the running
+  servers and swaps the new build in whole.
+- A llama-server left running by an earlier session is never taken for the
+  app's own. If it still holds port 8080, a new load takes a free port.
 
 ```
 server.py       Flask API — chat streaming, fit, downloads, engine control
@@ -429,7 +478,11 @@ Port: `LLAMA_STUDIO_PORT`. `LLAMA_STUDIO_NO_BROWSER=1` stops it opening a tab.
 
 ### Production checks
 
-The desktop service binds only to loopback. It validates persisted generation
+The desktop service binds only to loopback, and answers only its own page. A
+request whose Host is not a loopback name is refused, which blocks a
+DNS-rebinding page that would otherwise reach the workspace endpoint that
+runs commands. So is a state-changing request whose Origin is another site.
+It validates persisted generation
 settings, caps request bodies, writes configuration and chats atomically, and
 adds browser hardening/no-cache headers to API responses. Run the regression
 suite before packaging:

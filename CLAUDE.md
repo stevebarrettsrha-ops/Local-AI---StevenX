@@ -6,6 +6,9 @@
    - weights: real GGUF size from the HuggingFace API, never a table
    - KV cache: from the model's own config.json; when that cannot be read the
      result is flagged as estimated in the UI text
+   - a file on disk is judged by its own GGUF header (`fit.file_config`)
+     whenever config.json is missing or its layer count disagrees with the
+     file's — never by the 32-layer guess (`server.model_shape`)
    - speed: bandwidth ÷ bytes-per-token, only for cards in `GPUS`; otherwise no
      number at all. Never invent a benchmark.
 3. **Speed guard:** files under 50 MB get no speed estimate, and anything over
@@ -97,6 +100,19 @@
    own moves, not a distance from the end. `.thread` keeps
    `overflow-anchor: none`, or the browser drags a reader who scrolled up
    along with the text.
+
+24. **Only this machine's own page drives the app.** `local_only` refuses a
+   non-loopback Host (DNS rebinding reached the command-running workspace
+   endpoint) and a state-changing request from another site's Origin.
+25. **An unreadable data file is never written over.** `load_chats` retries
+   a locked file and keeps a damaged one aside (`keep_aside`); only
+   `read_chats`, for display, may treat it as empty. Same for config.json.
+26. **What changes per question goes at the end of the prompt.** Recall
+   excerpts ride with the new question (`recall_extra`), never in the
+   system prompt: llama.cpp re-reads from the first changed token, so a
+   changing top made every turn re-read the whole conversation.
+27. **llama-server's stream is decoded as UTF-8** (`r.encoding`); it names
+   no charset and requests then assumes Latin-1.
 
 ## Validation gate
 
