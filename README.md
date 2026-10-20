@@ -5,6 +5,15 @@ actually hold, downloads the right GGUF, runs `llama-server`, and talks to it.
 
 Port 7806. `run.bat` on Windows, `./run.sh` elsewhere.
 
+On Linux, double-clicking `run.sh` in the file manager opens it in a text
+editor — that is the file manager's choice, not a fault. Right-click it and
+pick **Run as a Program** instead; it opens a terminal and runs there. If a
+terminal answers `Permission denied` (an unzip can drop the executable bit),
+run `bash run.sh`, or `chmod +x run.sh` once. The packages go into a private
+`.venv` beside the script; on Debian and Ubuntu that first needs
+`sudo apt-get install -y python3-venv`, and the script says so when it is
+missing.
+
 Fresh installs default to an **Auto** context and an 8-bit KV cache. Auto
 takes the longest window — 8k, 16k or 32k — that keeps every layer the model
 had on the GPU, judged against the VRAM that is actually free when it loads
