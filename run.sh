@@ -22,6 +22,8 @@ if [ "$(uname)" = "Linux" ] && [ -z "${LLAMA_STUDIO_IN_TERMINAL:-}" ] \
       *) "$term" -e bash "$SELF" && exit 0 ;;
     esac
   done
+  # No window opened: this run carries on here, so it is not one.
+  unset LLAMA_STUDIO_IN_TERMINAL
   # No terminal found: carry on without one. The page still opens.
 fi
 
