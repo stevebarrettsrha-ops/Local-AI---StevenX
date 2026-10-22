@@ -6,3 +6,7 @@ llama.cpp/
 whisper.cpp/
 stable-diffusion.cpp/
 .venv/
+llama.cpp-*/
+whisper.cpp-*/
+stable-diffusion.cpp-*/
+.venv-*/

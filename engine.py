@@ -9,6 +9,7 @@ fit calculation, and speaks to its OpenAI-compatible endpoint.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
@@ -236,32 +237,117 @@ def _resolve_release(choices: list[tuple[list[str], str]],
         (sample or "nothing") + ".")
 
 
-def server_binary() -> Path | None:
-    name = "llama-server.exe" if platform.system() == "Windows" \
-        else "llama-server"
-    for base in (BIN_DIR, BIN_DIR / "build" / "bin"):
-        if not base.is_dir():
+_ELF = b"\x7fELF"
+_MACHO = (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe")
+
+
+def foreign_binary(path: Path | str) -> bool:
+    """Is this an executable built for another operating system?
+
+    An app folder on a drive shared by Windows and Linux carries the build
+    the other system downloaded. The first bytes say which system a binary
+    is for: MZ is Windows, ELF is Linux, Mach-O is macOS. Anything
+    unreadable or unrecognised counts as native — this only ever rules out
+    what is plainly foreign, it never guesses."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    system = platform.system()
+    if head[:2] == b"MZ":
+        return system != "Windows"
+    if head == _ELF:
+        return system not in ("Linux", "FreeBSD")
+    if head in _MACHO:
+        return system != "Darwin"
+    return False
+
+
+def _exe(stem: str) -> str:
+    return stem + ".exe" if platform.system() == "Windows" else stem
+
+
+def _own_dir(base: Path) -> Path:
+    """This system's folder beside `base`: llama.cpp-linux and so on."""
+    return base.with_name(f"{base.name}-{platform.system().lower()}")
+
+
+def install_dir(base: Path, stem: str) -> Path:
+    """Where this system's build of `stem` goes.
+
+    `base`, unless `base` holds a build made for another operating system
+    and none for this one — an app folder first set up on Windows, opened
+    on Linux. That build is the other system's to keep: the install swaps
+    its folder out whole, so installing over it would delete the Windows
+    build, and Windows would then delete this one in turn. This system
+    gets a folder of its own beside it instead."""
+    if not base.is_dir():
+        return base
+    foreign = False
+    for name in {stem + ".exe", stem}:
+        for f in base.rglob(name):
+            if not f.is_file():
+                continue
+            if foreign_binary(f):
+                foreign = True
+            elif name == _exe(stem):
+                return base
+    return _own_dir(base) if foreign else base
+
+
+def _find(base: Path, stem: str) -> Path | None:
+    """This system's `stem` binary under `base` or its own folder beside it.
+    A file of the right name built for another system is passed over."""
+    name = _exe(stem)
+    first = install_dir(base, stem)
+    for d in dict.fromkeys((first, base, _own_dir(base))):
+        if not d.is_dir():
             continue
-        direct = base / name
-        if direct.exists():
-            return direct
-        for found in base.rglob(name):
-            return found
-    found = shutil.which(name)
-    return Path(found) if found else None
+        direct = d / name
+        for f in [direct] + sorted(d.rglob(name)):
+            if f.is_file() and not foreign_binary(f):
+                return f
+    return None
+
+
+def foreign_build(base: Path, stem: str) -> str:
+    """A sentence when `base` holds only another system's build, else ""."""
+    target = install_dir(base, stem)
+    if target == base or _find(base, stem):
+        return ""
+    return (f"{base.name} holds a build made for another operating system, "
+            f"which cannot run here. Install fetches this system's build "
+            f"into {target.name} and leaves that one as it is.")
+
+
+def exec_failure(exc: OSError, binary: Path | str) -> str:
+    """What a failed start of `binary` means, instead of the bare errno."""
+    if exc.errno == errno.ENOEXEC:
+        return (f"{binary} was built for another operating system and "
+                "cannot run here. Install it again from this page to fetch "
+                "this system's build.")
+    if exc.errno == errno.EACCES:
+        return (f"{binary} is not allowed to run. If the app folder is on a "
+                "drive mounted without exec permission, mount it with exec "
+                "(or move the app to this system's own drive).")
+    return f"Could not start {binary}: {exc}"
+
+
+def server_binary() -> Path | None:
+    found = _find(BIN_DIR, "llama-server")
+    if found:
+        return found
+    found = shutil.which(_exe("llama-server"))
+    return Path(found) if found and not foreign_binary(found) else None
 
 
 def whisper_binary() -> Path | None:
-    name = "whisper-server.exe" if platform.system() == "Windows" \
-        else "whisper-server"
-    if WHISPER_DIR.is_dir():
-        direct = WHISPER_DIR / name
-        if direct.exists():
-            return direct
-        for found in WHISPER_DIR.rglob(name):
-            return found
-    found = shutil.which(name)
-    return Path(found) if found else None
+    found = _find(WHISPER_DIR, "whisper-server")
+    if found:
+        return found
+    found = shutil.which(_exe("whisper-server"))
+    return Path(found) if found and not foreign_binary(found) else None
 
 
 def whisper_install_sync(task: Task) -> None:
@@ -278,8 +364,9 @@ def whisper_install_sync(task: Task) -> None:
     release, match, why = _resolve_release(choices, task,
                                            base=WHISPER_RELEASES)
     task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
-    WHISPER_DIR.mkdir(parents=True, exist_ok=True)
-    if not _fetch_zip(task, match, 0, 40, dest_dir=WHISPER_DIR):
+    target = install_dir(WHISPER_DIR, "whisper-server")
+    target.mkdir(parents=True, exist_ok=True)
+    if not _fetch_zip(task, match, 0, 40, dest_dir=target):
         task.set(state="cancelled", detail="Cancelled")
         return
     binary = whisper_binary()
@@ -287,7 +374,7 @@ def whisper_install_sync(task: Task) -> None:
         raise RuntimeError("Unpacked, but no whisper-server binary was "
                            "found inside the archive.")
     if platform.system() != "Windows":
-        for f in WHISPER_DIR.rglob("whisper-*"):
+        for f in target.rglob("whisper-*"):
             try:
                 f.chmod(0o755)
             except OSError:
@@ -295,14 +382,7 @@ def whisper_install_sync(task: Task) -> None:
 
 
 def sd_binary() -> Path | None:
-    name = "sd.exe" if platform.system() == "Windows" else "sd"
-    if SD_DIR.is_dir():
-        direct = SD_DIR / name
-        if direct.exists():
-            return direct
-        for found in SD_DIR.rglob(name):
-            return found
-    return None
+    return _find(SD_DIR, "sd")
 
 
 def sd_install_sync(task: Task, hw: dict) -> None:
@@ -322,8 +402,9 @@ def sd_install_sync(task: Task, hw: dict) -> None:
                     "release…")
     release, match, why = _resolve_release(choices, task, base=SD_RELEASES)
     task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
-    SD_DIR.mkdir(parents=True, exist_ok=True)
-    if not _fetch_zip(task, match, 0, 22, dest_dir=SD_DIR):
+    target = install_dir(SD_DIR, "sd")
+    target.mkdir(parents=True, exist_ok=True)
+    if not _fetch_zip(task, match, 0, 22, dest_dir=target):
         task.set(state="cancelled", detail="Cancelled")
         return
     if "cuda" in match["name"].lower():
@@ -333,7 +414,7 @@ def sd_install_sync(task: Task, hw: dict) -> None:
                        None)
         if runtime:
             task.set(pct=22, detail="Fetching the CUDA runtime DLLs…")
-            if not _fetch_zip(task, runtime, 22, 30, dest_dir=SD_DIR):
+            if not _fetch_zip(task, runtime, 22, 30, dest_dir=target):
                 task.set(state="cancelled", detail="Cancelled")
                 return
     if not sd_binary():
@@ -407,7 +488,14 @@ def install_sync(task: Task, hw: dict, before_swap=None) -> None:
     task.set(detail="Asking GitHub for the latest release…")
     release, match, why = _resolve_release(asset_choices(hw), task)
     task.log(f"{release.get('tag_name')} — {match['name']} ({why})")
-    staging = BIN_DIR.with_name(BIN_DIR.name + ".new")
+    # A folder holding only another system's build (set up on Windows,
+    # opened on Linux) is left alone; this system's goes beside it.
+    target = install_dir(BIN_DIR, "llama-server")
+    if target != BIN_DIR:
+        task.log(f"{BIN_DIR.name} holds a build for another operating "
+                 f"system; it is left as it is and this one goes into "
+                 f"{target.name}.")
+    staging = target.with_name(target.name + ".new")
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
     if not _fetch_zip(task, match, 0, 80, staging):
@@ -431,8 +519,7 @@ def install_sync(task: Task, hw: dict, before_swap=None) -> None:
                 shutil.rmtree(staging, ignore_errors=True)
                 task.set(state="cancelled", detail="Cancelled")
                 return
-    name = "llama-server.exe" if platform.system() == "Windows" \
-        else "llama-server"
+    name = _exe("llama-server")
     if not next(staging.rglob(name), None):
         shutil.rmtree(staging, ignore_errors=True)
         raise RuntimeError("Unpacked, but no llama-server binary was found "
@@ -440,18 +527,18 @@ def install_sync(task: Task, hw: dict, before_swap=None) -> None:
     task.set(pct=96, detail="Swapping in the new build…")
     if before_swap:
         before_swap()
-    old = BIN_DIR.with_name(BIN_DIR.name + ".old")
+    old = target.with_name(target.name + ".old")
     shutil.rmtree(old, ignore_errors=True)
-    if BIN_DIR.exists():
-        BIN_DIR.replace(old)
-    staging.replace(BIN_DIR)
+    if target.exists():
+        target.replace(old)
+    staging.replace(target)
     shutil.rmtree(old, ignore_errors=True)
     binary = server_binary()
     if not binary:
         raise RuntimeError("Unpacked, but no llama-server binary was found "
                            "inside the archive.")
     if platform.system() != "Windows":
-        for f in BIN_DIR.rglob("llama-*"):
+        for f in target.rglob("llama-*"):
             try:
                 f.chmod(0o755)
             except OSError:
@@ -749,10 +836,17 @@ class Server:
             env["LD_LIBRARY_PATH"] = lib + ":" + env.get("LD_LIBRARY_PATH", "")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) \
             if platform.system() == "Windows" and not _has_console() else 0
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True,
-                                     encoding="utf-8", errors="replace",
-                                     bufsize=1, env=env, creationflags=flags)
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, text=True,
+                                         encoding="utf-8", errors="replace",
+                                         bufsize=1, env=env,
+                                         creationflags=flags)
+        except OSError as exc:
+            why = exec_failure(exc, cmd[0])
+            with self._lock:
+                self.lines.append(why)
+            raise RuntimeError(why) from exc
         self.model, self.flags = model_path, cmd
         threading.Thread(target=self._pump, daemon=True).start()
 

@@ -55,17 +55,25 @@ fi
 # Debian/Ubuntu refuse pip into the system Python (PEP 668). The check asks for
 # pip, not just a Python: without python3-venv, `venv` dies after writing
 # bin/python but before pip, and that half-built folder is rebuilt, not kept.
-if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
-  rm -rf .venv
+# A .venv made on Windows (an app folder on a drive both systems share) holds
+# Scripts/python.exe and no bin/python. It is the other system's, and a venv
+# serves one system only, so it is left alone and this one gets its own.
+VENV=.venv
+if [ ! -e .venv/bin/python ] && [ -e .venv/Scripts/python.exe ]; then
+  VENV=".venv-$(uname | tr '[:upper:]' '[:lower:]')"
+  echo "  .venv was set up on Windows; using $VENV for this system."
+fi
+if ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+  rm -rf "$VENV"
   echo "  Setting up Llama Studio's packages (first run only)..."
-  "$PY" -m venv .venv || {
-    rm -rf .venv
+  "$PY" -m venv "$VENV" || {
+    rm -rf "$VENV"
     echo "Could not create a virtual environment. On Debian/Ubuntu install" >&2
     echo "python3-venv (sudo apt-get install -y python3-venv), then run this again." >&2
     exit 1
   }
 fi
-PY=.venv/bin/python
+PY="$VENV/bin/python"
 echo "  Using: $($PY -c 'import sys;print(sys.executable)')"
 "$PY" -m pip install --disable-pip-version-check --quiet -r requirements.txt
 # The server takes this script's place (exec), so whatever stops the

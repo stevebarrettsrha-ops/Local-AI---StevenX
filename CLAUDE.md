@@ -114,6 +114,19 @@
 27. **llama-server's stream is decoded as UTF-8** (`r.encoding`); it names
    no charset and requests then assumes Latin-1.
 
+28. **A build for another operating system is neither run nor installed
+   over.** An app folder on a drive shared by Windows and Linux carries the
+   other system's `llama.cpp/` (and `whisper.cpp/`, `stable-diffusion.cpp/`,
+   `.venv/`). `engine.foreign_binary` reads the first bytes (MZ, ELF,
+   Mach-O; unreadable or unknown counts as native) and the binary lookups
+   pass over a foreign file, so it never reaches `[Errno 8] Exec format
+   error`. Install swaps its folder out whole, so installing over the other
+   system's build deleted it, and that system then deleted this one back:
+   `install_dir` gives this system `llama.cpp-linux` (`-windows`,
+   `-darwin`) beside it instead, `/api/status` says so in `llama_note`, and
+   `run.sh` uses `.venv-linux` beside a `.venv` holding only
+   `Scripts/python.exe` rather than deleting it.
+
 ## Validation gate
 
 ```bash
