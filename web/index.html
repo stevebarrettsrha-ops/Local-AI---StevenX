@@ -2296,7 +2296,8 @@ function renderHardware() {
   el.id = "installLine";
   el.style.display = "block";
   el.innerHTML = '<div class="n"><b>llama-server</b><span>' +
-    esc(st.llama_installed ? st.llama_path : "not installed yet") +
+    esc(st.llama_installed ? st.llama_path :
+      st.llama_note || "not installed yet") +
     '</span></div><div class="bar"><i style="width:0%"></i></div>';
   box.appendChild(el);
   var run = document.createElement("div");

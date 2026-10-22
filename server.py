@@ -260,6 +260,10 @@ def api_status():
         "hardware": hw,
         "llama_installed": bool(binary),
         "llama_path": str(binary) if binary else "",
+        # set up on another system (a drive shared with Windows): say so,
+        # rather than a bare "not installed"
+        "llama_note": "" if binary else
+        engine.foreign_build(engine.BIN_DIR, "llama-server"),
         "running": server.alive(), "ready": server.ready(),
         "api_url": server.url + "/v1",
         "model": Path(server.model).name if server.model else "",
@@ -1102,9 +1106,12 @@ def api_image_generate():
                "-o", str(out), "--steps", str(steps),
                "-W", str(w), "-H", str(h), "-s", str(seed)]
         task.log(" ".join(cmd))
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                bufsize=1, cwd=str(engine.SD_DIR))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    bufsize=1, cwd=str(engine.SD_DIR))
+        except OSError as exc:
+            raise RuntimeError(engine.exec_failure(exc, binary)) from exc
         for line in proc.stdout:
             line = line.strip()
             if not line:
